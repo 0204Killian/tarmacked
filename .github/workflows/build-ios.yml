@@ -1,0 +1,49 @@
+name: Build unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Generate native iOS project
+        run: npx expo prebuild --platform ios --no-install
+
+      - name: Install CocoaPods
+        run: cd ios && pod install
+
+      - name: Build unsigned .app
+        run: |
+          cd ios
+          xcodebuild \
+            -workspace tarmacked.xcworkspace \
+            -scheme tarmacked \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package as IPA
+        run: |
+          mkdir -p Payload
+          cp -r ios/build/Build/Products/Release-iphoneos/tarmacked.app Payload/
+          zip -r tarmacked.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarmacked-ipa
+          path: tarmacked.ipa

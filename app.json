@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "tarmacked",
+    "slug": "tarmacked",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "bundleIdentifier": "com.tarmacked.app",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "tarmacked needs your location to record the roads you drive.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "tarmacked needs background location so it keeps recording while your phone is locked.",
+        "UIBackgroundModes": ["location"]
+      }
+    },
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "tarmacked needs background location so it keeps recording while your phone is locked."
+        }
+      ]
+    ]
+  }
+}
