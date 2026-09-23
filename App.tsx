@@ -3,13 +3,22 @@ import { StyleSheet, Text, View, Pressable, ScrollView } from 'react-native';
 import MapView, { Polyline, PROVIDER_DEFAULT, MapPressEvent } from 'react-native-maps';
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { findNearestSegment, totalLengthMeters, segmentLengthMeters, RoadSegment } from './src/roadMatcher';
+import roadDataRaw from './assets/roads/kilkenny.json';
+
+const roadData = roadDataRaw as RoadSegment[];
+const roadsById = new Map(roadData.map((seg) => [seg.id, seg]));
+
+const DRIVEN_KEY = 'tarmacked:driven:kilkenny';
+const EXCLUDED_KEY = 'tarmacked:excluded:kilkenny';
 
 const LOCATION_TASK_NAME = 'tarmacked-background-location';
 
 type Point = { latitude: number; longitude: number; timestamp: number };
 
-// In-memory only for now — real persistence comes once the core flow is
-// confirmed solid on the phone.
+// In-memory only — persistence is for drivenIds/excludedIds (the results),
+// not the raw point stream itself.
 let recordedPoints: Point[] = [];
 
 TaskManager.defineTask(LOCATION_TASK_NAME, ({ data, error }) => {
@@ -36,9 +45,6 @@ const FALLBACK_REGION = {
   longitudeDelta: 4,
 };
 
-// Nothing on the native side is allowed to hang the UI forever — if a call
-// doesn't resolve within this window, we treat it as failed and move on,
-// so the app always ends up in a known state instead of stuck on "checking…".
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
     promise,
@@ -50,12 +56,51 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 
 export default function App() {
   const [tracking, setTracking] = useState(false);
+  const [editMode, setEditMode] = useState(false);
   const [region, setRegion] = useState(FALLBACK_REGION);
-  const [trail, setTrail] = useState<Point[]>([]);
+  const [pointCount, setPointCount] = useState(0);
+  const [drivenIds, setDrivenIds] = useState<Set<string>>(new Set());
+  const [excludedIds, setExcludedIds] = useState<Set<string>>(new Set());
   const [note, setNote] = useState('');
   const [debug, setDebug] = useState('starting…');
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const foregroundSub = useRef<Location.LocationSubscription | null>(null);
+  const loadedRef = useRef(false);
+
+  // Load persisted driven/excluded roads once on startup.
+  useEffect(() => {
+    (async () => {
+      try {
+        const [savedDriven, savedExcluded] = await Promise.all([
+          AsyncStorage.getItem(DRIVEN_KEY),
+          AsyncStorage.getItem(EXCLUDED_KEY),
+        ]);
+        if (savedDriven) setDrivenIds(new Set(JSON.parse(savedDriven)));
+        if (savedExcluded) setExcludedIds(new Set(JSON.parse(savedExcluded)));
+      } catch (e) {
+        console.warn('failed to load saved roads', e);
+      } finally {
+        loadedRef.current = true;
+      }
+    })();
+  }, []);
+
+  // Persist whenever driven/excluded change, but only after the initial
+  // load has completed — otherwise the empty starting state would
+  // overwrite whatever was saved before the load finishes.
+  useEffect(() => {
+    if (!loadedRef.current) return;
+    AsyncStorage.setItem(DRIVEN_KEY, JSON.stringify(Array.from(drivenIds))).catch((e) =>
+      console.warn('failed to save driven roads', e)
+    );
+  }, [drivenIds]);
+
+  useEffect(() => {
+    if (!loadedRef.current) return;
+    AsyncStorage.setItem(EXCLUDED_KEY, JSON.stringify(Array.from(excludedIds))).catch((e) =>
+      console.warn('failed to save excluded roads', e)
+    );
+  }, [excludedIds]);
 
   useEffect(() => {
     (async () => {
@@ -88,23 +133,36 @@ export default function App() {
       } catch (e) {
         setDebug((d) => d + `\nposition: FAILED — ${(e as Error).message} (using fallback map region)`);
       }
+
+      setDebug((d) => d + `\nroads loaded: ${roadData.length}`);
     })();
   }, []);
 
   useEffect(() => {
     if (tracking) {
-      pollRef.current = setInterval(() => setTrail([...recordedPoints]), 2000);
+      pollRef.current = setInterval(() => {
+        const eligible = roadData.filter((seg) => !excludedIds.has(seg.id));
+        setDrivenIds((prev) => {
+          const next = new Set(prev);
+          for (const p of recordedPoints) {
+            const id = findNearestSegment(p, eligible);
+            if (id) next.add(id);
+          }
+          return next;
+        });
+        setPointCount(recordedPoints.length);
+      }, 2000);
     } else if (pollRef.current) {
       clearInterval(pollRef.current);
     }
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
-  }, [tracking]);
+  }, [tracking, excludedIds]);
 
   const start = async () => {
     recordedPoints = [];
-    setTrail([]);
+    setPointCount(0);
     setNote('');
     try {
       await withTimeout(
@@ -155,11 +213,29 @@ export default function App() {
   };
 
   const onMapPress = (e: MapPressEvent) => {
-    if (!tracking) return;
+    if (!tracking || editMode) return;
     const { latitude, longitude } = e.nativeEvent.coordinate;
     recordedPoints.push({ latitude, longitude, timestamp: Date.now() });
-    setTrail([...recordedPoints]);
   };
+
+  const toggleExcluded = (id: string) => {
+    setExcludedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const eligibleSegments = roadData.filter((seg) => !excludedIds.has(seg.id));
+  const totalLength = totalLengthMeters(eligibleSegments);
+  const drivenLength = eligibleSegments
+    .filter((seg) => drivenIds.has(seg.id))
+    .reduce((sum, seg) => sum + segmentLengthMeters(seg), 0);
+  const percentDriven = totalLength > 0 ? (drivenLength / totalLength) * 100 : 0;
 
   return (
     <View style={styles.container}>
@@ -170,7 +246,36 @@ export default function App() {
         showsUserLocation
         onPress={onMapPress}
       >
-        {trail.length > 1 && <Polyline coordinates={trail} strokeColor="#39d353" strokeWidth={4} />}
+        {editMode &&
+          roadData.map((seg) => {
+            const isExcluded = excludedIds.has(seg.id);
+            return (
+              <Polyline
+                key={seg.id}
+                coordinates={seg.coords.map(([lat, lon]) => ({ latitude: lat, longitude: lon }))}
+                strokeColor={isExcluded ? '#a03030' : '#555'}
+                strokeWidth={isExcluded ? 4 : 2}
+                lineDashPattern={isExcluded ? [6, 4] : undefined}
+                tappable
+                onPress={() => toggleExcluded(seg.id)}
+              />
+            );
+          })}
+
+        {!editMode &&
+          Array.from(drivenIds).map((id) => {
+            if (excludedIds.has(id)) return null;
+            const seg = roadsById.get(id);
+            if (!seg) return null;
+            return (
+              <Polyline
+                key={id}
+                coordinates={seg.coords.map(([lat, lon]) => ({ latitude: lat, longitude: lon }))}
+                strokeColor="#39d353"
+                strokeWidth={5}
+              />
+            );
+          })}
       </MapView>
 
       <ScrollView style={styles.debugBox}>
@@ -178,13 +283,39 @@ export default function App() {
       </ScrollView>
 
       <View style={styles.overlay}>
-        <Text style={styles.status}>tracking: {tracking ? 'ON' : 'off'}</Text>
-        <Text style={styles.status}>points: {trail.length}</Text>
-        {tracking && <Text style={styles.hint}>tap the map to add a point</Text>}
-        {note ? <Text style={styles.note}>{note}</Text> : null}
-        <Pressable style={[styles.button, tracking && styles.buttonStop]} onPress={tracking ? stop : start}>
-          <Text style={styles.buttonText}>{tracking ? 'Stop' : 'Start'} tracking</Text>
-        </Pressable>
+        {editMode ? (
+          <>
+            <Text style={styles.status}>Edit mode — tap a road to mark it private/gone</Text>
+            <Text style={styles.status}>excluded: {excludedIds.size}</Text>
+          </>
+        ) : (
+          <>
+            <Text style={styles.status}>tracking: {tracking ? 'ON' : 'off'}</Text>
+            <Text style={styles.status}>points: {pointCount}</Text>
+            <Text style={styles.status}>
+              {percentDriven.toFixed(2)}% of County Kilkenny driven ({(drivenLength / 1000).toFixed(1)} /{' '}
+              {(totalLength / 1000).toFixed(1)} km)
+            </Text>
+            {tracking && <Text style={styles.hint}>tap the map to add a point</Text>}
+            {note ? <Text style={styles.note}>{note}</Text> : null}
+          </>
+        )}
+
+        <View style={styles.buttonRow}>
+          {!editMode && (
+            <Pressable style={[styles.button, tracking && styles.buttonStop]} onPress={tracking ? stop : start}>
+              <Text style={styles.buttonText}>{tracking ? 'Stop' : 'Start'} tracking</Text>
+            </Pressable>
+          )}
+          {!tracking && (
+            <Pressable
+              style={[styles.button, styles.buttonEdit, editMode && styles.buttonEditActive]}
+              onPress={() => setEditMode((v) => !v)}
+            >
+              <Text style={styles.buttonText}>{editMode ? 'Done editing' : 'Edit roads'}</Text>
+            </Pressable>
+          )}
+        </View>
       </View>
     </View>
   );
@@ -198,7 +329,7 @@ const styles = StyleSheet.create({
     top: 50,
     left: 16,
     right: 16,
-    maxHeight: 140,
+    maxHeight: 100,
     backgroundColor: 'rgba(17,17,17,0.85)',
     borderRadius: 8,
     padding: 10,
@@ -214,10 +345,13 @@ const styles = StyleSheet.create({
     padding: 16,
     alignItems: 'center',
   },
-  status: { color: '#aaa', fontSize: 13, marginBottom: 4 },
-  hint: { color: '#6aa9ff', fontSize: 12, marginTop: 2 },
+  status: { color: '#aaa', fontSize: 13, marginBottom: 4, textAlign: 'center' },
+  hint: { color: '#6aa9ff', fontSize: 12, marginTop: 2, textAlign: 'center' },
   note: { color: '#e0a030', fontSize: 12, marginTop: 4, textAlign: 'center' },
-  button: { backgroundColor: '#2a6f2a', paddingVertical: 12, paddingHorizontal: 28, borderRadius: 8, marginTop: 8 },
+  buttonRow: { flexDirection: 'row', gap: 10, marginTop: 8 },
+  button: { backgroundColor: '#2a6f2a', paddingVertical: 12, paddingHorizontal: 24, borderRadius: 8 },
   buttonStop: { backgroundColor: '#8a2a2a' },
-  buttonText: { color: '#fff', fontSize: 16, fontWeight: '600' },
+  buttonEdit: { backgroundColor: '#2a4f8a' },
+  buttonEditActive: { backgroundColor: '#8a6a2a' },
+  buttonText: { color: '#fff', fontSize: 15, fontWeight: '600' },
 });
