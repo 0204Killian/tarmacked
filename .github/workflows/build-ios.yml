@@ -18,8 +18,11 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Fetch road data
+      - name: Fetch road data (Kilkenny)
         run: node scripts/fetch-roads.js "County Kilkenny" assets/roads/kilkenny.json
+
+      - name: Fetch road data (Laois)
+        run: node scripts/fetch-roads.js "County Laois" assets/roads/laois.json
 
       - name: Generate native iOS project
         run: npx expo prebuild --platform ios --no-install

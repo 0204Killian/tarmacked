@@ -1,17 +1,20 @@
 import { useState, useEffect, useRef } from 'react';
 import { StyleSheet, Text, View, Pressable, ScrollView } from 'react-native';
-import MapView, { Polyline, PROVIDER_DEFAULT, MapPressEvent } from 'react-native-maps';
+import MapView, { Polyline, PROVIDER_DEFAULT, MapPressEvent, MapType } from 'react-native-maps';
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { findNearestSegment, totalLengthMeters, segmentLengthMeters, RoadSegment } from './src/roadMatcher';
-import roadDataRaw from './assets/roads/kilkenny.json';
+import { findNearestSegment, totalLengthMeters, segmentLengthMeters, RoadSegment, RoadFile } from './src/roadMatcher';
+import kilkennyFileRaw from './assets/roads/kilkenny.json';
+import laoisFileRaw from './assets/roads/laois.json';
 
-const roadData = roadDataRaw as RoadSegment[];
+const roadFiles = [kilkennyFileRaw as RoadFile, laoisFileRaw as RoadFile];
+const areaLabel = roadFiles.map((f) => f.county).join(' + ');
+const roadData: RoadSegment[] = roadFiles.flatMap((f) => f.segments);
 const roadsById = new Map(roadData.map((seg) => [seg.id, seg]));
 
-const DRIVEN_KEY = 'tarmacked:driven:kilkenny';
-const EXCLUDED_KEY = 'tarmacked:excluded:kilkenny';
+const DRIVEN_KEY = 'tarmacked:driven:local'; // now covers Kilkenny + Laois together
+const EXCLUDED_KEY = 'tarmacked:excluded:local';
 
 const LOCATION_TASK_NAME = 'tarmacked-background-location';
 
@@ -45,6 +48,8 @@ const FALLBACK_REGION = {
   longitudeDelta: 4,
 };
 
+const MAP_TYPES: MapType[] = ['standard', 'satellite', 'hybrid'];
+
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
     promise,
@@ -57,6 +62,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 export default function App() {
   const [tracking, setTracking] = useState(false);
   const [editMode, setEditMode] = useState(false);
+  const [mapTypeIndex, setMapTypeIndex] = useState(0);
   const [region, setRegion] = useState(FALLBACK_REGION);
   const [pointCount, setPointCount] = useState(0);
   const [drivenIds, setDrivenIds] = useState<Set<string>>(new Set());
@@ -67,7 +73,6 @@ export default function App() {
   const foregroundSub = useRef<Location.LocationSubscription | null>(null);
   const loadedRef = useRef(false);
 
-  // Load persisted driven/excluded roads once on startup.
   useEffect(() => {
     (async () => {
       try {
@@ -85,9 +90,6 @@ export default function App() {
     })();
   }, []);
 
-  // Persist whenever driven/excluded change, but only after the initial
-  // load has completed — otherwise the empty starting state would
-  // overwrite whatever was saved before the load finishes.
   useEffect(() => {
     if (!loadedRef.current) return;
     AsyncStorage.setItem(DRIVEN_KEY, JSON.stringify(Array.from(drivenIds))).catch((e) =>
@@ -134,7 +136,7 @@ export default function App() {
         setDebug((d) => d + `\nposition: FAILED — ${(e as Error).message} (using fallback map region)`);
       }
 
-      setDebug((d) => d + `\nroads loaded: ${roadData.length}`);
+      setDebug((d) => d + `\nroads loaded: ${roadData.length} chunks (${areaLabel})`);
     })();
   }, []);
 
@@ -230,6 +232,8 @@ export default function App() {
     });
   };
 
+  const cycleMapType = () => setMapTypeIndex((i) => (i + 1) % MAP_TYPES.length);
+
   const eligibleSegments = roadData.filter((seg) => !excludedIds.has(seg.id));
   const totalLength = totalLengthMeters(eligibleSegments);
   const drivenLength = eligibleSegments
@@ -242,6 +246,7 @@ export default function App() {
       <MapView
         style={styles.map}
         provider={PROVIDER_DEFAULT}
+        mapType={MAP_TYPES[mapTypeIndex]}
         initialRegion={region}
         showsUserLocation
         onPress={onMapPress}
@@ -278,6 +283,10 @@ export default function App() {
           })}
       </MapView>
 
+      <Pressable style={styles.mapTypeButton} onPress={cycleMapType}>
+        <Text style={styles.mapTypeButtonText}>{MAP_TYPES[mapTypeIndex]}</Text>
+      </Pressable>
+
       <ScrollView style={styles.debugBox}>
         <Text style={styles.debugText}>{debug}</Text>
       </ScrollView>
@@ -293,7 +302,7 @@ export default function App() {
             <Text style={styles.status}>tracking: {tracking ? 'ON' : 'off'}</Text>
             <Text style={styles.status}>points: {pointCount}</Text>
             <Text style={styles.status}>
-              {percentDriven.toFixed(2)}% of County Kilkenny driven ({(drivenLength / 1000).toFixed(1)} /{' '}
+              {percentDriven.toFixed(2)}% of {areaLabel} driven ({(drivenLength / 1000).toFixed(2)} /{' '}
               {(totalLength / 1000).toFixed(1)} km)
             </Text>
             {tracking && <Text style={styles.hint}>tap the map to add a point</Text>}
@@ -324,11 +333,21 @@ export default function App() {
 const styles = StyleSheet.create({
   container: { flex: 1 },
   map: { flex: 1 },
+  mapTypeButton: {
+    position: 'absolute',
+    top: 50,
+    right: 16,
+    backgroundColor: 'rgba(17,17,17,0.85)',
+    borderRadius: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+  },
+  mapTypeButtonText: { color: '#fff', fontSize: 12, fontWeight: '600', textTransform: 'capitalize' },
   debugBox: {
     position: 'absolute',
     top: 50,
     left: 16,
-    right: 16,
+    right: 100,
     maxHeight: 100,
     backgroundColor: 'rgba(17,17,17,0.85)',
     borderRadius: 8,

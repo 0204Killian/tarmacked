@@ -1,7 +1,11 @@
 export type RoadSegment = {
   id: string;
-  county: string;
   coords: [number, number][]; // [lat, lon] pairs, in order along the road
+};
+
+export type RoadFile = {
+  county: string;
+  segments: RoadSegment[];
 };
 
 export type LatLon = { latitude: number; longitude: number };
@@ -38,12 +42,15 @@ function pointToSegmentDistance(px: number, py: number, ax: number, ay: number, 
 const SNAP_THRESHOLD_METERS = 25;
 
 /**
- * Finds the closest road segment to a point, if one is within
- * SNAP_THRESHOLD_METERS. Pass only the segments that should be eligible to
- * match (i.e. already filtered to exclude anything marked private/gone).
- * Returns the segment's id, or null if nothing is close enough.
+ * Finds the closest road chunk to a point, if one is within
+ * SNAP_THRESHOLD_METERS. Pass only the segments eligible to match (i.e.
+ * already filtered to exclude anything marked private/gone). Returns the
+ * chunk's id, or null if nothing is close enough.
  *
- * This is a plain linear scan over every segment — fine for one county's
+ * Each chunk is a short (~100m) piece of a road, not the whole road — so a
+ * match only lights up the specific stretch a point was actually near.
+ *
+ * This is a plain linear scan over every chunk — fine for one county's
  * worth of roads, but will need a spatial index (a grid bucketed by
  * lat/lon) once this covers all of Ireland.
  */
