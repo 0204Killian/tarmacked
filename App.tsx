@@ -13,15 +13,17 @@ const areaLabel = roadFiles.map((f) => f.county).join(' + ');
 const roadData: RoadSegment[] = roadFiles.flatMap((f) => f.segments);
 const roadsById = new Map(roadData.map((seg) => [seg.id, seg]));
 
-const DRIVEN_KEY = 'tarmacked:driven:local'; // now covers Kilkenny + Laois together
+const DRIVEN_KEY = 'tarmacked:driven:local';
 const EXCLUDED_KEY = 'tarmacked:excluded:local';
+const UNMATCHED_KEY = 'tarmacked:unmatched:local';
 
 const LOCATION_TASK_NAME = 'tarmacked-background-location';
 
 type Point = { latitude: number; longitude: number; timestamp: number };
 
-// In-memory only — persistence is for drivenIds/excludedIds (the results),
-// not the raw point stream itself.
+// In-memory only — this is the current session's raw stream. Anything
+// that doesn't match a road gets copied out into the persisted
+// "unmatched" store before this array resets on the next Start.
 let recordedPoints: Point[] = [];
 
 TaskManager.defineTask(LOCATION_TASK_NAME, ({ data, error }) => {
@@ -67,21 +69,25 @@ export default function App() {
   const [pointCount, setPointCount] = useState(0);
   const [drivenIds, setDrivenIds] = useState<Set<string>>(new Set());
   const [excludedIds, setExcludedIds] = useState<Set<string>>(new Set());
+  const [unmatchedPoints, setUnmatchedPoints] = useState<Point[]>([]);
   const [note, setNote] = useState('');
   const [debug, setDebug] = useState('starting…');
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const foregroundSub = useRef<Location.LocationSubscription | null>(null);
   const loadedRef = useRef(false);
+  const processedIndexRef = useRef(0);
 
   useEffect(() => {
     (async () => {
       try {
-        const [savedDriven, savedExcluded] = await Promise.all([
+        const [savedDriven, savedExcluded, savedUnmatched] = await Promise.all([
           AsyncStorage.getItem(DRIVEN_KEY),
           AsyncStorage.getItem(EXCLUDED_KEY),
+          AsyncStorage.getItem(UNMATCHED_KEY),
         ]);
         if (savedDriven) setDrivenIds(new Set(JSON.parse(savedDriven)));
         if (savedExcluded) setExcludedIds(new Set(JSON.parse(savedExcluded)));
+        if (savedUnmatched) setUnmatchedPoints(JSON.parse(savedUnmatched));
       } catch (e) {
         console.warn('failed to load saved roads', e);
       } finally {
@@ -103,6 +109,13 @@ export default function App() {
       console.warn('failed to save excluded roads', e)
     );
   }, [excludedIds]);
+
+  useEffect(() => {
+    if (!loadedRef.current) return;
+    AsyncStorage.setItem(UNMATCHED_KEY, JSON.stringify(unmatchedPoints)).catch((e) =>
+      console.warn('failed to save unmatched points', e)
+    );
+  }, [unmatchedPoints]);
 
   useEffect(() => {
     (async () => {
@@ -140,18 +153,34 @@ export default function App() {
     })();
   }, []);
 
+  // Processes any points recorded since the last poll: matched ones update
+  // drivenIds, unmatched ones get saved permanently instead of discarded.
   useEffect(() => {
     if (tracking) {
       pollRef.current = setInterval(() => {
         const eligible = roadData.filter((seg) => !excludedIds.has(seg.id));
-        setDrivenIds((prev) => {
-          const next = new Set(prev);
-          for (const p of recordedPoints) {
-            const id = findNearestSegment(p, eligible);
-            if (id) next.add(id);
+        const newPoints = recordedPoints.slice(processedIndexRef.current);
+        processedIndexRef.current = recordedPoints.length;
+
+        if (newPoints.length > 0) {
+          const newlyUnmatched: Point[] = [];
+          setDrivenIds((prev) => {
+            const next = new Set(prev);
+            for (const p of newPoints) {
+              const id = findNearestSegment(p, eligible);
+              if (id) {
+                next.add(id);
+              } else {
+                newlyUnmatched.push(p);
+              }
+            }
+            return next;
+          });
+          if (newlyUnmatched.length > 0) {
+            setUnmatchedPoints((prev) => [...prev, ...newlyUnmatched]);
           }
-          return next;
-        });
+        }
+
         setPointCount(recordedPoints.length);
       }, 2000);
     } else if (pollRef.current) {
@@ -164,6 +193,7 @@ export default function App() {
 
   const start = async () => {
     recordedPoints = [];
+    processedIndexRef.current = 0;
     setPointCount(0);
     setNote('');
     try {
@@ -211,6 +241,28 @@ export default function App() {
       foregroundSub.current.remove();
       foregroundSub.current = null;
     }
+    // Final drain, in case anything landed after the last poll tick.
+    const eligible = roadData.filter((seg) => !excludedIds.has(seg.id));
+    const newPoints = recordedPoints.slice(processedIndexRef.current);
+    processedIndexRef.current = recordedPoints.length;
+    if (newPoints.length > 0) {
+      const newlyUnmatched: Point[] = [];
+      setDrivenIds((prev) => {
+        const next = new Set(prev);
+        for (const p of newPoints) {
+          const id = findNearestSegment(p, eligible);
+          if (id) {
+            next.add(id);
+          } else {
+            newlyUnmatched.push(p);
+          }
+        }
+        return next;
+      });
+      if (newlyUnmatched.length > 0) {
+        setUnmatchedPoints((prev) => [...prev, ...newlyUnmatched]);
+      }
+    }
     setTracking(false);
   };
 
@@ -233,6 +285,27 @@ export default function App() {
   };
 
   const cycleMapType = () => setMapTypeIndex((i) => (i + 1) % MAP_TYPES.length);
+
+  const rematch = () => {
+    const eligible = roadData.filter((seg) => !excludedIds.has(seg.id));
+    const stillUnmatched: Point[] = [];
+    let recovered = 0;
+    setDrivenIds((prevDriven) => {
+      const next = new Set(prevDriven);
+      for (const p of unmatchedPoints) {
+        const id = findNearestSegment(p, eligible);
+        if (id) {
+          next.add(id);
+          recovered++;
+        } else {
+          stillUnmatched.push(p);
+        }
+      }
+      return next;
+    });
+    setUnmatchedPoints(stillUnmatched);
+    setNote(`Rematch: recovered ${recovered} of ${unmatchedPoints.length} saved points`);
+  };
 
   const eligibleSegments = roadData.filter((seg) => !excludedIds.has(seg.id));
   const totalLength = totalLengthMeters(eligibleSegments);
@@ -305,6 +378,9 @@ export default function App() {
               {percentDriven.toFixed(2)}% of {areaLabel} driven ({(drivenLength / 1000).toFixed(2)} /{' '}
               {(totalLength / 1000).toFixed(1)} km)
             </Text>
+            {unmatchedPoints.length > 0 && (
+              <Text style={styles.status}>unmatched (saved): {unmatchedPoints.length}</Text>
+            )}
             {tracking && <Text style={styles.hint}>tap the map to add a point</Text>}
             {note ? <Text style={styles.note}>{note}</Text> : null}
           </>
@@ -322,6 +398,11 @@ export default function App() {
               onPress={() => setEditMode((v) => !v)}
             >
               <Text style={styles.buttonText}>{editMode ? 'Done editing' : 'Edit roads'}</Text>
+            </Pressable>
+          )}
+          {!tracking && !editMode && unmatchedPoints.length > 0 && (
+            <Pressable style={[styles.button, styles.buttonRematch]} onPress={rematch}>
+              <Text style={styles.buttonText}>Rematch ({unmatchedPoints.length})</Text>
             </Pressable>
           )}
         </View>
@@ -367,10 +448,11 @@ const styles = StyleSheet.create({
   status: { color: '#aaa', fontSize: 13, marginBottom: 4, textAlign: 'center' },
   hint: { color: '#6aa9ff', fontSize: 12, marginTop: 2, textAlign: 'center' },
   note: { color: '#e0a030', fontSize: 12, marginTop: 4, textAlign: 'center' },
-  buttonRow: { flexDirection: 'row', gap: 10, marginTop: 8 },
+  buttonRow: { flexDirection: 'row', gap: 10, marginTop: 8, flexWrap: 'wrap', justifyContent: 'center' },
   button: { backgroundColor: '#2a6f2a', paddingVertical: 12, paddingHorizontal: 24, borderRadius: 8 },
   buttonStop: { backgroundColor: '#8a2a2a' },
   buttonEdit: { backgroundColor: '#2a4f8a' },
   buttonEditActive: { backgroundColor: '#8a6a2a' },
+  buttonRematch: { backgroundColor: '#5a3a8a' },
   buttonText: { color: '#fff', fontSize: 15, fontWeight: '600' },
 });
