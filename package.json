@@ -8,13 +8,16 @@
     "ios": "expo run:ios"
   },
   "dependencies": {
-    "expo": "~51.0.0",
-    "expo-location": "~17.0.1",
-    "expo-task-manager": "~11.8.2",
-    "react": "18.2.0",
-    "react-native": "0.74.5"
+    "expo": "^57.0.24",
+    "expo-location": "~57.0.19",
+    "expo-task-manager": "~57.0.19",
+    "react": "19.2.3",
+    "react-native": "0.86.3",
+    "react-native-maps": "1.27.2"
   },
   "devDependencies": {
-    "@babel/core": "^7.20.0"
+    "@babel/core": "^7.20.0",
+    "@types/react": "~19.2.4",
+    "typescript": "~6.0.3"
   }
 }
