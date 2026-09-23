@@ -3,15 +3,8 @@ export type RoadSegment = {
   coords: [number, number][]; // [lat, lon] pairs, in order along the road
 };
 
-export type RoadFile = {
-  county: string;
-  segments: RoadSegment[];
-};
-
 export type LatLon = { latitude: number; longitude: number };
 
-// Rough local meters-per-degree conversion — accurate enough at county
-// scale, not meant for anything near the poles (Ireland is nowhere close).
 const METERS_PER_DEG_LAT = 111_320;
 
 function metersPerDegLon(atLat: number) {
@@ -25,7 +18,6 @@ function toLocalMeters(lat: number, lon: number, originLat: number, originLon: n
   };
 }
 
-// Perpendicular distance (meters) from a point to a line segment.
 function pointToSegmentDistance(px: number, py: number, ax: number, ay: number, bx: number, by: number) {
   const dx = bx - ax;
   const dy = by - ay;
@@ -41,19 +33,6 @@ function pointToSegmentDistance(px: number, py: number, ax: number, ay: number, 
 
 const SNAP_THRESHOLD_METERS = 25;
 
-/**
- * Finds the closest road chunk to a point, if one is within
- * SNAP_THRESHOLD_METERS. Pass only the segments eligible to match (i.e.
- * already filtered to exclude anything marked private/gone). Returns the
- * chunk's id, or null if nothing is close enough.
- *
- * Each chunk is a short (~100m) piece of a road, not the whole road — so a
- * match only lights up the specific stretch a point was actually near.
- *
- * This is a plain linear scan over every chunk — fine for one county's
- * worth of roads, but will need a spatial index (a grid bucketed by
- * lat/lon) once this covers all of Ireland.
- */
 export function findNearestSegment(point: LatLon, segments: RoadSegment[]): string | null {
   let bestId: string | null = null;
   let bestDist = SNAP_THRESHOLD_METERS;
@@ -75,7 +54,6 @@ export function findNearestSegment(point: LatLon, segments: RoadSegment[]): stri
   return bestId;
 }
 
-// Haversine distance in meters between two [lat, lon] points.
 function haversine(a: [number, number], b: [number, number]): number {
   const [lat1, lon1] = a;
   const [lat2, lon2] = b;

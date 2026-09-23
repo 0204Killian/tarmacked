@@ -1,14 +1,31 @@
-// Fetches a county's public roads and splits them into small geographic
-// tiles, written to tiles/<tileId>.json. These get committed to the repo
-// and served live over GitHub's raw file CDN — the app fetches whichever
-// tile it needs on demand as it enters new areas, no server required.
+// Fetches one or more counties' public roads and splits them into small
+// geographic tiles, written to tiles/<tileId>.json. Also maintains
+// tiles/county-index.json, a map of county name -> tile IDs, which the app
+// uses to bulk-download a whole county up front (e.g. during onboarding)
+// rather than only discovering tiles reactively as GPS points land in them.
 //
-// Usage: node scripts/tile-county.js "County Carlow"
+// These all get committed to the repo and served live over GitHub's raw
+// file CDN — no server required.
+//
+// Usage:
+//   node scripts/tile-county.js "County Carlow"
+//   node scripts/tile-county.js "County Cork" "County Kerry"
+//   node scripts/tile-county.js --rest-of-roi
 
-const AREA_NAME = process.argv[2];
+const REST_OF_ROI = [
+  'County Dublin', 'County Kildare', 'County Longford', 'County Louth',
+  'County Meath', 'County Offaly', 'County Westmeath', 'County Wexford', 'County Wicklow',
+  'County Galway', 'County Leitrim', 'County Mayo', 'County Roscommon', 'County Sligo',
+  'County Clare', 'County Cork', 'County Kerry', 'County Limerick',
+  'County Tipperary', 'County Waterford',
+  'County Cavan', 'County Donegal', 'County Monaghan',
+];
 
-if (!AREA_NAME) {
-  console.error('Usage: node scripts/tile-county.js "<OSM area name>"');
+const args = process.argv.slice(2);
+const COUNTIES = args[0] === '--rest-of-roi' ? REST_OF_ROI : args;
+
+if (COUNTIES.length === 0) {
+  console.error('Usage: node scripts/tile-county.js "<County Name>" ["<Another County>" ...] | --rest-of-roi');
   process.exit(1);
 }
 
@@ -23,15 +40,6 @@ const HIGHWAY_CLASSES = [
   'living_street',
 ];
 
-const query = `
-[out:json][timeout:180];
-area["name"="${AREA_NAME}"]["boundary"="administrative"]->.searchArea;
-(
-  way["highway"~"^(${HIGHWAY_CLASSES.join('|')})$"]["access"!~"^(private|no)$"](area.searchArea);
-);
-out geom;
-`;
-
 const ENDPOINTS = [
   'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
@@ -40,13 +48,15 @@ const ENDPOINTS = [
 
 const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
 const RETRY_DELAY_MS = 5000;
+const BETWEEN_COUNTIES_DELAY_MS = 5000;
 
 const CHUNK_TARGET_METERS = 100;
 const COORD_DECIMALS = 100000; // ~1.1m precision
 
-// Must match tileIdForPoint() in App.tsx exactly — 0.05° cells, ~5.5km x
-// ~3.5km at Irish latitudes.
+// Must match tileIdForPoint() in App.tsx exactly.
 const TILE_DEGREES = 0.05;
+
+const INDEX_PATH = 'tiles/county-index.json';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -93,11 +103,22 @@ function splitIntoChunks(coords, targetMeters) {
   return chunks;
 }
 
-async function queryOverpass() {
+function buildQuery(countyName) {
+  return `
+[out:json][timeout:180];
+area["name"="${countyName}"]["boundary"="administrative"]->.searchArea;
+(
+  way["highway"~"^(${HIGHWAY_CLASSES.join('|')})$"]["access"!~"^(private|no)$"](area.searchArea);
+);
+out geom;
+`;
+}
+
+async function queryOverpass(query, label) {
   let lastError;
   for (const endpoint of ENDPOINTS) {
     for (let attempt = 1; attempt <= 2; attempt++) {
-      console.log(`Querying ${endpoint} (attempt ${attempt})...`);
+      console.log(`  [${label}] querying ${endpoint} (attempt ${attempt})...`);
       try {
         const res = await fetch(endpoint, {
           method: 'POST',
@@ -111,33 +132,44 @@ async function queryOverpass() {
         if (res.ok) return res;
         lastError = new Error(`${endpoint} responded ${res.status} ${res.statusText}`);
         if (!RETRYABLE_STATUS.has(res.status)) throw lastError;
-        console.warn(`${lastError.message} — retrying...`);
+        console.warn(`  [${label}] ${lastError.message} — retrying...`);
       } catch (e) {
         lastError = e;
-        console.warn(`${e.message} — retrying...`);
+        console.warn(`  [${label}] ${e.message} — retrying...`);
       }
       await sleep(RETRY_DELAY_MS);
     }
   }
-  throw new Error(`All Overpass endpoints failed. Last error: ${lastError.message}`);
+  throw new Error(`All endpoints failed. Last error: ${lastError.message}`);
 }
 
-async function main() {
-  console.log(`Querying Overpass for public roads in "${AREA_NAME}"...`);
-  const res = await queryOverpass();
+function loadIndex() {
+  const fs = require('fs');
+  if (!fs.existsSync(INDEX_PATH)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(INDEX_PATH, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function saveIndex(index) {
+  const fs = require('fs');
+  fs.mkdirSync('tiles', { recursive: true });
+  fs.writeFileSync(INDEX_PATH, JSON.stringify(index));
+}
+
+async function tileOneCounty(countyName) {
+  const res = await queryOverpass(buildQuery(countyName), countyName);
   const data = await res.json();
 
   const tiles = new Map(); // tileId -> segments[]
-
   for (const el of data.elements || []) {
     if (el.type !== 'way' || !el.geometry) continue;
     const coords = el.geometry.map((pt) => [round(pt.lat), round(pt.lon)]);
     const chunks = splitIntoChunks(coords, CHUNK_TARGET_METERS);
     chunks.forEach((chunkCoords, i) => {
       const id = `way/${el.id}#${i}`;
-      // Tile is decided by the chunk's first point — chunks are ~100m and
-      // tiles are ~5km, so a chunk straddling a tile edge is rare enough
-      // to not worry about for now.
       const tid = tileIdForPoint(chunkCoords[0][0], chunkCoords[0][1]);
       if (!tiles.has(tid)) tiles.set(tid, []);
       tiles.get(tid).push({ id, coords: chunkCoords });
@@ -147,11 +179,49 @@ async function main() {
   const fs = require('fs');
   fs.mkdirSync('tiles', { recursive: true });
   for (const [tid, segments] of tiles) {
-    fs.writeFileSync(`tiles/${tid}.json`, JSON.stringify({ segments }));
+    let existingSegments = [];
+    const tilePath = `tiles/${tid}.json`;
+    if (fs.existsSync(tilePath)) {
+      try {
+        existingSegments = JSON.parse(fs.readFileSync(tilePath, 'utf8')).segments || [];
+      } catch {
+        // corrupt/unexpected existing file — just overwrite it below
+      }
+    }
+    const existingIds = new Set(existingSegments.map((s) => s.id));
+    const merged = [...existingSegments, ...segments.filter((s) => !existingIds.has(s.id))];
+    fs.writeFileSync(tilePath, JSON.stringify({ segments: merged }));
   }
 
+  const index = loadIndex();
+  index[countyName] = Array.from(tiles.keys());
+  saveIndex(index);
+
   const totalSegments = Array.from(tiles.values()).reduce((sum, s) => sum + s.length, 0);
-  console.log(`Wrote ${tiles.size} tiles covering ${AREA_NAME} (${totalSegments} segments total).`);
+  return { tileCount: tiles.size, segmentCount: totalSegments };
+}
+
+async function main() {
+  const succeeded = [];
+  const failed = [];
+
+  for (const county of COUNTIES) {
+    console.log(`\nTiling ${county}...`);
+    try {
+      const result = await tileOneCounty(county);
+      console.log(`  ${county}: ${result.tileCount} tiles, ${result.segmentCount} segments`);
+      succeeded.push(county);
+    } catch (e) {
+      console.error(`  FAILED for ${county}: ${e.message}`);
+      failed.push(county);
+    }
+    await sleep(BETWEEN_COUNTIES_DELAY_MS);
+  }
+
+  console.log(`\nDone. ${succeeded.length}/${COUNTIES.length} counties tiled successfully.`);
+  if (failed.length > 0) {
+    console.log(`Failed (re-run just these): node scripts/tile-county.js ${failed.map((c) => `"${c}"`).join(' ')}`);
+  }
 }
 
 main().catch((err) => {
