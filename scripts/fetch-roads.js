@@ -39,11 +39,27 @@ area["name"="${AREA_NAME}"]["boundary"="administrative"]->.searchArea;
 out geom;
 `;
 
+// Overpass is a shared free service — the main server occasionally times
+// out (504) or rate-limits (429) under load. Falling back to a different
+// mirror, and retrying, makes this reliable instead of a coin flip.
+const ENDPOINTS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://overpass.private.coffee/api/interpreter',
+];
+
+const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
+const RETRY_DELAY_MS = 5000;
+
 const CHUNK_TARGET_METERS = 100;
 // ~1.1m precision at this latitude — far tighter than the 25m match
 // threshold needs, but keeps the file much smaller than full float
 // precision would.
 const COORD_DECIMALS = 100000;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function haversine(a, b) {
   const [lat1, lon1] = a;
@@ -83,21 +99,40 @@ function splitIntoChunks(coords, targetMeters) {
   return chunks;
 }
 
+async function queryOverpass() {
+  let lastError;
+  for (const endpoint of ENDPOINTS) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      console.log(`Querying ${endpoint} (attempt ${attempt})...`);
+      try {
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'text/plain',
+            Accept: '*/*',
+            'User-Agent': 'tarmacked/0.1 (personal Ireland road-tracking project; github.com/0204Killian/tarmacked)',
+          },
+          body: query,
+        });
+
+        if (res.ok) return res;
+
+        lastError = new Error(`${endpoint} responded ${res.status} ${res.statusText}`);
+        if (!RETRYABLE_STATUS.has(res.status)) throw lastError; // not worth retrying, e.g. a bad query
+        console.warn(`${lastError.message} — retrying...`);
+      } catch (e) {
+        lastError = e;
+        console.warn(`${e.message} — retrying...`);
+      }
+      await sleep(RETRY_DELAY_MS);
+    }
+  }
+  throw new Error(`All Overpass endpoints failed. Last error: ${lastError.message}`);
+}
+
 async function main() {
   console.log(`Querying Overpass for public roads in "${AREA_NAME}"...`);
-  const res = await fetch('https://overpass-api.de/api/interpreter', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'text/plain',
-      Accept: '*/*',
-      'User-Agent': 'tarmacked/0.1 (personal Ireland road-tracking project; github.com/0204Killian/tarmacked)',
-    },
-    body: query,
-  });
-
-  if (!res.ok) {
-    throw new Error(`Overpass request failed: ${res.status} ${res.statusText}`);
-  }
+  const res = await queryOverpass();
 
   const data = await res.json();
   const segments = [];
