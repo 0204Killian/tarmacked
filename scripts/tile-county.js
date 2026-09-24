@@ -11,6 +11,8 @@
 //   node scripts/tile-county.js "County Carlow"
 //   node scripts/tile-county.js "County Cork" "County Kerry"
 //   node scripts/tile-county.js --rest-of-roi
+//   node scripts/tile-county.js --all-roi   (all 26 counties — use this for
+//     a full re-tile after the data format changes)
 
 const REST_OF_ROI = [
   'County Dublin', 'County Kildare', 'County Longford', 'County Louth',
@@ -21,11 +23,14 @@ const REST_OF_ROI = [
   'County Cavan', 'County Donegal', 'County Monaghan',
 ];
 
+const ALL_ROI = ['County Kilkenny', 'County Laois', 'County Carlow', ...REST_OF_ROI];
+
 const args = process.argv.slice(2);
-const COUNTIES = args[0] === '--rest-of-roi' ? REST_OF_ROI : args;
+const COUNTIES =
+  args[0] === '--all-roi' ? ALL_ROI : args[0] === '--rest-of-roi' ? REST_OF_ROI : args;
 
 if (COUNTIES.length === 0) {
-  console.error('Usage: node scripts/tile-county.js "<County Name>" ["<Another County>" ...] | --rest-of-roi');
+  console.error('Usage: node scripts/tile-county.js "<County Name>" ["<Another County>" ...] | --rest-of-roi | --all-roi');
   process.exit(1);
 }
 
@@ -83,6 +88,20 @@ function tileIdForPoint(lat, lon) {
   const latIdx = Math.floor(lat / TILE_DEGREES);
   const lonIdx = Math.floor(lon / TILE_DEGREES);
   return `t_${latIdx}_${lonIdx}`;
+}
+
+// Direction traffic may flow, relative to the way's drawn order:
+// 1 = with it, -1 = against it, 0 = both ways. Motorways and roundabouts
+// are one-way by default in OSM even without an explicit oneway tag.
+function onewayOf(tags) {
+  const t = tags || {};
+  const ow = t.oneway;
+  if (ow === 'no') return 0;
+  if (ow === 'yes' || ow === 'true' || ow === '1') return 1;
+  if (ow === '-1' || ow === 'reverse') return -1;
+  if (t.highway === 'motorway') return 1;
+  if (t.junction === 'roundabout' || t.junction === 'circular') return 1;
+  return 0;
 }
 
 function splitIntoChunks(coords, targetMeters) {
@@ -168,11 +187,14 @@ async function tileOneCounty(countyName) {
     if (el.type !== 'way' || !el.geometry) continue;
     const coords = el.geometry.map((pt) => [round(pt.lat), round(pt.lon)]);
     const chunks = splitIntoChunks(coords, CHUNK_TARGET_METERS);
+    const oneway = onewayOf(el.tags);
     chunks.forEach((chunkCoords, i) => {
       const id = `way/${el.id}#${i}`;
       const tid = tileIdForPoint(chunkCoords[0][0], chunkCoords[0][1]);
       if (!tiles.has(tid)) tiles.set(tid, []);
-      tiles.get(tid).push({ id, coords: chunkCoords });
+      const chunk = { id, coords: chunkCoords };
+      if (oneway !== 0) chunk.o = oneway; // omitted for two-way roads to keep files small
+      tiles.get(tid).push(chunk);
     });
   }
 
@@ -188,8 +210,12 @@ async function tileOneCounty(countyName) {
         // corrupt/unexpected existing file — just overwrite it below
       }
     }
-    const existingIds = new Set(existingSegments.map((s) => s.id));
-    const merged = [...existingSegments, ...segments.filter((s) => !existingIds.has(s.id))];
+    // Fresh data wins: a chunk re-fetched now replaces the old copy (so a
+    // re-tile actually updates things like the one-way flag), while chunks
+    // from a neighbouring county sharing this tile are kept.
+    const byId = new Map(existingSegments.map((s) => [s.id, s]));
+    for (const seg of segments) byId.set(seg.id, seg);
+    const merged = Array.from(byId.values());
     fs.writeFileSync(tilePath, JSON.stringify({ segments: merged }));
   }
 
