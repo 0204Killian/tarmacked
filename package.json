@@ -10,7 +10,11 @@
   "dependencies": {
     "@react-native-async-storage/async-storage": "2.2.0",
     "expo": "^57.0.24",
+    "expo-document-picker": "~57.0.2",
+    "expo-file-system": "~57.0.7",
     "expo-location": "~57.0.19",
+    "expo-sharing": "~57.0.22",
+    "expo-sqlite": "~57.0.3",
     "expo-task-manager": "~57.0.19",
     "react": "19.2.3",
     "react-native": "0.86.3",
