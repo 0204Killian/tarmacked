@@ -12,6 +12,9 @@
 //    re-downloaded, so stale areas get cleared out automatically.
 //  - driven roads store their own shape, so they keep drawing even when
 //    the tile cache for that area has been cleared.
+//  - unmarked: roads you un-marked by hand, and when — so re-checking your
+//    drives doesn't put them back (unless you drive them again later).
+//  - driven_removed: roads a re-check took away, kept so it can be undone.
 
 import * as SQLite from 'expo-sqlite';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -48,7 +51,17 @@ async function openDb() {
       pinned INTEGER NOT NULL DEFAULT 0,
       last_used_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS unmarked (id TEXT PRIMARY KEY NOT NULL, at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS driven_removed (
+      id TEXT PRIMARY KEY NOT NULL, shape TEXT, first_at INTEGER, county INTEGER, removed_at INTEGER NOT NULL
+    );
   `);
+  // v0.13: per-drive summary columns.
+  const cols = await db.getAllAsync<{ name: string }>('PRAGMA table_info(drives)');
+  const have = new Set(cols.map((c) => c.name));
+  if (!have.has('ended_at')) await db.execAsync('ALTER TABLE drives ADD COLUMN ended_at INTEGER');
+  if (!have.has('distance_m')) await db.execAsync('ALTER TABLE drives ADD COLUMN distance_m REAL');
+  if (!have.has('new_m')) await db.execAsync('ALTER TABLE drives ADD COLUMN new_m REAL');
   return db;
 }
 
@@ -126,7 +139,6 @@ const OLD_KEYS = {
  */
 export async function migrateIfNeeded(): Promise<string | null> {
   if (await getMeta('migrated_from_asyncstorage')) return null;
-  const db = await getDb();
 
   const [drivenRaw, excludedRaw, unmatchedRaw, tilesRaw, onboardedRaw, homeRaw, trailRaw] = await Promise.all([
     AsyncStorage.getItem(OLD_KEYS.driven),
@@ -290,7 +302,6 @@ export async function setExcluded(id: string, excluded: boolean, county: number 
 
 export async function addUnmatched(points: StoredPoint[]) {
   if (points.length === 0) return;
-  const db = await getDb();
   await write(async (db) => {
     await bulk(
       db,
@@ -301,7 +312,6 @@ export async function addUnmatched(points: StoredPoint[]) {
 }
 
 export async function replaceUnmatched(points: StoredPoint[]) {
-  const db = await getDb();
   await write(async (db) => {
     await db.runAsync('DELETE FROM unmatched');
     await bulk(
@@ -321,7 +331,6 @@ export async function startDrive(startedAt: number): Promise<number> {
 
 export async function addPoints(driveId: number, points: StoredPoint[]) {
   if (points.length === 0) return;
-  const db = await getDb();
   await write(async (db) => {
     await bulk(
       db,
@@ -331,30 +340,199 @@ export async function addPoints(driveId: number, points: StoredPoint[]) {
   });
 }
 
-// Every saved drive, oldest first. Only loaded on demand (showing the raw
-// trail, re-running matching) since it's the part that grows over time.
-export async function loadDrives(): Promise<StoredPoint[][]> {
+export type DriveRecord = { id: number; startedAt: number; points: StoredPoint[] };
+
+// Every saved drive with its points, oldest first. Only loaded on demand
+// (re-checking drives, showing the raw trail) since it keeps growing.
+export async function loadDrives(): Promise<DriveRecord[]> {
   const db = await getDb();
-  const rows = await db.getAllAsync<{ drive_id: number; lat: number; lon: number; t: number }>(
-    'SELECT drive_id, lat, lon, t FROM points ORDER BY drive_id, rowid'
+  const drives = await db.getAllAsync<{ id: number; started_at: number }>(
+    'SELECT id, started_at FROM drives ORDER BY started_at'
   );
-  const sessions: StoredPoint[][] = [];
-  let currentId: number | null = null;
+  const rows = await db.getAllAsync<{ drive_id: number; lat: number; lon: number; t: number }>(
+    'SELECT drive_id, lat, lon, t FROM points ORDER BY drive_id, t, rowid'
+  );
+  const byDrive = new Map<number, StoredPoint[]>();
   for (const r of rows) {
-    if (r.drive_id !== currentId) {
-      sessions.push([]);
-      currentId = r.drive_id;
-    }
-    sessions[sessions.length - 1].push({ latitude: r.lat, longitude: r.lon, timestamp: r.t });
+    const p = { latitude: r.lat, longitude: r.lon, timestamp: r.t };
+    const list = byDrive.get(r.drive_id);
+    if (list) list.push(p);
+    else byDrive.set(r.drive_id, [p]);
   }
-  return sessions;
+  return drives.map((d) => ({ id: d.id, startedAt: d.started_at, points: byDrive.get(d.id) || [] }));
+}
+
+export async function loadDrivePoints(driveId: number): Promise<StoredPoint[]> {
+  const db = await getDb();
+  const rows = await db.getAllAsync<{ lat: number; lon: number; t: number }>(
+    'SELECT lat, lon, t FROM points WHERE drive_id = ? ORDER BY t, rowid',
+    [driveId]
+  );
+  return rows.map((r) => ({ latitude: r.lat, longitude: r.lon, timestamp: r.t }));
+}
+
+export type DriveSummary = {
+  id: number;
+  startedAt: number;
+  endedAt: number | null;
+  distanceM: number | null;
+  newM: number | null;
+  pointCount: number;
+};
+
+// For the Drives list, newest first.
+export async function listDrives(): Promise<DriveSummary[]> {
+  const db = await getDb();
+  const rows = await db.getAllAsync<{
+    id: number;
+    started_at: number;
+    ended_at: number | null;
+    distance_m: number | null;
+    new_m: number | null;
+    n: number;
+    last_t: number | null;
+  }>(
+    'SELECT d.id, d.started_at, d.ended_at, d.distance_m, d.new_m, COUNT(p.drive_id) AS n, MAX(p.t) AS last_t ' +
+      'FROM drives d LEFT JOIN points p ON p.drive_id = d.id GROUP BY d.id ORDER BY d.started_at DESC'
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    startedAt: r.started_at,
+    endedAt: r.ended_at ?? r.last_t,
+    distanceM: r.distance_m,
+    newM: r.new_m,
+    pointCount: r.n,
+  }));
+}
+
+export async function setDriveStats(rows: { id: number; endedAt: number | null; distanceM: number; newM: number }[]) {
+  if (rows.length === 0) return;
+  await write(async (db) => {
+    await bulk(
+      db,
+      'UPDATE drives SET ended_at = COALESCE(?, ended_at), distance_m = ?, new_m = ? WHERE id = ?',
+      rows.map((r) => [r.endedAt, r.distanceM, r.newM, r.id])
+    );
+  });
+}
+
+export async function deleteDrive(driveId: number) {
+  await write(async (db) => {
+    await db.runAsync('DELETE FROM points WHERE drive_id = ?', [driveId]);
+    await db.runAsync('DELETE FROM drives WHERE id = ?', [driveId]);
+  });
+}
+
+/**
+ * Tidies the saved drives, once: a recording with a long pause in it (the
+ * tracker left on between two trips) is split into separate drives, and
+ * empty recordings are dropped. No points are deleted except those in
+ * recordings with fewer than 2 points.
+ */
+export async function splitDrivesOnGaps(gapMs: number): Promise<{ split: number; dropped: number }> {
+  const db = await getDb();
+  const drives = await db.getAllAsync<{ id: number }>('SELECT id FROM drives');
+  let split = 0;
+  let dropped = 0;
+  await write(async (db) => {
+    for (const d of drives) {
+      const ts = await db.getAllAsync<{ t: number }>('SELECT t FROM points WHERE drive_id = ? ORDER BY t', [d.id]);
+      if (ts.length < 2) {
+        await db.runAsync('DELETE FROM points WHERE drive_id = ?', [d.id]);
+        await db.runAsync('DELETE FROM drives WHERE id = ?', [d.id]);
+        dropped++;
+        continue;
+      }
+      const starts: number[] = [];
+      for (let i = 1; i < ts.length; i++) if (ts[i].t - ts[i - 1].t > gapMs) starts.push(ts[i].t);
+      // Latest piece first, so each move only takes that piece's points.
+      for (const start of starts.reverse()) {
+        let startedAt = start;
+        let res = await db.runAsync('INSERT OR IGNORE INTO drives (started_at) VALUES (?)', [startedAt]);
+        while (res.changes === 0) {
+          startedAt += 1; // started_at must be unique
+          res = await db.runAsync('INSERT OR IGNORE INTO drives (started_at) VALUES (?)', [startedAt]);
+        }
+        await db.runAsync('UPDATE points SET drive_id = ? WHERE drive_id = ? AND t >= ?', [res.lastInsertRowId, d.id, start]);
+        split++;
+      }
+    }
+  });
+  // Pieces that only got 1 point are dropped too.
+  const tiny = await db.getAllAsync<{ id: number }>(
+    'SELECT d.id FROM drives d LEFT JOIN points p ON p.drive_id = d.id GROUP BY d.id HAVING COUNT(p.drive_id) < 2'
+  );
+  if (tiny.length > 0) {
+    await write(async (db) => {
+      for (const d of tiny) {
+        await db.runAsync('DELETE FROM points WHERE drive_id = ?', [d.id]);
+        await db.runAsync('DELETE FROM drives WHERE id = ?', [d.id]);
+      }
+    });
+    dropped += tiny.length;
+  }
+  return { split, dropped };
+}
+
+// --- hand edits and re-check results ---
+
+export async function markUnmarked(id: string) {
+  await write((db) => db.runAsync('INSERT OR REPLACE INTO unmarked (id, at) VALUES (?, ?)', [id, Date.now()]));
+}
+
+export async function loadUnmarked(): Promise<Map<string, number>> {
+  const db = await getDb();
+  const rows = await db.getAllAsync<{ id: string; at: number }>('SELECT id, at FROM unmarked');
+  return new Map(rows.map((r) => [r.id, r.at]));
+}
+
+/**
+ * Applies the result of re-checking drives: adds newly confirmed roads and
+ * removes ones that no longer pass. Removed roads are kept in
+ * driven_removed so the change can be undone.
+ */
+export async function applyRecheck(
+  add: { id: string; shape: Shape | null; county: number | null }[],
+  remove: string[]
+) {
+  const now = Date.now();
+  await write(async (db) => {
+    await bulk(
+      db,
+      'INSERT OR REPLACE INTO driven_removed (id, shape, first_at, county, removed_at) ' +
+        'SELECT id, shape, first_at, county, ? FROM driven WHERE id = ?',
+      remove.map((id) => [now, id])
+    );
+    await bulk(db, 'DELETE FROM driven WHERE id = ?', remove.map((id) => [id]));
+    await bulk(db, DRIVEN_UPSERT, add.map((r) => [r.id, r.shape ? JSON.stringify(r.shape) : null, now, r.county]));
+  });
+}
+
+export async function countRemoved(): Promise<number> {
+  const db = await getDb();
+  const row = await db.getFirstAsync<{ n: number }>('SELECT COUNT(*) AS n FROM driven_removed');
+  return row?.n ?? 0;
+}
+
+// Puts back everything re-checks have removed.
+export async function restoreRemoved(): Promise<number> {
+  const n = await countRemoved();
+  if (n === 0) return 0;
+  await write(async (db) => {
+    await db.runAsync(
+      'INSERT OR IGNORE INTO driven (id, shape, first_at, county) SELECT id, shape, first_at, county FROM driven_removed'
+    );
+    await db.runAsync('DELETE FROM driven_removed');
+    // Anything restored shouldn't be taken away again by the next re-check.
+    await db.runAsync('DELETE FROM unmarked WHERE id IN (SELECT id FROM driven)');
+  });
+  return n;
 }
 
 // --- tile cache (disposable) ---
 
 export async function putTiles(entries: TileEntry[], pinned: boolean) {
   if (entries.length === 0) return;
-  const db = await getDb();
   const now = Date.now();
   await write(async (db) => {
     await bulk(
@@ -370,7 +548,6 @@ export async function putTiles(entries: TileEntry[], pinned: boolean) {
 // cleared out as stale.
 export async function touchTiles(tileIds: string[]) {
   if (tileIds.length === 0) return;
-  const db = await getDb();
   const now = Date.now();
   await write(async (db) => {
     await bulk(db, 'UPDATE tiles SET last_used_at = ? WHERE tile_id = ?', tileIds.map((id) => [now, id]));
@@ -391,13 +568,14 @@ export async function clearTiles() {
 // --- reset (dev tool) ---
 
 export async function resetProgress() {
-  const db = await getDb();
   await write(async (db) => {
     await db.runAsync('DELETE FROM driven');
     await db.runAsync('DELETE FROM excluded_roads');
     await db.runAsync('DELETE FROM unmatched');
     await db.runAsync('DELETE FROM points');
     await db.runAsync('DELETE FROM drives');
+    await db.runAsync('DELETE FROM unmarked');
+    await db.runAsync('DELETE FROM driven_removed');
   });
 }
 
@@ -419,6 +597,7 @@ export async function exportBackup() {
   );
   const unmatched = await db.getAllAsync<{ lat: number; lon: number; t: number }>('SELECT lat, lon, t FROM unmatched');
   const drives = await db.getAllAsync<{ id: number; started_at: number }>('SELECT id, started_at FROM drives ORDER BY id');
+  const unmarked = await db.getAllAsync<{ id: string; at: number }>('SELECT id, at FROM unmarked');
   const points = await db.getAllAsync<{ drive_id: number; lat: number; lon: number; t: number }>(
     'SELECT drive_id, lat, lon, t FROM points ORDER BY drive_id, rowid'
   );
@@ -437,6 +616,7 @@ export async function exportBackup() {
     excluded: excluded.map((r) => ({ id: r.id, c: r.county, l: r.length_m })),
     unmatched: unmatched.map((r) => [r.lat, r.lon, r.t]),
     drives: drives.map((d) => ({ startedAt: d.started_at, points: pointsByDrive.get(d.id) || [] })),
+    unmarked: unmarked.map((u) => [u.id, u.at]),
   };
 }
 
@@ -448,7 +628,6 @@ export async function exportBackup() {
 export async function importBackup(data: any) {
   if (!data || data.format !== BACKUP_FORMAT) throw new Error("That file isn't a tarmacked backup.");
   if (data.version !== BACKUP_VERSION) throw new Error(`Unsupported backup version (${data.version}).`);
-  const db = await getDb();
   let drivesAdded = 0;
   await write(async (db) => {
     await bulk(
@@ -476,6 +655,7 @@ export async function importBackup(data: any) {
       );
       drivesAdded++;
     }
+    await bulk(db, 'INSERT OR IGNORE INTO unmarked (id, at) VALUES (?, ?)', data.unmarked || []);
     if (data.homeCounty) {
       await db.runAsync("INSERT OR IGNORE INTO meta (key, value) VALUES ('home_county', ?)", [data.homeCounty]);
     }
