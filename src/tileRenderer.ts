@@ -10,7 +10,7 @@
 // double resolution for sharpness. Only the area on screen (plus a margin)
 // is drawn, at the zoom levels the map is likely to ask for.
 
-import { Skia, PaintStyle, StrokeCap, StrokeJoin, SkSurface } from '@shopify/react-native-skia';
+import type { SkSurface } from '@shopify/react-native-skia';
 import { Directory, File, Paths } from 'expo-file-system';
 import { Coord, lonToWorldX, latToWorldY } from './geo';
 
@@ -24,6 +24,15 @@ const GRID_DEG = 0.02; // lookup grid for shapes, ~2km
 export type ViewRegion = { latitude: number; longitude: number; latitudeDelta: number; longitudeDelta: number };
 
 type Shape = { coords: Coord[]; minLat: number; maxLat: number; minLon: number; maxLon: number };
+
+// Skia is loaded only when the renderer is created, inside a try — if its
+// native part is missing from a build, the app falls back to drawing lines
+// instead of failing to start.
+let SkiaLib: typeof import('@shopify/react-native-skia') | null = null;
+function loadSkia() {
+  if (!SkiaLib) SkiaLib = require('@shopify/react-native-skia');
+  return SkiaLib!;
+}
 
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -51,6 +60,7 @@ export class DrivenTileRenderer {
       // ignore — a fresh generation folder is used anyway
     }
     this.root.create({ intermediates: true, idempotent: true });
+    const { Skia } = loadSkia();
     this.surface = Skia.Surface.Make(TILE_PX, TILE_PX) ?? Skia.Surface.MakeOffscreen(TILE_PX, TILE_PX);
     if (!this.surface) throw new Error("couldn't create a drawing surface");
   }
@@ -141,6 +151,7 @@ export class DrivenTileRenderer {
 
   // Returns true if a picture was written (tiles with no roads are skipped).
   private drawTile(z: number, x: number, y: number): boolean {
+    const { Skia, PaintStyle, StrokeCap, StrokeJoin } = loadSkia();
     const { outline, core } = strokeFor(z);
     const originX = x * 256;
     const originY = y * 256;

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { Component, ReactNode, useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { StyleSheet, Text, View, Pressable, ScrollView, ActivityIndicator, Dimensions } from 'react-native';
 import MapView, { Polyline, LocalTile, PROVIDER_DEFAULT, MapPressEvent, MapType, Region } from 'react-native-maps';
 import * as Location from 'expo-location';
@@ -118,7 +118,37 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   ]);
 }
 
-export default function App() {
+// If anything goes wrong while drawing the screen, show the error instead
+// of a blank screen, so it can be reported.
+class CrashScreen extends Component<{ children: ReactNode }, { error: Error | null }> {
+  state = { error: null as Error | null };
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+  render() {
+    const { error } = this.state;
+    if (!error) return this.props.children;
+    return (
+      <View style={styles.onboardContainer}>
+        <Text style={styles.onboardTitle}>Something went wrong</Text>
+        <Text style={styles.onboardText}>Screenshot this and send it on:</Text>
+        <ScrollView style={styles.countyList}>
+          <Text style={styles.logText}>{`${error.message}\n\n${error.stack ?? ''}`}</Text>
+        </ScrollView>
+      </View>
+    );
+  }
+}
+
+export default function Root() {
+  return (
+    <CrashScreen>
+      <App />
+    </CrashScreen>
+  );
+}
+
+function App() {
   // null = still loading; false = needs onboarding; true = ready
   const [onboarded, setOnboarded] = useState<boolean | null>(null);
   const [onboardingCounties, setOnboardingCounties] = useState<string[] | null>(null);
@@ -196,6 +226,7 @@ export default function App() {
   const [renderMode, setRenderMode] = useState<RenderMode>('images');
   const [tileKey, setTileKey] = useState(0);
   const [dataLoaded, setDataLoaded] = useState(false);
+  const [bootStep, setBootStep] = useState('Starting…');
 
   const setNote = useCallback((text: string) => {
     setNoteText(text);
@@ -364,14 +395,18 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
+        setBootStep('Opening your data…');
         const migrated = await store.migrateIfNeeded();
         if (migrated) setNote(migrated);
       } catch (e) {
         setNote(`Couldn't move your data to the new storage yet (${(e as Error).message}). Nothing was deleted — it retries next launch.`);
       }
       try {
+        setBootStep('Clearing old road data…');
         await store.evictStaleTiles();
+        setBootStep('Loading your roads…');
         const data = await store.loadAll();
+        setBootStep('Setting up the map…');
         for (const d of data.driven) {
           drivenRef.current.add(d.id);
           rememberDriven(d.id, d.shape, d.county);
@@ -395,6 +430,7 @@ export default function App() {
         setOnboarded(data.onboarded);
         setDataLoaded(true);
       } catch (e) {
+        setBootStep(`Couldn't load saved data: ${(e as Error).message}`);
         setNote(`Couldn't load saved data: ${(e as Error).message}`);
         setOnboarded(false);
       }
@@ -1099,6 +1135,7 @@ export default function App() {
     return (
       <View style={styles.onboardContainer}>
         <ActivityIndicator color="#39d353" size="large" />
+        <Text style={[styles.onboardText, { marginTop: 16 }]}>{bootStep}</Text>
       </View>
     );
   }
