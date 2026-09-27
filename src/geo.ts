@@ -54,22 +54,34 @@ export function neighbourTileIds(lat: number, lon: number): string[] {
   return ids;
 }
 
-// --- Web Mercator, for the rendered map-image tiles ---
-
-export function lonToWorldX(lon: number, z: number) {
-  return ((lon + 180) / 360) * 256 * 2 ** z;
-}
-
-export function latToWorldY(lat: number, z: number) {
-  const s = Math.sin(toRad(Math.max(-85, Math.min(85, lat))));
-  return (0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)) * 256 * 2 ** z;
-}
-
-export function worldXToLon(x: number, z: number) {
-  return (x / (256 * 2 ** z)) * 360 - 180;
-}
-
-export function worldYToLat(y: number, z: number) {
-  const n = Math.PI - (2 * Math.PI * y) / (256 * 2 ** z);
-  return (180 / Math.PI) * Math.atan(Math.sinh(n));
+// Drops points that don't change a line's shape by more than `tolerance`
+// (in degrees) — Ramer–Douglas–Peucker. Used to draw less detail when
+// zoomed out.
+export function simplifyLine(coords: Coord[], tolerance: number): Coord[] {
+  if (coords.length <= 2) return coords;
+  const keep = new Uint8Array(coords.length);
+  keep[0] = keep[coords.length - 1] = 1;
+  const stack: [number, number][] = [[0, coords.length - 1]];
+  const tol2 = tolerance * tolerance;
+  while (stack.length) {
+    const [a, b] = stack.pop()!;
+    const [ay, ax] = coords[a];
+    const [by, bx] = coords[b];
+    const dx = bx - ax, dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    let worst = -1, worstD = tol2;
+    for (let i = a + 1; i < b; i++) {
+      const [py, px] = coords[i];
+      let t = len2 === 0 ? 0 : ((px - ax) * dx + (py - ay) * dy) / len2;
+      t = Math.max(0, Math.min(1, t));
+      const ex = ax + t * dx - px, ey = ay + t * dy - py;
+      const d = ex * ex + ey * ey;
+      if (d > worstD) { worstD = d; worst = i; }
+    }
+    if (worst >= 0) {
+      keep[worst] = 1;
+      stack.push([a, worst], [worst, b]);
+    }
+  }
+  return coords.filter((_, i) => keep[i] === 1);
 }
