@@ -62,6 +62,78 @@ const COORD_DECIMALS = 100000; // ~1.1m precision
 const TILE_DEGREES = 0.05;
 
 const INDEX_PATH = 'tiles/county-index.json';
+const STATS_PATH = 'tiles/county-stats.json';
+
+// Fixed county codes — each road chunk stores its county as a small number
+// (index into this list) to keep tile files small. Never reorder this list:
+// the app and already-generated tiles depend on the numbers.
+const COUNTY_CODES = [
+  'County Carlow', 'County Cavan', 'County Clare', 'County Cork', 'County Donegal',
+  'County Dublin', 'County Galway', 'County Kerry', 'County Kildare', 'County Kilkenny',
+  'County Laois', 'County Leitrim', 'County Limerick', 'County Longford', 'County Louth',
+  'County Mayo', 'County Meath', 'County Monaghan', 'County Offaly', 'County Roscommon',
+  'County Sligo', 'County Tipperary', 'County Waterford', 'County Westmeath', 'County Wexford',
+  'County Wicklow',
+];
+
+// --- County boundaries ---
+// A road crossing a county line is returned in BOTH counties' downloads,
+// so "which download did it come from" isn't good enough. Instead each
+// chunk's midpoint is tested against the county's actual boundary shape.
+
+const BAND_DEGREES = 0.01;
+
+function boundaryQuery(countyName) {
+  return `
+[out:json][timeout:180];
+rel["name"="${countyName}"]["boundary"="administrative"];
+out geom;
+`;
+}
+
+// Turns the boundary relation into line segments, bucketed into thin
+// latitude bands so each point test only checks nearby boundary segments.
+function buildBoundary(data, countyName) {
+  const rels = (data.elements || []).filter((e) => e.type === 'relation');
+  if (rels.length === 0) throw new Error(`no boundary found for ${countyName}`);
+  // Prefer the county-level boundary if the name matches more than one.
+  const rel = rels.find((r) => r.tags && r.tags.admin_level === '6') || rels[0];
+  const bands = new Map();
+  let segCount = 0;
+  for (const m of rel.members || []) {
+    if (m.type !== 'way' || !m.geometry) continue;
+    for (let i = 0; i < m.geometry.length - 1; i++) {
+      const a = m.geometry[i];
+      const b = m.geometry[i + 1];
+      if (!a || !b) continue;
+      const seg = [a.lat, a.lon, b.lat, b.lon];
+      const lo = Math.floor(Math.min(a.lat, b.lat) / BAND_DEGREES);
+      const hi = Math.floor(Math.max(a.lat, b.lat) / BAND_DEGREES);
+      for (let k = lo; k <= hi; k++) {
+        if (!bands.has(k)) bands.set(k, []);
+        bands.get(k).push(seg);
+      }
+      segCount++;
+    }
+  }
+  if (segCount === 0) throw new Error(`boundary for ${countyName} has no geometry`);
+  return bands;
+}
+
+// Standard ray-casting point-in-polygon: count how many boundary lines a
+// ray heading due east from the point crosses. Odd = inside.
+function insideBoundary(bands, lat, lon) {
+  const list = bands.get(Math.floor(lat / BAND_DEGREES));
+  if (!list) return false;
+  let inside = false;
+  for (const [y1, x1, y2, x2] of list) {
+    if (y1 > lat !== y2 > lat) {
+      const x = x1 + ((lat - y1) * (x2 - x1)) / (y2 - y1);
+      if (x > lon) inside = !inside;
+    }
+  }
+  return inside;
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -179,8 +251,15 @@ function saveIndex(index) {
 }
 
 async function tileOneCounty(countyName) {
+  const code = COUNTY_CODES.indexOf(countyName);
+  if (code < 0) throw new Error(`${countyName} isn't in the county code list`);
+
   const res = await queryOverpass(buildQuery(countyName), countyName);
   const data = await res.json();
+
+  await sleep(BETWEEN_COUNTIES_DELAY_MS);
+  const bRes = await queryOverpass(boundaryQuery(countyName), `${countyName} boundary`);
+  const boundary = buildBoundary(await bRes.json(), countyName);
 
   const tiles = new Map(); // tileId -> segments[]
   for (const el of data.elements || []) {
@@ -194,6 +273,11 @@ async function tileOneCounty(countyName) {
       if (!tiles.has(tid)) tiles.set(tid, []);
       const chunk = { id, coords: chunkCoords };
       if (oneway !== 0) chunk.o = oneway; // omitted for two-way roads to keep files small
+      // County = whichever county the chunk's midpoint is actually in.
+      // Chunks outside this county (the far end of a road that crosses the
+      // border) are left untagged here; that county's own run tags them.
+      const mid = chunkCoords[Math.floor(chunkCoords.length / 2)];
+      if (insideBoundary(boundary, mid[0], mid[1])) chunk.c = code;
       tiles.get(tid).push(chunk);
     });
   }
@@ -214,7 +298,12 @@ async function tileOneCounty(countyName) {
     // re-tile actually updates things like the one-way flag), while chunks
     // from a neighbouring county sharing this tile are kept.
     const byId = new Map(existingSegments.map((s) => [s.id, s]));
-    for (const seg of segments) byId.set(seg.id, seg);
+    for (const seg of segments) {
+      const prev = byId.get(seg.id);
+      // Keep a county tag set by the neighbouring county's run.
+      if (prev && prev.c !== undefined && seg.c === undefined) byId.set(seg.id, { ...seg, c: prev.c });
+      else byId.set(seg.id, seg);
+    }
     const merged = Array.from(byId.values());
     fs.writeFileSync(tilePath, JSON.stringify({ segments: merged }));
   }
@@ -245,9 +334,42 @@ async function main() {
   }
 
   console.log(`\nDone. ${succeeded.length}/${COUNTIES.length} counties tiled successfully.`);
+  writeCountyStats();
   if (failed.length > 0) {
     console.log(`Failed (re-run just these): node scripts/tile-county.js ${failed.map((c) => `"${c}"`).join(' ')}`);
   }
+}
+
+// Totals every road chunk across all tiles, once each, by county — the real
+// denominators for the app's county and national percentages.
+function writeCountyStats() {
+  const fs = require('fs');
+  const totals = new Array(COUNTY_CODES.length).fill(0);
+  let outside = 0;
+  const seen = new Set();
+  for (const name of fs.readdirSync('tiles')) {
+    if (!name.startsWith('t_') || !name.endsWith('.json')) continue;
+    const { segments } = JSON.parse(fs.readFileSync(`tiles/${name}`, 'utf8'));
+    for (const seg of segments || []) {
+      if (seen.has(seg.id)) continue;
+      seen.add(seg.id);
+      let len = 0;
+      for (let i = 0; i < seg.coords.length - 1; i++) len += haversine(seg.coords[i], seg.coords[i + 1]);
+      if (seg.c === undefined) outside += len;
+      else totals[seg.c] += len;
+    }
+  }
+  const national = totals.reduce((a, b) => a + b, 0);
+  fs.writeFileSync(
+    STATS_PATH,
+    JSON.stringify({ generatedAt: Date.now(), counties: COUNTY_CODES, totalMeters: totals.map(Math.round), nationalMeters: Math.round(national) })
+  );
+  console.log(`\nCounty totals written to ${STATS_PATH}:`);
+  COUNTY_CODES.forEach((c, i) => console.log(`  ${c}: ${(totals[i] / 1000).toFixed(0)} km`));
+  console.log(`  Republic of Ireland: ${(national / 1000).toFixed(0)} km`);
+  if (outside > 0) console.log(`  (${(outside / 1000).toFixed(0)} km just over the border/outside the Republic — not counted)`);
+  const empty = COUNTY_CODES.filter((_, i) => totals[i] === 0);
+  if (empty.length > 0) console.log(`  WARNING: no roads counted yet for: ${empty.join(', ')}`);
 }
 
 main().catch((err) => {

@@ -4,6 +4,10 @@ export type RoadSegment = {
   // One-way: 1 = traffic flows in coords order, -1 = against coords order,
   // absent = two-way. Comes from OSM's oneway / motorway / roundabout tags.
   o?: 1 | -1;
+  // County code (index into the county list in county-stats.json), from
+  // the county boundary the chunk's midpoint falls inside. Absent for the
+  // bits of border roads that are outside the Republic.
+  c?: number;
 };
 
 export type LatLon = { latitude: number; longitude: number };
