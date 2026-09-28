@@ -8,6 +8,9 @@ export type RoadSegment = {
   o?: 1 | -1;
   // County code (index into county-stats.json's list). Absent outside the Republic.
   c?: number;
+  // Road name / number from OSM (e.g. "N77 Kilkenny Road"). Absent on
+  // unnamed roads and in tiles made before v0.14.
+  n?: string;
 };
 
 export const SNAP_THRESHOLD_METERS = 25;
@@ -158,14 +161,40 @@ export class RoadNetwork {
     return out;
   }
 
-  // Shape of a chunk or section, if its chunk is downloaded.
+  // Shape of a chunk, a section, or any stretch "<chunk>~<a>-<b>" (metres
+  // along the chunk), if its chunk is downloaded.
   shapeOf(id: string): Coord[] | null {
     const base = baseChunkId(id);
     const seg = this.segs.get(base);
     if (!seg) return null;
     if (base === id) return seg.coords;
     const sec = this.sections(base).find((x) => x.id === id);
-    return sec ? seg.coords.slice(sec.i0, sec.i1 + 1) : null;
+    if (sec) return seg.coords.slice(sec.i0, sec.i1 + 1);
+    const m = /~(\d+)-(\d+)$/.exec(id);
+    return m ? this.subShape(base, Number(m[1]), Number(m[2])) : null;
+  }
+
+  // The part of a chunk between two distances along it.
+  subShape(id: string, a: number, b: number): Coord[] | null {
+    const seg = this.segs.get(id);
+    const cum = this.cum.get(id);
+    if (!seg || !cum || b <= a) return null;
+    const at = (d: number): Coord => {
+      let i = 1;
+      while (i < cum.length - 1 && cum[i] < d) i++;
+      const span = cum[i] - cum[i - 1];
+      const f = span > 0 ? Math.max(0, Math.min(1, (d - cum[i - 1]) / span)) : 0;
+      const p = seg.coords[i - 1], q = seg.coords[i];
+      return [p[0] + (q[0] - p[0]) * f, p[1] + (q[1] - p[1]) * f];
+    };
+    const out: Coord[] = [at(a)];
+    for (let i = 0; i < cum.length; i++) if (cum[i] > a && cum[i] < b) out.push(seg.coords[i]);
+    out.push(at(b));
+    return out;
+  }
+
+  nameOf(id: string): string | null {
+    return this.segs.get(baseChunkId(id))?.n ?? null;
   }
 
   countyOf(id: string): number | null {

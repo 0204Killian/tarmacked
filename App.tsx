@@ -1,15 +1,17 @@
 import { Component, ReactNode, useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { StyleSheet, Text, View, Pressable, ScrollView, ActivityIndicator } from 'react-native';
-import MapView, { Polyline, PROVIDER_DEFAULT, MapPressEvent, MapType, Region } from 'react-native-maps';
+import MapView, { Polyline, UrlTile, PROVIDER_DEFAULT, MapPressEvent, MapType, Region } from 'react-native-maps';
 import * as Location from 'expo-location';
+import * as Battery from 'expo-battery';
 import * as TaskManager from 'expo-task-manager';
 import { File, Paths } from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import * as DocumentPicker from 'expo-document-picker';
 import * as store from './src/storage';
 import { RoadNetwork, RoadSegment, parseChunkId, baseChunkId } from './src/roadMatcher';
-import { DriveMatcher, Point } from './src/coverage';
+import { DriveMatcher, Point, PieceIndex, isPatchy } from './src/coverage';
 import { recheckDrives } from './src/recheck';
+import { HEAT_STEPS, heatStep, stepColor, rankRoads, RoadRank } from './src/heat';
 import { Coord, lineLengthMeters, distanceMeters, tileIdForPoint, neighbourTileIds, simplifyLine } from './src/geo';
 
 // Every road tile is fetched live from the public repo over GitHub's raw
@@ -31,7 +33,36 @@ type Panel = null | 'stats' | 'drives' | 'dev';
 type Chain = { coords: Coord[]; minLat: number; maxLat: number; minLon: number; maxLon: number };
 
 const shortCounty = (name: string) => name.replace(/^County /, '');
-const MAP_TYPES: MapType[] = ['standard', 'satellite', 'hybrid'];
+// 'osm' = OpenStreetMap tiles drawn over a plain Apple map (the default).
+type MapChoice = 'osm' | MapType;
+const MAP_TYPES: MapChoice[] = ['osm', 'standard', 'satellite', 'hybrid'];
+const MAP_LABELS: Record<MapChoice, string> = { osm: 'OSM', standard: 'Apple', satellite: 'Satellite', hybrid: 'Hybrid' } as Record<MapChoice, string>;
+const OSM_TILE_URL = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+
+// GPS accuracy modes. Savings come from logging less often and letting
+// the phone batch updates; accuracy stays high in every mode so points
+// aren't thrown away by the wild-GPS filter.
+type AccuracyMode = 'high' | 'balanced' | 'saver' | 'auto';
+const ACCURACY_MODES: { key: AccuracyMode; label: string; info: string }[] = [
+  { key: 'high', label: 'High', info: 'Recommended. A point every ~10 m. Most accurate, most battery.' },
+  { key: 'balanced', label: 'Balanced', info: 'A point every ~20 m, delivered in batches. Less battery.' },
+  { key: 'saver', label: 'Saver', info: 'A point every ~35 m, big batches. Least battery; short roads may be missed.' },
+  { key: 'auto', label: 'Auto', info: 'High while charging, Balanced on battery.' },
+];
+function locationOptions(mode: 'high' | 'balanced' | 'saver') {
+  if (mode === 'high') return { accuracy: Location.Accuracy.BestForNavigation, timeInterval: 2000, distanceInterval: 10 };
+  if (mode === 'balanced')
+    return { accuracy: Location.Accuracy.High, timeInterval: 3000, distanceInterval: 20, deferredUpdatesInterval: 15000, deferredUpdatesDistance: 200 };
+  return { accuracy: Location.Accuracy.High, timeInterval: 5000, distanceInterval: 35, deferredUpdatesInterval: 60000, deferredUpdatesDistance: 800 };
+}
+const isCharging = (s: Battery.BatteryState) => s === Battery.BatteryState.CHARGING || s === Battery.BatteryState.FULL;
+type StatsTab = 'overview' | 'counties' | 'roads' | 'data';
+const STATS_TABS: { key: StatsTab; label: string }[] = [
+  { key: 'overview', label: 'Overview' },
+  { key: 'counties', label: 'Counties' },
+  { key: 'roads', label: 'Roads' },
+  { key: 'data', label: 'Your data' },
+];
 const FALLBACK_REGION = { latitude: 53.1, longitude: -7.7, latitudeDelta: 4, longitudeDelta: 4 };
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -142,7 +173,12 @@ TaskManager.defineTask(LOCATION_TASK_NAME, ({ data, error }) => {
   if (data) {
     const { locations } = data as { locations: Location.LocationObject[] };
     for (const loc of locations) {
-      recordedPoints.push({ latitude: loc.coords.latitude, longitude: loc.coords.longitude, timestamp: loc.timestamp });
+      recordedPoints.push({
+        latitude: loc.coords.latitude,
+        longitude: loc.coords.longitude,
+        timestamp: loc.timestamp,
+        accuracy: loc.coords.accuracy ?? null,
+      });
     }
   }
 });
@@ -216,6 +252,8 @@ function App() {
   const lengthRef = useRef<Map<string, number>>(new Map());
   const excludedInfoRef = useRef<Map<string, { c: number | null; l: number | null }>>(new Map());
   const unmarkedRef = useRef<Map<string, number>>(new Map());
+  // Partly-driven road pieces: covered stretches that add up across drives.
+  const partialsRef = useRef<Map<string, [number, number][]>>(new Map());
 
   // Downloaded road data.
   const netRef = useRef(new RoadNetwork());
@@ -237,10 +275,20 @@ function App() {
   const foregroundSub = useRef<Location.LocationSubscription | null>(null);
   const [liveIds, setLiveIds] = useState<string[]>([]);
   const [liveTrail, setLiveTrail] = useState<Point[]>([]);
+  const [accuracyMode, setAccuracyMode] = useState<AccuracyMode>('high');
+  const activeModeRef = useRef<'high' | 'balanced' | 'saver'>('high');
+  const batterySub = useRef<{ remove(): void } | null>(null);
+
+  // Heatmap: how many drives covered each chunk.
+  const [roadCounts, setRoadCounts] = useState<Map<string, number>>(new Map());
+  const [heatOn, setHeatOn] = useState(false);
+  // A most-driven stretch picked from Stats → Roads, highlighted on the map.
+  const [highlight, setHighlight] = useState<{ name: string; count: number; chunks: string[] } | null>(null);
+  const [statsTab, setStatsTab] = useState<StatsTab>('overview');
 
   // Drives list / drive shown on the map.
   const [drives, setDrives] = useState<store.DriveSummary[] | null>(null);
-  const [selectedDrive, setSelectedDrive] = useState<{ id: number; points: Point[] } | null>(null);
+  const [selectedDrive, setSelectedDrive] = useState<{ id: number; points: Point[]; roads: string[] } | null>(null);
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
 
   // Dev / housekeeping.
@@ -287,25 +335,46 @@ function App() {
     lengthRef.current.delete(id);
   };
 
-  // Marks roads as driven. Returns the ones that weren't driven before.
-  const markDriven = (ids: string[]): string[] => {
+  // Marks road pieces as driven. A piece already covered by a driven one
+  // adds nothing; smaller pieces a new one covers (e.g. a start/stop
+  // stretch, later driven in full) are replaced by it.
+  // Returns the new pieces and the metres of road they add.
+  const markDriven = (ids: string[]): { fresh: string[]; newM: number } => {
     const net = netRef.current;
-    // A section of a road already driven as a whole piece adds nothing new.
-    const fresh = ids.filter((id) => {
-      const base = baseChunkId(id);
-      return !drivenRef.current.has(id) && !drivenRef.current.has(base) && !excludedRef.current.has(base);
-    });
-    if (fresh.length === 0) return [];
-    const rows = fresh.map((id) => {
+    const bases = new Set(ids.map(baseChunkId));
+    const index = new PieceIndex(Array.from(drivenRef.current).filter((d) => bases.has(baseChunkId(d))));
+    const fresh: string[] = [];
+    const replaced: string[] = [];
+    let newM = 0;
+    for (const id of ids) {
+      if (excludedRef.current.has(baseChunkId(id)) || index.coveredBy(id)) continue;
+      for (const old of index.within(id)) {
+        index.delete(old);
+        replaced.push(old);
+        newM -= lengthRef.current.get(old) ?? net.length(old);
+      }
+      index.add(id);
+      fresh.push(id);
+    }
+    if (fresh.length === 0) return { fresh, newM: 0 };
+    for (const old of replaced) {
+      drivenRef.current.delete(old);
+      forgetDriven(old);
+    }
+    const stillFresh = fresh.filter((id) => !replaced.includes(id));
+    const rows = stillFresh.map((id) => {
       const shape = drivenShapesRef.current.get(id) ?? net.shapeOf(id);
       const county = drivenCountyRef.current.get(id) ?? net.countyOf(id);
       rememberDriven(id, shape, county);
       drivenRef.current.add(id);
+      newM += lengthRef.current.get(id) ?? net.length(id);
       return { id, shape, county };
     });
     setDrivenIds(new Set(drivenRef.current));
-    store.addDriven(rows).catch((e) => setNote(`Couldn't save driven roads: ${(e as Error).message}`));
-    return fresh;
+    store
+      .applyRecheck(rows, replaced, false)
+      .catch((e) => setNote(`Couldn't save driven roads: ${(e as Error).message}`));
+    return { fresh: stillFresh, newM: Math.max(0, newM) };
   };
 
   // When road data arrives, fill in shape/county/length for driven or
@@ -452,6 +521,12 @@ function App() {
           excludedInfoRef.current.set(e.id, { c: e.county, l: e.lengthM });
         }
         unmarkedRef.current = await store.loadUnmarked();
+        partialsRef.current = await store.loadPartials();
+        setRoadCounts(await store.loadRoadCounts());
+        const savedMode = (await store.getMeta('accuracy_mode')) as AccuracyMode | null;
+        if (savedMode && ACCURACY_MODES.some((m) => m.key === savedMode)) setAccuracyMode(savedMode);
+        const savedMap = await store.getMeta('map_type');
+        if (savedMap && MAP_TYPES.includes(savedMap as MapChoice)) setMapTypeIndex(MAP_TYPES.indexOf(savedMap as MapChoice));
         const segs = data.tiles.flatMap((t) => t.segments);
         data.tiles.forEach((t) => knownTilesRef.current.add(t.tileId));
         addRoadData(segs);
@@ -559,6 +634,10 @@ function App() {
       } catch {
         forgotten = [];
       }
+      // Left-out drives earn nothing; their trails are only used to find
+      // the roads to re-check (like a deleted drive's).
+      const counted = allDrives.filter((d) => !d.leftOut);
+      const leftOutTrails = allDrives.filter((d) => d.leftOut).map((d) => d.points);
       const tiles = new Set<string>();
       const visited = new Set<string>();
       for (const points of [...allDrives.map((d) => d.points), ...forgotten]) {
@@ -585,12 +664,12 @@ function App() {
       drivenRef.current.forEach((id) => current.set(id, drivenShapesRef.current.get(id) ?? null));
       const result = await recheckDrives(
         netRef.current,
-        allDrives,
+        counted,
         current,
         excludedRef.current,
         unmarkedRef.current,
         (f) => setRecheckProgress(0.3 + f * 0.7),
-        forgotten
+        [...forgotten, ...leftOutTrails]
       );
       const net = netRef.current;
       const addRows = result.add.map((id) => ({ id, shape: net.shapeOf(id), county: net.countyOf(id) }));
@@ -598,6 +677,10 @@ function App() {
       await store.setMeta('forgotten_trails', '[]');
       await store.setDriveStats(result.stats);
       await store.replaceUnmatched(result.unmatched);
+      await store.replacePartials(result.partials);
+      await store.replaceAllDriveRoads(result.driveRoads);
+      setRoadCounts(await store.loadRoadCounts());
+      partialsRef.current = result.partials;
       await store.setMeta('recheck_pending', '');
       for (const r of addRows) {
         drivenRef.current.add(r.id);
@@ -636,12 +719,20 @@ function App() {
     if (!dataLoaded || onboarded !== true) return;
     (async () => {
       const upgraded = await store.getMeta('v013_upgrade');
+      const upgraded14 = await store.getMeta('v014_upgrade');
       const pending = await store.getMeta('recheck_pending');
       if (!upgraded) {
         const { split, dropped } = await store.splitDrivesOnGaps(DRIVE_SPLIT_GAP_MS);
         addLog(`drives tidied: ${split} split, ${dropped} empty removed`);
         await store.setMeta('v013_split', '1');
-        if (await runRecheck('upgrade')) await store.setMeta('v013_upgrade', String(Date.now()));
+        if (await runRecheck('upgrade')) {
+          await store.setMeta('v013_upgrade', String(Date.now()));
+          await store.setMeta('v014_upgrade', String(Date.now()));
+        }
+      } else if (!upgraded14) {
+        // v0.14: start/stop credit, wild-GPS filter and heatmap counts
+        // are worked out for every saved drive.
+        if (await runRecheck('upgrade')) await store.setMeta('v014_upgrade', String(Date.now()));
       } else if (pending === '1') {
         await runRecheck('manual');
       }
@@ -661,22 +752,26 @@ function App() {
     });
 
     const matcher = matcherRef.current;
+    // Distance only counts points that pass the wild-GPS filter.
+    let good = newPoints;
     if (matcher) {
       const result = matcher.feed(newPoints);
-      const fresh = markDriven(result.completed);
+      good = result.accepted;
+      const { fresh, newM } = markDriven(result.completed);
       if (fresh.length > 0) {
-        driveNewMRef.current += fresh.reduce((m, id) => m + (lengthRef.current.get(id) ?? 0), 0);
+        driveNewMRef.current += newM;
         setLiveIds((prev) => [...prev, ...fresh]);
       }
       if (result.unmatched.length > 0) {
         setUnmatchedCount((n) => n + result.unmatched.length);
         store.addUnmatched(result.unmatched).catch(() => undefined);
       }
+      savePartialsFrom(matcher);
       const last = matcher.lastChunkId ? netRef.current.segs.get(matcher.lastChunkId) : undefined;
       if (last?.c !== undefined) setCurrentCounty(last.c);
     }
 
-    for (const p of newPoints) {
+    for (const p of good) {
       const prev = lastLivePointRef.current;
       if (prev && p.timestamp - prev.timestamp <= 60_000) driveDistanceRef.current += distanceMeters(prev, p);
       lastLivePointRef.current = p;
@@ -688,6 +783,17 @@ function App() {
     setRawStats((prev) => ({ ...prev, points: prev.points + newPoints.length }));
     setLiveTrail((prev) => [...prev, ...newPoints]);
     store.touchTiles(Array.from(new Set(newPoints.map((p) => tileIdForPoint(p.latitude, p.longitude))))).catch(() => undefined);
+  };
+
+  // Saves the partly-driven stretches this drive changed.
+  const savePartialsFrom = (matcher: DriveMatcher) => {
+    if (matcher.touched.size === 0) return;
+    const entries: [string, [number, number][] | null][] = Array.from(matcher.touched).map((id) => [
+      id,
+      partialsRef.current.get(id) ?? null,
+    ]);
+    matcher.touched.clear();
+    store.savePartials(entries).catch(() => undefined);
   };
 
   const processRef = useRef(processPoints);
@@ -708,7 +814,7 @@ function App() {
   const start = async () => {
     recordedPoints = [];
     processedIndexRef.current = 0;
-    matcherRef.current = new DriveMatcher(netRef.current, excludedRef.current);
+    matcherRef.current = new DriveMatcher(netRef.current, excludedRef.current, partialsRef.current);
     driveStartRef.current = Date.now();
     driveDistanceRef.current = 0;
     driveNewMRef.current = 0;
@@ -716,6 +822,7 @@ function App() {
     setLiveIds([]);
     setLiveTrail([]);
     setSelectedDrive(null);
+    setHighlight(null);
     setPanel(null);
     setFollowing(true);
     try {
@@ -725,29 +832,31 @@ function App() {
       currentDriveIdRef.current = null;
       setNote(`Couldn't start saving this drive (${(e as Error).message}) — roads will still be matched.`);
     }
+    let mode: 'high' | 'balanced' | 'saver' = accuracyMode === 'auto' ? 'balanced' : accuracyMode;
+    if (accuracyMode === 'auto') {
+      try {
+        mode = isCharging(await Battery.getBatteryStateAsync()) ? 'high' : 'balanced';
+        batterySub.current = Battery.addBatteryStateListener(({ batteryState }) => {
+          const next = isCharging(batteryState) ? 'high' : 'balanced';
+          if (next !== activeModeRef.current) startUpdates(next).catch(() => undefined);
+        });
+      } catch (e) {
+        addLog(`battery state unavailable: ${(e as Error).message}`);
+      }
+    }
     try {
-      await withTimeout(
-        Location.startLocationUpdatesAsync(LOCATION_TASK_NAME, {
-          accuracy: Location.Accuracy.BestForNavigation,
-          timeInterval: 2000,
-          distanceInterval: 10,
-          activityType: Location.ActivityType.AutomotiveNavigation,
-          pausesUpdatesAutomatically: false,
-          showsBackgroundLocationIndicator: true,
-          foregroundService: { notificationTitle: 'tarmacked is tracking', notificationBody: 'Recording this drive' },
-        }),
-        8000,
-        'start background tracking'
-      );
+      await withTimeout(startUpdates(mode), 8000, 'start background tracking');
     } catch (e) {
       addLog(`background tracking unavailable: ${(e as Error).message}`);
       try {
-        foregroundSub.current = await Location.watchPositionAsync(
-          { accuracy: Location.Accuracy.BestForNavigation, timeInterval: 2000, distanceInterval: 10 },
-          (loc) => {
-            recordedPoints.push({ latitude: loc.coords.latitude, longitude: loc.coords.longitude, timestamp: loc.timestamp });
-          }
-        );
+        foregroundSub.current = await Location.watchPositionAsync(locationOptions(mode), (loc) => {
+          recordedPoints.push({
+            latitude: loc.coords.latitude,
+            longitude: loc.coords.longitude,
+            timestamp: loc.timestamp,
+            accuracy: loc.coords.accuracy ?? null,
+          });
+        });
         setNote('Tracking only while the app is open (background location unavailable).');
       } catch {
         setNote('No GPS available.');
@@ -756,7 +865,30 @@ function App() {
     setTracking(true);
   };
 
+  // (Re)starts background location in a mode; calling it again while
+  // tracking just changes the settings (Auto switching on charge).
+  const startUpdates = async (mode: 'high' | 'balanced' | 'saver') => {
+    activeModeRef.current = mode;
+    await Location.startLocationUpdatesAsync(LOCATION_TASK_NAME, {
+      ...locationOptions(mode),
+      activityType: Location.ActivityType.AutomotiveNavigation,
+      pausesUpdatesAutomatically: false,
+      showsBackgroundLocationIndicator: true,
+      foregroundService: { notificationTitle: 'tarmacked is tracking', notificationBody: 'Recording this drive' },
+    });
+    addLog(`GPS mode: ${mode}`);
+  };
+
+  const chooseAccuracy = (mode: AccuracyMode) => {
+    setAccuracyMode(mode);
+    store.setMeta('accuracy_mode', mode).catch(() => undefined);
+  };
+
   const stop = async () => {
+    if (batterySub.current) {
+      batterySub.current.remove();
+      batterySub.current = null;
+    }
     try {
       await Location.stopLocationUpdatesAsync(LOCATION_TASK_NAME);
     } catch {
@@ -770,9 +902,17 @@ function App() {
     processedIndexRef.current = recordedPoints.length;
     processPoints(newPoints);
     const matcher = matcherRef.current;
+    let ignored = 0;
+    let driveRoads: string[] = [];
     if (matcher) {
-      const fresh = markDriven(matcher.finish());
-      driveNewMRef.current += fresh.reduce((m, id) => m + (lengthRef.current.get(id) ?? 0), 0);
+      const done = matcher.finish();
+      // Start/stop credit comes after the completed sections, so a section
+      // finished this drive replaces any stretch of it.
+      const { newM } = markDriven([...done, ...matcher.stubs]);
+      driveNewMRef.current += newM;
+      savePartialsFrom(matcher);
+      ignored = matcher.gps.ignored;
+      driveRoads = matcher.roadsCovered();
     }
     matcherRef.current = null;
     const driveId = currentDriveIdRef.current;
@@ -782,9 +922,20 @@ function App() {
         setRawStats((prev) => ({ ...prev, drives: Math.max(0, prev.drives - 1) }));
       } else {
         store
-          .setDriveStats([{ id: driveId, endedAt: Date.now(), distanceM: driveDistanceRef.current, newM: driveNewMRef.current }])
+          .setDriveStats([
+            { id: driveId, endedAt: Date.now(), distanceM: driveDistanceRef.current, newM: driveNewMRef.current, ignoredN: ignored },
+          ])
           .catch(() => undefined);
-        setNote(`Drive saved: ${km(driveDistanceRef.current)} km, ${km(driveNewMRef.current)} km of new road.`);
+        store
+          .setDriveRoads(driveId, driveRoads)
+          .then(() => store.loadRoadCounts())
+          .then(setRoadCounts)
+          .catch(() => undefined);
+        const patchy = isPatchy(ignored, recordedPoints.length);
+        setNote(
+          `Drive saved: ${km(driveDistanceRef.current)} km, ${km(driveNewMRef.current)} km of new road.` +
+            (patchy ? ' ⚠ Patchy GPS on this drive — check it in Drives.' : '')
+        );
       }
     }
     currentDriveIdRef.current = null;
@@ -864,7 +1015,9 @@ function App() {
     }
     try {
       const points = await store.loadDrivePoints(id);
-      setSelectedDrive({ id, points });
+      const roads = await store.loadDriveRoads(id);
+      setSelectedDrive({ id, points, roads });
+      setHighlight(null);
       if (points.length > 1) {
         setFollowing(false);
         mapRef.current?.fitToCoordinates(
@@ -901,6 +1054,39 @@ function App() {
     } catch (e) {
       setNote(`Couldn't delete that drive: ${(e as Error).message}`);
     }
+  };
+
+  // Leave a patchy drive out (it earns no roads) or put it back in.
+  const toggleLeftOut = async (d: store.DriveSummary) => {
+    try {
+      await store.setDriveLeftOut(d.id, !d.leftOut);
+      setDrives(await store.listDrives());
+      const ok = await runRecheck('manual');
+      if (!ok) setNote(`Drive ${d.leftOut ? 'included' : 'left out'} — roads update once road data can be downloaded.`);
+    } catch (e) {
+      setNote(`Couldn't change that drive: ${(e as Error).message}`);
+    }
+  };
+
+  // ---------- Stats: roads ----------
+
+  // Jumps to a road's most-driven bit, with the heatmap on so the colours
+  // match the list.
+  const showRoad = (r: RoadRank) => {
+    const shapes = r.hotChunks.map((id) => netRef.current.shapeOf(id)).filter((c): c is Coord[] => !!c);
+    if (shapes.length === 0) return;
+    setHighlight({ name: r.name, count: r.count, chunks: r.hotChunks });
+    setSelectedDrive(null);
+    setHeatOn(true);
+    setPanel(null);
+    setFollowing(false);
+    // Zoom to the longest joined-up stretch at that count.
+    const chains = buildChains(r.hotChunks, (id) => netRef.current.shapeOf(id) ?? undefined);
+    const longest = chains.reduce((a, b) => (lineLengthMeters(b.coords) > lineLengthMeters(a.coords) ? b : a), chains[0]);
+    mapRef.current?.fitToCoordinates(toLatLng(longest.coords), {
+      edgePadding: { top: 160, right: 60, bottom: 220, left: 60 },
+      animated: true,
+    });
   };
 
   // ---------- Dev tools ----------
@@ -984,6 +1170,9 @@ function App() {
     lengthRef.current = new Map();
     excludedInfoRef.current = new Map();
     unmarkedRef.current = new Map();
+    partialsRef.current = new Map();
+    setRoadCounts(new Map());
+    setHighlight(null);
     setDrivenIds(new Set());
     setExcludedIds(new Set());
     setUnmatchedCount(0);
@@ -1043,6 +1232,7 @@ function App() {
       if (data.homeCounty) setHomeCounty(data.homeCounty);
       setPanel(null);
       setNote(`Restored: ${result.driven} road pieces merged in, ${result.drivesAdded} new drives. Nothing on the phone was removed.`);
+      if (result.drivesAdded > 0) runRecheck('manual'); // fills in heatmap counts for the restored drives
     } catch (e) {
       setNote(`Restore failed: ${(e as Error).message}`);
     } finally {
@@ -1119,6 +1309,74 @@ function App() {
   const visibleChains = useMemo(() => simplifiedChains.filter(inView), [simplifiedChains, bounds]); // eslint-disable-line react-hooks/exhaustive-deps
   const zoomedOut = visibleRegion.latitudeDelta > 0.3;
 
+  // Heatmap: driven roads grouped into colour steps by how many drives
+  // covered them, each step joined into lines like the plain green.
+  const maxCount = useMemo(() => {
+    let m = 1;
+    roadCounts.forEach((n) => {
+      if (n > m) m = n;
+    });
+    return m;
+  }, [roadCounts]);
+  const heatChains = useMemo(() => {
+    if (!heatOn) return [] as Chain[][];
+    const steps: string[][] = Array.from({ length: HEAT_STEPS }, () => []);
+    drivenIds.forEach((id) => {
+      if (excludedIds.has(baseChunkId(id))) return;
+      steps[heatStep(roadCounts.get(baseChunkId(id)) ?? 1, maxCount)].push(id);
+    });
+    return steps.map((ids) => buildChains(ids, (id) => drivenShapesRef.current.get(id)));
+  }, [heatOn, drivenIds, excludedIds, roadCounts, maxCount]);
+  const visibleHeat = useMemo(() => {
+    const tolerance = simplifyLevel === 0 ? 0 : (0.005 * 2 ** simplifyLevel) / 700;
+    return heatChains.map((chains) =>
+      chains.filter(inView).map((c) => (tolerance ? { ...c, coords: simplifyLine(c.coords, tolerance) } : c))
+    );
+  }, [heatChains, simplifyLevel, bounds]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The selected drive's roads (orange), and a most-driven stretch picked
+  // from Stats → Roads.
+  const shapeForDraw = (id: string) => drivenShapesRef.current.get(id) ?? netRef.current.shapeOf(id) ?? undefined;
+  const selectedChains = useMemo(
+    () => (selectedDrive ? buildChains(selectedDrive.roads, shapeForDraw) : []),
+    [selectedDrive, netRev] // eslint-disable-line react-hooks/exhaustive-deps
+  );
+  const highlightChains = useMemo(
+    () => (highlight ? buildChains(highlight.chunks, shapeForDraw) : []),
+    [highlight, netRev] // eslint-disable-line react-hooks/exhaustive-deps
+  );
+
+  // ---------- Stats figures ----------
+
+  const roadRanking = useMemo(
+    () => (panel === 'stats' && statsTab === 'roads' ? rankRoads(netRef.current, roadCounts) : []),
+    [panel, statsTab, roadCounts, netRev]
+  );
+  const overview = useMemo(() => {
+    const list = (drives ?? []).filter((d) => !d.leftOut);
+    const now = new Date();
+    const weekStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - ((now.getDay() + 6) % 7)).getTime();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+    let week = 0, month = 0, all = 0, dist = 0, time = 0;
+    let longest: store.DriveSummary | null = null;
+    let mostNew: store.DriveSummary | null = null;
+    for (const d of list) {
+      const n = d.newM ?? 0;
+      all += n;
+      if (d.startedAt >= weekStart) week += n;
+      if (d.startedAt >= monthStart) month += n;
+      dist += d.distanceM ?? 0;
+      if (d.endedAt) time += d.endedAt - d.startedAt;
+      if ((d.distanceM ?? 0) > (longest?.distanceM ?? 0)) longest = d;
+      if (n > (mostNew?.newM ?? 0)) mostNew = d;
+    }
+    return { count: list.length, week, month, all, dist, time, longest, mostNew };
+  }, [drives]);
+  const topRoad = useMemo(
+    () => (panel === 'stats' && statsTab === 'overview' ? rankRoads(netRef.current, roadCounts, 1)[0] ?? null : null),
+    [panel, statsTab, roadCounts, netRev]
+  );
+
   // Roads completed during the drive in progress, drawn live on top.
   const liveChains = useMemo(() => buildChains(liveIds, (id) => drivenShapesRef.current.get(id)), [liveIds]);
 
@@ -1136,31 +1394,55 @@ function App() {
   // stacks lines in the order they're added (it ignores zIndex), so the
   // whole set is re-added whenever it changes to keep that order.
   const drawRevs = useRef({ n: 0, map: new WeakMap<Chain[], number>() });
-  const drawLines = (prefix: string, chains: Chain[], thin: boolean) => {
-    // A new number only when this set of lines actually changes.
+  // A new number only when this set of lines actually changes.
+  const revOf = (chains: Chain[]) => {
     const revs = drawRevs.current;
     let rev = revs.map.get(chains);
     if (rev === undefined) {
       rev = ++revs.n;
       revs.map.set(chains, rev);
     }
+    return rev;
+  };
+  type Layer = { chains: Chain[]; color: string };
+  // `after`: revision of the lines drawn underneath. Lines drawn on top
+  // include it in their keys, so they're re-added (back on top) whenever
+  // the lines under them are.
+  const drawLayers = (prefix: string, layers: Layer[], thin: boolean, after = '', outline = '#0d3818', width = 4) => {
+    const tag = (c: Chain[]) => `${revOf(c)}${after}`;
     const outlines = thin
       ? []
-      : chains.map((c, i) => (
-          <Polyline key={`${prefix}o${i}-${rev}`} coordinates={toLatLng(c.coords)} strokeColor="#0d3818" strokeWidth={7} lineCap="round" lineJoin="round" />
-        ));
-    const cores = chains.map((c, i) => (
-      <Polyline
-        key={`${prefix}c${i}-${rev}`}
-        coordinates={toLatLng(c.coords)}
-        strokeColor="#39d353"
-        strokeWidth={thin ? 3 : 4}
-        lineCap="round"
-        lineJoin="round"
-      />
-    ));
+      : layers.flatMap((l, li) =>
+          l.chains.map((c, i) => (
+            <Polyline
+              key={`${prefix}o${li}.${i}-${tag(l.chains)}`}
+              coordinates={toLatLng(c.coords)}
+              strokeColor={outline}
+              strokeWidth={width + 3}
+              lineCap="round"
+              lineJoin="round"
+            />
+          ))
+        );
+    const cores = layers.flatMap((l, li) =>
+      l.chains.map((c, i) => (
+        <Polyline
+          key={`${prefix}c${li}.${i}-${tag(l.chains)}`}
+          coordinates={toLatLng(c.coords)}
+          strokeColor={l.color}
+          strokeWidth={thin ? width - 1 : width}
+          lineCap="round"
+          lineJoin="round"
+        />
+      ))
+    );
     return [...outlines, ...cores];
   };
+  const baseLayers: Layer[] = heatOn
+    ? visibleHeat.map((chains, i) => ({ chains, color: stepColor(i) }))
+    : [{ chains: visibleChains, color: '#39d353' }];
+  // Everything drawn on top is re-added when the base lines or map type change.
+  const baseRev = `m${mapTypeIndex}b${editMode ? 'e' : baseLayers.map((l) => revOf(l.chains)).join('.')}`;
 
   // ---------- Onboarding ----------
 
@@ -1221,7 +1503,8 @@ function App() {
         ref={mapRef}
         style={styles.map}
         provider={PROVIDER_DEFAULT}
-        mapType={MAP_TYPES[mapTypeIndex]}
+        mapType={MAP_TYPES[mapTypeIndex] === 'osm' ? 'standard' : (MAP_TYPES[mapTypeIndex] as MapType)}
+        showsPointsOfInterest={MAP_TYPES[mapTypeIndex] !== 'osm'}
         initialRegion={region}
         showsUserLocation
         followsUserLocation={following && !editMode}
@@ -1229,6 +1512,16 @@ function App() {
         onPress={onMapPress}
         onRegionChangeComplete={(r) => setVisibleRegion(r)}
       >
+        {MAP_TYPES[mapTypeIndex] === 'osm' && (
+          <UrlTile
+            key="osm"
+            urlTemplate={OSM_TILE_URL}
+            maximumZ={19}
+            shouldReplaceMapContent
+            tileCachePath={`${Paths.cache.uri}osm-tiles`}
+            tileCacheMaxAge={7 * 24 * 60 * 60}
+          />
+        )}
         {editMode &&
           visibleEditSegments.map((seg) => {
             const isExcluded = excludedIds.has(seg.id);
@@ -1248,9 +1541,9 @@ function App() {
             );
           })}
 
-        {!editMode && drawLines('d', visibleChains, zoomedOut)}
+        {!editMode && drawLayers('d', baseLayers, zoomedOut, `m${mapTypeIndex}`)}
 
-        {tracking && drawLines('live', liveChains, false)}
+        {tracking && drawLayers('live', [{ chains: liveChains, color: '#39d353' }], false, baseRev)}
 
         {tracking && liveTrail.length > 1 && (
           <Polyline
@@ -1263,8 +1556,12 @@ function App() {
           />
         )}
 
-        {selectedDrive && selectedDrive.points.length > 1 && (
+        {/* Selected drive: its roads in orange, on top of everything else. */}
+        {selectedDrive && selectedChains.length > 0 && drawLayers('sel', [{ chains: selectedChains, color: '#ff9f1a' }], false, baseRev, '#5a3000')}
+        {/* Drives from before v0.14's re-check have no road list yet: show the GPS trail. */}
+        {selectedDrive && selectedChains.length === 0 && selectedDrive.points.length > 1 && (
           <Polyline
+            key={`seltrail-${baseRev}`}
             coordinates={selectedDrive.points.map((p) => ({ latitude: p.latitude, longitude: p.longitude }))}
             strokeColor="#ff9f1a"
             strokeWidth={4}
@@ -1273,6 +1570,9 @@ function App() {
             zIndex={7}
           />
         )}
+
+        {/* Most-driven stretch picked from Stats → Roads. */}
+        {highlight && drawLayers('hl', [{ chains: highlightChains, color: '#ffffff' }], false, baseRev, '#d0206a', 5)}
 
         {rawSessions &&
           rawSessions.map((session, i) =>
@@ -1291,7 +1591,13 @@ function App() {
       {/* Top bar */}
       <View style={styles.topBar}>
         <View style={styles.topGroup}>
-          <Pressable style={[styles.chip, panel === 'stats' && styles.chipActive]} onPress={() => togglePanel('stats')}>
+          <Pressable
+            style={[styles.chip, panel === 'stats' && styles.chipActive]}
+            onPress={() => {
+              togglePanel('stats');
+              store.listDrives().then(setDrives).catch(() => undefined);
+            }}
+          >
             <Text style={styles.chipText}>Stats</Text>
           </Pressable>
           <Pressable style={[styles.chip, panel === 'drives' && styles.chipActive]} onPress={openDrives}>
@@ -1301,10 +1607,45 @@ function App() {
             <Text style={styles.chipText}>⚙</Text>
           </Pressable>
         </View>
-        <Pressable style={styles.chip} onPress={() => setMapTypeIndex((i) => (i + 1) % MAP_TYPES.length)}>
-          <Text style={[styles.chipText, { textTransform: 'capitalize' }]}>{MAP_TYPES[mapTypeIndex]}</Text>
-        </Pressable>
+        <View style={styles.topGroup}>
+          <Pressable style={[styles.chip, heatOn && styles.chipHeat]} onPress={() => setHeatOn((v) => !v)}>
+            <Text style={styles.chipText}>Heat</Text>
+          </Pressable>
+          <Pressable
+            style={styles.chip}
+            onPress={() => {
+              const next = (mapTypeIndex + 1) % MAP_TYPES.length;
+              setMapTypeIndex(next);
+              store.setMeta('map_type', MAP_TYPES[next]).catch(() => undefined);
+            }}
+          >
+            <Text style={styles.chipText}>{MAP_LABELS[MAP_TYPES[mapTypeIndex]]}</Text>
+          </Pressable>
+        </View>
       </View>
+
+      {/* Heatmap legend, and the picked most-driven stretch */}
+      {(heatOn || highlight) && !panel && !editMode && (
+        <View style={styles.heatBar}>
+          {heatOn && (
+            <View style={styles.legendRow}>
+              <Text style={styles.legendText}>1×</Text>
+              {Array.from({ length: HEAT_STEPS }, (_, i) => (
+                <View key={i} style={[styles.legendStep, { backgroundColor: stepColor(i) }]} />
+              ))}
+              <Text style={styles.legendText}>{maxCount}×</Text>
+            </View>
+          )}
+          {highlight && (
+            <Pressable style={styles.legendRow} onPress={() => setHighlight(null)}>
+              <Text style={styles.highlightText} numberOfLines={1}>
+                {highlight.name} · {highlight.count}× — most driven bit
+              </Text>
+              <Text style={styles.legendText}>  ✕</Text>
+            </Pressable>
+          )}
+        </View>
+      )}
 
       {/* Messages */}
       {recheckProgress !== null ? (
@@ -1320,45 +1661,128 @@ function App() {
       {/* Stats */}
       {panel === 'stats' && (
         <View style={styles.panel}>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.tabBar} contentContainerStyle={{ gap: 6 }}>
+            {STATS_TABS.map((t) => (
+              <Pressable key={t.key} style={[styles.tabPill, statsTab === t.key && styles.tabPillActive]} onPress={() => setStatsTab(t.key)}>
+                <Text style={styles.chipText}>{t.label}</Text>
+              </Pressable>
+            ))}
+          </ScrollView>
           <ScrollView>
-            <Text style={styles.panelTitle}>Stats</Text>
-            {countyStats ? (
-              <>
-                <Text style={styles.statsHeadline}>
-                  Ireland {countyFigures.nationalPercent.toFixed(3)}% · {km(countyFigures.nationalDriven)} /{' '}
-                  {km(countyFigures.nationalTotal, 0)} km
-                </Text>
-                {countyFigures.rows.map((r) => (
-                  <View key={r.name} style={[styles.countyStatRow, r.code === focusRow?.code && styles.countyStatRowCurrent]}>
-                    <Text style={[styles.countyStatName, r.driven > 0 && styles.countyStatNameDriven]}>{shortCounty(r.name)}</Text>
-                    <Text style={styles.countyStatValue}>
-                      {r.percent.toFixed(2)}% · {km(r.driven)} / {km(r.total, 0)} km
-                    </Text>
-                  </View>
-                ))}
-                {countyFigures.unassigned > 0 && (
+            {statsTab === 'overview' &&
+              (countyStats ? (
+                <>
+                  <Text style={styles.bigStat}>{countyFigures.nationalPercent.toFixed(3)}%</Text>
                   <Text style={styles.small}>
-                    {countyFigures.unassigned} road pieces aren't counted yet — their county fills in once the road data for
-                    that area downloads.
+                    of Ireland's roads · {km(countyFigures.nationalDriven)} / {km(countyFigures.nationalTotal, 0)} km
                   </Text>
+                  <Text style={styles.sectionTitle}>New road</Text>
+                  <View style={styles.statGrid}>
+                    <StatTile label="This week" value={`+${km(overview.week)} km`} />
+                    <StatTile label="This month" value={`+${km(overview.month)} km`} />
+                    <StatTile label="All time" value={`${km(overview.all)} km`} />
+                  </View>
+                  <Text style={styles.sectionTitle}>Drives</Text>
+                  <View style={styles.statGrid}>
+                    <StatTile label="Drives" value={String(overview.count)} />
+                    <StatTile label="Distance" value={`${km(overview.dist, 0)} km`} />
+                    <StatTile label="Time" value={formatDuration(overview.time)} />
+                  </View>
+                  <Text style={styles.sectionTitle}>Records</Text>
+                  {overview.longest && (
+                    <Text style={styles.recordLine}>
+                      Longest drive: {km(overview.longest.distanceM ?? 0)} km · {formatWhen(overview.longest.startedAt)}
+                    </Text>
+                  )}
+                  {overview.mostNew && (
+                    <Text style={styles.recordLine}>
+                      Most new road: +{km(overview.mostNew.newM ?? 0)} km · {formatWhen(overview.mostNew.startedAt)}
+                    </Text>
+                  )}
+                  {topRoad && (
+                    <Pressable onPress={() => showRoad(topRoad)}>
+                      <Text style={styles.recordLine}>
+                        Most driven road: {topRoad.name} · {topRoad.count}× <Text style={styles.linkText}>show</Text>
+                      </Text>
+                    </Pressable>
+                  )}
+                  {!overview.longest && !topRoad && <Text style={styles.small}>Records appear after your first drive.</Text>}
+                </>
+              ) : (
+                <Text style={styles.small}>Road totals haven't loaded yet — connect to the internet once and they're saved for offline use.</Text>
+              ))}
+
+            {statsTab === 'counties' &&
+              (countyStats ? (
+                <>
+                  <Text style={styles.statsHeadline}>
+                    Ireland {countyFigures.nationalPercent.toFixed(3)}% · {km(countyFigures.nationalDriven)} /{' '}
+                    {km(countyFigures.nationalTotal, 0)} km
+                  </Text>
+                  {countyFigures.rows.map((r) => (
+                    <View key={r.name} style={[styles.countyStatRow, r.code === focusRow?.code && styles.countyStatRowCurrent]}>
+                      <Text style={[styles.countyStatName, r.driven > 0 && styles.countyStatNameDriven]}>{shortCounty(r.name)}</Text>
+                      <Text style={styles.countyStatValue}>
+                        {r.percent.toFixed(2)}% · {km(r.driven)} / {km(r.total, 0)} km
+                      </Text>
+                    </View>
+                  ))}
+                  {countyFigures.unassigned > 0 && (
+                    <Text style={styles.small}>
+                      {countyFigures.unassigned} road pieces aren't counted yet — their county fills in once the road data for
+                      that area downloads.
+                    </Text>
+                  )}
+                </>
+              ) : (
+                <Text style={styles.small}>Road totals haven't loaded yet — connect to the internet once and they're saved for offline use.</Text>
+              ))}
+
+            {statsTab === 'roads' && (
+              <>
+                <Text style={styles.small}>
+                  Your most driven roads — the number is how many drives covered the busiest bit. Tap one to see it on the map
+                  (colours match the heatmap).
+                </Text>
+                {roadRanking.length === 0 ? (
+                  <Text style={styles.small}>Nothing yet — this fills in as you drive.</Text>
+                ) : (
+                  roadRanking.map((r, i) => (
+                    <Pressable key={r.key} style={styles.roadRow} onPress={() => showRoad(r)}>
+                      <Text style={styles.roadRank}>{i + 1}</Text>
+                      <View style={[styles.roadSwatch, { backgroundColor: stepColor(heatStep(r.count, maxCount)) }]} />
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.roadName} numberOfLines={1}>
+                          {r.name}
+                        </Text>
+                        <Text style={styles.driveInfo}>
+                          {r.county !== null && countyStats ? `${shortCounty(countyStats.counties[r.county] ?? '')} · ` : ''}
+                          {km(r.hotM, 2)} km at that
+                        </Text>
+                      </View>
+                      <Text style={styles.roadCount}>{r.count}×</Text>
+                    </Pressable>
+                  ))
                 )}
               </>
-            ) : (
-              <Text style={styles.small}>Road totals haven't loaded yet — connect to the internet once and they're saved for offline use.</Text>
             )}
-            <Text style={[styles.panelTitle, { marginTop: 16 }]}>Your data</Text>
-            <Text style={styles.small}>
-              Saved on this phone. Back up to keep a copy somewhere safe (Files, iCloud Drive, email). Restoring merges a backup in
-              — it never removes anything already on the phone.
-            </Text>
-            <View style={styles.row}>
-              <Pressable style={[styles.button, styles.buttonBlue]} onPress={exportBackup} disabled={backupBusy}>
-                <Text style={styles.buttonText}>{backupBusy ? 'Working…' : 'Back up'}</Text>
-              </Pressable>
-              <Pressable style={[styles.button, styles.buttonGrey]} onPress={restoreBackup} disabled={backupBusy || tracking}>
-                <Text style={styles.buttonText}>Restore</Text>
-              </Pressable>
-            </View>
+
+            {statsTab === 'data' && (
+              <>
+                <Text style={styles.small}>
+                  Saved on this phone. Back up to keep a copy somewhere safe (Files, iCloud Drive, email). Restoring merges a backup
+                  in — it never removes anything already on the phone.
+                </Text>
+                <View style={styles.row}>
+                  <Pressable style={[styles.button, styles.buttonBlue]} onPress={exportBackup} disabled={backupBusy}>
+                    <Text style={styles.buttonText}>{backupBusy ? 'Working…' : 'Back up'}</Text>
+                  </Pressable>
+                  <Pressable style={[styles.button, styles.buttonGrey]} onPress={restoreBackup} disabled={backupBusy || tracking}>
+                    <Text style={styles.buttonText}>Restore</Text>
+                  </Pressable>
+                </View>
+              </>
+            )}
           </ScrollView>
         </View>
       )}
@@ -1375,16 +1799,30 @@ function App() {
             <ScrollView>
               {drives.map((d) => {
                 const selected = selectedDrive?.id === d.id;
+                const patchy = isPatchy(d.ignoredN, d.pointCount);
                 return (
                   <Pressable key={d.id} style={[styles.driveRow, selected && styles.driveRowSelected]} onPress={() => showDrive(d.id)}>
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.driveWhen}>{formatWhen(d.startedAt)}</Text>
+                    <View style={{ flex: 1, opacity: d.leftOut ? 0.55 : 1 }}>
+                      <Text style={styles.driveWhen}>
+                        {formatWhen(d.startedAt)}
+                        {patchy && <Text style={styles.patchyTag}>{'  ⚠ patchy GPS'}</Text>}
+                        {d.leftOut && <Text style={styles.driveInfo}>{'  left out'}</Text>}
+                      </Text>
                       <Text style={styles.driveInfo}>
                         {d.endedAt ? `${formatDuration(d.endedAt - d.startedAt)} · ` : ''}
                         {d.distanceM !== null ? `${km(d.distanceM)} km` : `${d.pointCount} points`}
                         {d.newM !== null && d.newM > 0 ? ` · +${km(d.newM)} km new` : ''}
                       </Text>
                     </View>
+                    {selected && (patchy || d.leftOut) && (
+                      <Pressable
+                        style={[styles.smallButton, { marginRight: 6 }]}
+                        onPress={() => toggleLeftOut(d)}
+                        disabled={tracking || recheckProgress !== null}
+                      >
+                        <Text style={styles.chipText}>{d.leftOut ? 'Include' : 'Leave out'}</Text>
+                      </Pressable>
+                    )}
                     {selected && (
                       <Pressable
                         style={[styles.smallButton, deleteConfirmId === d.id && styles.smallButtonDanger]}
@@ -1398,7 +1836,14 @@ function App() {
               })}
             </ScrollView>
           )}
-          {selectedDrive && <Text style={styles.small}>Shown in orange on the map. Tap it again to hide.</Text>}
+          {selectedDrive && (
+            <Text style={styles.small}>
+              Its roads are shown in orange on the map. Tap it again to hide.
+              {drives?.find((d) => d.id === selectedDrive.id && isPatchy(d.ignoredN, d.pointCount))
+                ? ' Patchy GPS: some points were ignored. Its roads still count unless you leave it out.'
+                : ''}
+            </Text>
+          )}
         </View>
       )}
 
@@ -1406,7 +1851,23 @@ function App() {
       {panel === 'dev' && (
         <View style={styles.panel}>
           <ScrollView>
-            <Text style={styles.panelTitle}>Developer tools</Text>
+            <Text style={styles.panelTitle}>GPS accuracy</Text>
+            <View style={[styles.row, { marginTop: 0 }]}>
+              {ACCURACY_MODES.map((m) => (
+                <Pressable
+                  key={m.key}
+                  style={[styles.smallButton, accuracyMode === m.key && styles.chipActive]}
+                  onPress={() => chooseAccuracy(m.key)}
+                >
+                  <Text style={styles.chipText}>{m.label}</Text>
+                </Pressable>
+              ))}
+            </View>
+            <Text style={styles.small}>
+              {ACCURACY_MODES.find((m) => m.key === accuracyMode)?.info}
+              {tracking ? ' Applies from your next drive.' : ''}
+            </Text>
+            <Text style={[styles.panelTitle, { marginTop: 16 }]}>Developer tools</Text>
             <View style={styles.row}>
               <Pressable
                 style={[styles.button, styles.buttonBlue]}
@@ -1530,9 +1991,29 @@ function App() {
             disabled={!tracking && recheckProgress !== null}
           >
             <Text style={styles.buttonText}>{tracking ? 'Stop' : 'Start'}</Text>
+            <Text style={styles.modeLabel}>
+              {tracking
+                ? activeModeRef.current === 'high' ? 'High' : activeModeRef.current === 'balanced' ? 'Balanced' : 'Saver'
+                : ACCURACY_MODES.find((m) => m.key === accuracyMode)?.label}
+            </Text>
           </Pressable>
         </View>
       )}
+
+      {MAP_TYPES[mapTypeIndex] === 'osm' && (
+        <View style={styles.osmCredit} pointerEvents="none">
+          <Text style={styles.osmCreditText}>© OpenStreetMap contributors</Text>
+        </View>
+      )}
+    </View>
+  );
+}
+
+function StatTile({ label, value }: { label: string; value: string }) {
+  return (
+    <View style={styles.statTile}>
+      <Text style={styles.statValue}>{value}</Text>
+      <Text style={styles.statLabel}>{label}</Text>
     </View>
   );
 }
@@ -1554,6 +2035,43 @@ const styles = StyleSheet.create({
   topGroup: { flexDirection: 'row', gap: 8 },
   chip: { backgroundColor: 'rgba(17,17,17,0.88)', borderRadius: 18, paddingVertical: 8, paddingHorizontal: 14 },
   chipActive: { backgroundColor: '#2f6f3a' },
+  chipHeat: { backgroundColor: '#a3471a' },
+
+  heatBar: {
+    position: 'absolute',
+    top: 104,
+    left: 12,
+    right: 12,
+    backgroundColor: 'rgba(17,17,17,0.88)',
+    borderRadius: 12,
+    paddingVertical: 7,
+    paddingHorizontal: 12,
+    gap: 4,
+  },
+  legendRow: { flexDirection: 'row', alignItems: 'center' },
+  legendStep: { flex: 1, height: 6 },
+  legendText: { color: '#ccc', fontSize: 11, fontWeight: '600', marginHorizontal: 4 },
+  highlightText: { flex: 1, color: '#fff', fontSize: 13, fontWeight: '600' },
+
+  tabBar: { flexGrow: 0, marginBottom: 12 },
+  tabPill: { backgroundColor: '#2a2a2a', borderRadius: 16, paddingVertical: 7, paddingHorizontal: 14 },
+  tabPillActive: { backgroundColor: '#2f6f3a' },
+  bigStat: { color: '#39d353', fontSize: 30, fontWeight: '800' },
+  sectionTitle: { color: '#fff', fontSize: 14, fontWeight: '700', marginTop: 16, marginBottom: 6 },
+  statGrid: { flexDirection: 'row', gap: 8 },
+  statTile: { flex: 1, backgroundColor: '#1f1f1f', borderRadius: 10, paddingVertical: 10, paddingHorizontal: 8 },
+  statValue: { color: '#fff', fontSize: 15, fontWeight: '700' },
+  statLabel: { color: '#8a8a8a', fontSize: 11, marginTop: 2 },
+  recordLine: { color: '#ddd', fontSize: 13, paddingVertical: 4 },
+  roadRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 8, paddingHorizontal: 4, borderRadius: 8 },
+  roadRank: { color: '#777', fontSize: 12, width: 18, textAlign: 'right' },
+  roadSwatch: { width: 10, height: 26, borderRadius: 3 },
+  roadName: { color: '#fff', fontSize: 14, fontWeight: '600' },
+  roadCount: { color: '#fff', fontSize: 15, fontWeight: '700' },
+  patchyTag: { color: '#e8b040', fontSize: 12, fontWeight: '600' },
+  modeLabel: { color: 'rgba(255,255,255,0.7)', fontSize: 10, textAlign: 'center', marginTop: 1 },
+  osmCredit: { position: 'absolute', bottom: 12, left: 16, backgroundColor: 'rgba(255,255,255,0.75)', borderRadius: 4, paddingHorizontal: 5 },
+  osmCreditText: { color: '#333', fontSize: 10 },
   chipText: { color: '#fff', fontSize: 13, fontWeight: '600' },
 
   toast: {

@@ -176,6 +176,14 @@ function onewayOf(tags) {
   return 0;
 }
 
+// "N77 Kilkenny Road", "R693", "Main Street" — ref first, then name.
+function roadName(tags) {
+  const t = tags || {};
+  const ref = t.ref ? String(t.ref).replace(/;/g, '/') : '';
+  const name = t.name || '';
+  return [ref, name].filter(Boolean).join(' ') || null;
+}
+
 function splitIntoChunks(coords, targetMeters) {
   if (coords.length < 2) return [coords];
   const chunks = [];
@@ -267,12 +275,14 @@ async function tileOneCounty(countyName) {
     const coords = el.geometry.map((pt) => [round(pt.lat), round(pt.lon)]);
     const chunks = splitIntoChunks(coords, CHUNK_TARGET_METERS);
     const oneway = onewayOf(el.tags);
+    const name = roadName(el.tags);
     chunks.forEach((chunkCoords, i) => {
       const id = `way/${el.id}#${i}`;
       const tid = tileIdForPoint(chunkCoords[0][0], chunkCoords[0][1]);
       if (!tiles.has(tid)) tiles.set(tid, []);
       const chunk = { id, coords: chunkCoords };
       if (oneway !== 0) chunk.o = oneway; // omitted for two-way roads to keep files small
+      if (name) chunk.n = name; // v0.14: road name for the most-driven list
       // County = whichever county the chunk's midpoint is actually in.
       // Chunks outside this county (the far end of a road that crosses the
       // border) are left untagged here; that county's own run tags them.

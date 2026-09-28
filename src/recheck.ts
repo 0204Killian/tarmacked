@@ -9,7 +9,7 @@
 // kept aside and can be put back from Dev.
 
 import { RoadNetwork, baseChunkId } from './roadMatcher';
-import { DriveMatcher, Point } from './coverage';
+import { DriveMatcher, GpsFilter, PieceIndex, Point } from './coverage';
 import { Coord, haversine, distanceMeters } from './geo';
 
 const NEAR_TRAIL_M = 20;
@@ -17,7 +17,7 @@ const TRAIL_CELL = 0.0005; // ~55m x 33m
 const MAX_STEP_MS = 60_000; // longer gaps in a trail don't count towards distance
 
 export type DriveInput = { id: number; startedAt: number; points: Point[] };
-export type DriveStats = { id: number; endedAt: number | null; distanceM: number; newM: number };
+export type DriveStats = { id: number; endedAt: number | null; distanceM: number; newM: number; ignoredN: number };
 
 export type RecheckResult = {
   driven: Set<string>;
@@ -25,12 +25,21 @@ export type RecheckResult = {
   remove: string[];
   stats: DriveStats[];
   unmatched: Point[];
+  // Partly-driven chunks: what's been covered so far, across all drives.
+  partials: Map<string, [number, number][]>;
+  // Chunks each drive covered (for the heatmap and showing a drive).
+  driveRoads: Map<number, string[]>;
 };
 
+// Distance over the points that pass the wild-GPS filter.
 export function driveDistanceMeters(points: Point[]): number {
+  const f = new GpsFilter();
   let d = 0;
-  for (let i = 1; i < points.length; i++) {
-    if (points[i].timestamp - points[i - 1].timestamp <= MAX_STEP_MS) d += distanceMeters(points[i - 1], points[i]);
+  let prev: Point | null = null;
+  for (const p of points) {
+    if (!f.accept(p)) continue;
+    if (prev && p.timestamp - prev.timestamp <= MAX_STEP_MS) d += distanceMeters(prev, p);
+    prev = p;
   }
   return d;
 }
@@ -92,9 +101,19 @@ export async function recheckDrives(
   // Roads we keep regardless: not from a saved drive, or not in the
   // downloaded road data (can't be re-checked, so never removed).
   const driven = new Set<string>();
+  // A road piece whose id is gone from the road data (OSM changed since it
+  // was driven) but that sits in a downloaded area next to a trail is
+  // stale: the replay re-earns it under its new id, so the old one is
+  // dropped (kept aside, can be put back) rather than counted twice.
   current.forEach((shape, id) => {
     const s = shape ?? net.shapeOf(id);
-    if (!net.segs.has(baseChunkId(id)) || !s || !trail.touches(s)) driven.add(id);
+    if (!s || !trail.touches(s)) {
+      driven.add(id);
+      return;
+    }
+    if (net.segs.has(baseChunkId(id))) return; // re-checked by the replay
+    const areaLoaded = s.some(([la, lo]) => net.candidates({ latitude: la, longitude: lo }).length > 0);
+    if (!areaLoaded) driven.add(id); // no road data here: can't judge, keep
   });
 
   const stats: DriveStats[] = [];
@@ -102,9 +121,27 @@ export async function recheckDrives(
   const totalPoints = drives.reduce((n, d) => n + d.points.length, 0) || 1;
   let donePoints = 0;
   const sorted = drives.slice().sort((a, b) => a.startedAt - b.startedAt);
+  // Shared by every drive, oldest first, so coverage adds up across drives.
+  const partials = new Map<string, [number, number][]>();
+  const driveRoads = new Map<number, string[]>();
+  const index = new PieceIndex(driven);
+  // Adds a road piece unless one already covers it; drops pieces it now
+  // covers. Returns the metres it adds.
+  const addPiece = (id: string): number => {
+    if (index.coveredBy(id)) return 0;
+    let m = net.length(id);
+    for (const old of index.within(id)) {
+      m -= net.length(old);
+      index.delete(old);
+      driven.delete(old);
+    }
+    index.add(id);
+    driven.add(id);
+    return Math.max(0, m);
+  };
 
   for (const d of sorted) {
-    const m = new DriveMatcher(net, excluded);
+    const m = new DriveMatcher(net, excluded, partials);
     const completed = new Set<string>();
     for (let i = 0; i < d.points.length; i += 200) {
       const r = m.feed(d.points.slice(i, i + 200));
@@ -117,16 +154,15 @@ export async function recheckDrives(
     m.finish().forEach((id) => completed.add(id));
 
     let newM = 0;
-    completed.forEach((id) => {
+    [...completed, ...m.stubs].forEach((id) => {
       const base = baseChunkId(id);
       const unmarkedAt = unmarked.get(id) ?? unmarked.get(base);
       if (unmarkedAt !== undefined && unmarkedAt >= d.startedAt) return; // you un-marked it after this drive
-      if (driven.has(id) || (base !== id && driven.has(base))) return; // already counted (whole chunk)
-      driven.add(id);
-      newM += net.length(id);
+      newM += addPiece(id);
     });
+    driveRoads.set(d.id, m.roadsCovered());
     const last = d.points[d.points.length - 1];
-    stats.push({ id: d.id, endedAt: last ? last.timestamp : null, distanceM: driveDistanceMeters(d.points), newM });
+    stats.push({ id: d.id, endedAt: last ? last.timestamp : null, distanceM: driveDistanceMeters(d.points), newM, ignoredN: m.gps.ignored });
   }
 
   // A road you already had as one whole piece that's now earned section by
@@ -134,10 +170,7 @@ export async function recheckDrives(
   current.forEach((_, id) => {
     if (driven.has(id) || baseChunkId(id) !== id) return;
     const secs = net.sections(id);
-    if (secs.length > 1 && secs.every((x) => driven.has(x.id))) {
-      secs.forEach((x) => driven.delete(x.id));
-      driven.add(id);
-    }
+    if (secs.length > 1 && secs.every((x) => driven.has(x.id))) addPiece(id);
   });
 
   const add: string[] = [];
@@ -148,5 +181,5 @@ export async function recheckDrives(
   current.forEach((_, id) => {
     if (!driven.has(id)) remove.push(id);
   });
-  return { driven, add, remove, stats, unmatched };
+  return { driven, add, remove, stats, unmatched, partials, driveRoads };
 }
