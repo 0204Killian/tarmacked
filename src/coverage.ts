@@ -19,12 +19,14 @@
 //     where those chunks meet, so each run is extended to that junction.
 //     Chunks skipped over on the same road were driven in full; a short
 //     link between two roads counts between the two junctions only.
-//  5. A chunk is complete once its covered stretches span it end to end.
+//  5. A chunk is split into sections wherever another road joins it partway
+//     along. Each section counts once its covered stretches span it end to
+//     end — so turning off at a junction still credits the part you drove.
 //
 // Pure logic with no React or storage, so it can be tested on its own and
 // re-run over saved drives at any time.
 
-import { RoadNetwork, parseChunkId } from './roadMatcher';
+import { RoadNetwork, Section, parseChunkId } from './roadMatcher';
 import { distanceMeters, headingBetween } from './geo';
 
 export type Point = { latitude: number; longitude: number; timestamp: number };
@@ -246,25 +248,42 @@ export class DriveMatcher {
     return null;
   }
 
+  // Records a covered stretch of a chunk, and reports any of its sections
+  // that are now covered end to end.
   private cover(id: string, lo: number, hi: number) {
-    if (this.done.has(id)) return;
+    const secs = this.net.sections(id);
+    if (secs.length === 0 || secs.every((x) => this.done.has(x.id))) return;
     const list = this.coverage.get(id);
     if (list) list.push([lo, hi]);
     else this.coverage.set(id, [[lo, hi]]);
-    if (isCovered(this.net, id, this.coverage.get(id)!)) {
-      this.done.add(id);
-      this.coverage.delete(id);
-      this.completedBuffer.push(id);
+    const stretches = this.coverage.get(id)!;
+    for (const sec of secs) {
+      if (this.done.has(sec.id)) continue;
+      if (isSectionCovered(this.net, id, sec, stretches)) {
+        this.done.add(sec.id);
+        this.completedBuffer.push(sec.id);
+      }
     }
   }
 }
 
-// Does this set of covered stretches span the chunk end to end?
+// Is this section covered end to end? 10m slack at each end; 40m at the
+// end of a dead-end road.
+export function isSectionCovered(net: RoadNetwork, chunkId: string, sec: Section, stretches: [number, number][]): boolean {
+  const tol0 = sec.atChunkStart && net.isDeadEnd(chunkId, 'start') ? DEAD_END_TOLERANCE_M : END_TOLERANCE_M;
+  const tol1 = sec.atChunkEnd && net.isDeadEnd(chunkId, 'end') ? DEAD_END_TOLERANCE_M : END_TOLERANCE_M;
+  let need0 = sec.from + tol0;
+  let need1 = sec.to - tol1;
+  if (need0 >= need1) need0 = need1 = (sec.from + sec.to) / 2; // tiny section: just its middle
+  return spans(stretches, need0, need1);
+}
+
+// Whole-chunk version (every section covered).
 export function isCovered(net: RoadNetwork, id: string, stretches: [number, number][]): boolean {
-  const len = net.length(id);
-  let need0 = net.isDeadEnd(id, 'start') ? DEAD_END_TOLERANCE_M : END_TOLERANCE_M;
-  let need1 = len - (net.isDeadEnd(id, 'end') ? DEAD_END_TOLERANCE_M : END_TOLERANCE_M);
-  if (need0 >= need1) need0 = need1 = len / 2; // tiny chunk: just its middle
+  return net.sections(id).every((sec) => isSectionCovered(net, id, sec, stretches));
+}
+
+function spans(stretches: [number, number][], need0: number, need1: number): boolean {
   const sorted = stretches.slice().sort((x, y) => x[0] - y[0]);
   let lo = sorted[0][0];
   let hi = sorted[0][1];

@@ -8,7 +8,7 @@
 // crossed, gets re-checked too and may be removed. Everything removed is
 // kept aside and can be put back from Dev.
 
-import { RoadNetwork } from './roadMatcher';
+import { RoadNetwork, baseChunkId } from './roadMatcher';
 import { DriveMatcher, Point } from './coverage';
 import { Coord, haversine, distanceMeters } from './geo';
 
@@ -82,16 +82,19 @@ export async function recheckDrives(
   current: Map<string, Coord[] | null>, // driven id -> stored shape
   excluded: Set<string>,
   unmarked: Map<string, number>, // id -> when you un-marked it
-  onProgress?: (fraction: number) => void
+  onProgress?: (fraction: number) => void,
+  // GPS trails of drives that were deleted: they no longer earn roads, but
+  // roads near them are re-checked (so a deleted drive's roads go away).
+  forgottenTrails: Point[][] = []
 ): Promise<RecheckResult> {
-  const trail = new TrailIndex(drives);
+  const trail = new TrailIndex([...drives, ...forgottenTrails.map((points, i) => ({ id: -1 - i, startedAt: 0, points }))]);
 
   // Roads we keep regardless: not from a saved drive, or not in the
   // downloaded road data (can't be re-checked, so never removed).
   const driven = new Set<string>();
   current.forEach((shape, id) => {
-    const s = shape ?? net.segs.get(id)?.coords ?? null;
-    if (!net.segs.has(id) || !s || !trail.touches(s)) driven.add(id);
+    const s = shape ?? net.shapeOf(id);
+    if (!net.segs.has(baseChunkId(id)) || !s || !trail.touches(s)) driven.add(id);
   });
 
   const stats: DriveStats[] = [];
@@ -115,15 +118,27 @@ export async function recheckDrives(
 
     let newM = 0;
     completed.forEach((id) => {
-      const unmarkedAt = unmarked.get(id);
+      const base = baseChunkId(id);
+      const unmarkedAt = unmarked.get(id) ?? unmarked.get(base);
       if (unmarkedAt !== undefined && unmarkedAt >= d.startedAt) return; // you un-marked it after this drive
-      if (driven.has(id)) return;
+      if (driven.has(id) || (base !== id && driven.has(base))) return; // already counted (whole chunk)
       driven.add(id);
       newM += net.length(id);
     });
     const last = d.points[d.points.length - 1];
     stats.push({ id: d.id, endedAt: last ? last.timestamp : null, distanceM: driveDistanceMeters(d.points), newM });
   }
+
+  // A road you already had as one whole piece that's now earned section by
+  // section stays as the whole piece — no churn, nothing double-counted.
+  current.forEach((_, id) => {
+    if (driven.has(id) || baseChunkId(id) !== id) return;
+    const secs = net.sections(id);
+    if (secs.length > 1 && secs.every((x) => driven.has(x.id))) {
+      secs.forEach((x) => driven.delete(x.id));
+      driven.add(id);
+    }
+  });
 
   const add: string[] = [];
   const remove: string[] = [];

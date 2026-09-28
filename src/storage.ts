@@ -489,20 +489,24 @@ export async function loadUnmarked(): Promise<Map<string, number>> {
 /**
  * Applies the result of re-checking drives: adds newly confirmed roads and
  * removes ones that no longer pass. Removed roads are kept in
- * driven_removed so the change can be undone.
+ * driven_removed so the change can be undone (not when the removal is
+ * because you deleted the drive they came from).
  */
 export async function applyRecheck(
   add: { id: string; shape: Shape | null; county: number | null }[],
-  remove: string[]
+  remove: string[],
+  keepForUndo = true
 ) {
   const now = Date.now();
   await write(async (db) => {
-    await bulk(
-      db,
-      'INSERT OR REPLACE INTO driven_removed (id, shape, first_at, county, removed_at) ' +
-        'SELECT id, shape, first_at, county, ? FROM driven WHERE id = ?',
-      remove.map((id) => [now, id])
-    );
+    if (keepForUndo) {
+      await bulk(
+        db,
+        'INSERT OR REPLACE INTO driven_removed (id, shape, first_at, county, removed_at) ' +
+          'SELECT id, shape, first_at, county, ? FROM driven WHERE id = ?',
+        remove.map((id) => [now, id])
+      );
+    }
     await bulk(db, 'DELETE FROM driven WHERE id = ?', remove.map((id) => [id]));
     await bulk(db, DRIVEN_UPSERT, add.map((r) => [r.id, r.shape ? JSON.stringify(r.shape) : null, now, r.county]));
   });

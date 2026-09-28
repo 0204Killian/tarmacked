@@ -34,6 +34,17 @@ export function parseChunkId(id: string): { way: string; idx: number } | null {
   return { way: id.slice(0, hash), idx };
 }
 
+// A chunk is split into sections wherever another road joins it partway
+// along, so turning off at that junction still credits the part you drove.
+// Section ids are "<chunk id>~<from>-<to>" (metres along the chunk); a chunk
+// with no junction partway along is a single section with the chunk's own id.
+export type Section = { id: string; from: number; to: number; i0: number; i1: number; atChunkStart: boolean; atChunkEnd: boolean };
+
+export function baseChunkId(id: string): string {
+  const i = id.indexOf('~');
+  return i < 0 ? id : id.slice(0, i);
+}
+
 export type Match = {
   id: string | null;
   pos: number; // metres along the chunk from its first point
@@ -55,6 +66,7 @@ export class RoadNetwork {
 
   clear() {
     this.nbCache.clear();
+    this.secCache.clear();
     this.segs.clear();
     this.cum.clear();
     this.vertex.clear();
@@ -62,7 +74,10 @@ export class RoadNetwork {
   }
 
   add(segments: RoadSegment[]) {
-    if (segments.length > 0) this.nbCache.clear();
+    if (segments.length > 0) {
+      this.nbCache.clear();
+      this.secCache.clear(); // new roads can add junctions
+    }
     for (const seg of segments) {
       if (this.segs.has(seg.id) || seg.coords.length < 2) continue;
       this.segs.set(seg.id, seg);
@@ -97,9 +112,64 @@ export class RoadNetwork {
     }
   }
 
+  // Length of a chunk, or of one of its sections.
   length(id: string): number {
+    const base = baseChunkId(id);
+    if (base !== id) {
+      const sec = this.sections(base).find((x) => x.id === id);
+      if (sec) return sec.to - sec.from;
+      const m = /~(\d+)-(\d+)$/.exec(id);
+      return m ? Number(m[2]) - Number(m[1]) : 0;
+    }
     const cum = this.cum.get(id);
     return cum ? cum[cum.length - 1] : 0;
+  }
+
+  private secCache = new Map<string, Section[]>();
+
+  sections(id: string): Section[] {
+    const cached = this.secCache.get(id);
+    if (cached) return cached;
+    const seg = this.segs.get(id);
+    const cum = this.cum.get(id);
+    if (!seg || !cum) return [];
+    const cuts = [0];
+    for (let i = 1; i < seg.coords.length - 1; i++) {
+      if (this.chunksAt(seg.coords[i]).some((other) => other !== id)) cuts.push(i);
+    }
+    cuts.push(seg.coords.length - 1);
+    const out: Section[] = [];
+    for (let k = 0; k < cuts.length - 1; k++) {
+      const i0 = cuts[k];
+      const i1 = cuts[k + 1];
+      const from = cum[i0];
+      const to = cum[i1];
+      out.push({
+        id: cuts.length === 2 ? id : `${id}~${Math.round(from)}-${Math.round(to)}`,
+        from,
+        to,
+        i0,
+        i1,
+        atChunkStart: i0 === 0,
+        atChunkEnd: i1 === seg.coords.length - 1,
+      });
+    }
+    this.secCache.set(id, out);
+    return out;
+  }
+
+  // Shape of a chunk or section, if its chunk is downloaded.
+  shapeOf(id: string): Coord[] | null {
+    const base = baseChunkId(id);
+    const seg = this.segs.get(base);
+    if (!seg) return null;
+    if (base === id) return seg.coords;
+    const sec = this.sections(base).find((x) => x.id === id);
+    return sec ? seg.coords.slice(sec.i0, sec.i1 + 1) : null;
+  }
+
+  countyOf(id: string): number | null {
+    return this.segs.get(baseChunkId(id))?.c ?? null;
   }
 
   // Chunks near a point (within roughly the snap distance of its cell).

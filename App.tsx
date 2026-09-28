@@ -7,7 +7,7 @@ import { File, Paths } from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import * as DocumentPicker from 'expo-document-picker';
 import * as store from './src/storage';
-import { RoadNetwork, RoadSegment, parseChunkId } from './src/roadMatcher';
+import { RoadNetwork, RoadSegment, parseChunkId, baseChunkId } from './src/roadMatcher';
 import { DriveMatcher, Point } from './src/coverage';
 import { recheckDrives } from './src/recheck';
 import { Coord, lineLengthMeters, distanceMeters, tileIdForPoint, neighbourTileIds, simplifyLine } from './src/geo';
@@ -81,7 +81,7 @@ function buildChains(ids: Iterable<string>, shapeOf: (id: string) => Coord[] | u
     }
     lines.push(cur);
   });
-  return lines.map((coords) => {
+  return stitchLines(lines).map((coords) => {
     let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
     for (const [la, lo] of coords) {
       if (la < minLat) minLat = la;
@@ -91,6 +91,44 @@ function buildChains(ids: Iterable<string>, shapeOf: (id: string) => Coord[] | u
     }
     return { coords, minLat, maxLat, minLon, maxLon };
   });
+}
+
+// Joins lines end to end wherever exactly two of them meet (e.g. where one
+// road continues as another, or around a roundabout), so the map draws one
+// smooth line instead of separate pieces with visible joins.
+function stitchLines(input: Coord[][]): Coord[][] {
+  let lines = input.filter((l) => l.length >= 2);
+  const key = (c: Coord) => `${c[0]},${c[1]}`;
+  for (let pass = 0; pass < 50; pass++) {
+    const ends = new Map<string, { i: number; atStart: boolean }[]>();
+    lines.forEach((l, i) => {
+      for (const [c, atStart] of [[l[0], true], [l[l.length - 1], false]] as [Coord, boolean][]) {
+        const k = key(c);
+        const list = ends.get(k);
+        if (list) list.push({ i, atStart });
+        else ends.set(k, [{ i, atStart }]);
+      }
+    });
+    const used = new Set<number>();
+    const out: Coord[][] = [];
+    ends.forEach((list) => {
+      if (list.length !== 2) return;
+      const [a, b] = list;
+      if (a.i === b.i || used.has(a.i) || used.has(b.i)) return;
+      used.add(a.i);
+      used.add(b.i);
+      // Orient so the first line ends at the shared point and the second starts there.
+      const first = a.atStart ? lines[a.i].slice().reverse() : lines[a.i];
+      const second = b.atStart ? lines[b.i] : lines[b.i].slice().reverse();
+      out.push([...first, ...second.slice(1)]);
+    });
+    if (used.size === 0) return lines;
+    lines.forEach((l, i) => {
+      if (!used.has(i)) out.push(l);
+    });
+    lines = out;
+  }
+  return lines;
 }
 
 // --- Background location: points land here and are picked up every 2s ---
@@ -252,12 +290,15 @@ function App() {
   // Marks roads as driven. Returns the ones that weren't driven before.
   const markDriven = (ids: string[]): string[] => {
     const net = netRef.current;
-    const fresh = ids.filter((id) => !drivenRef.current.has(id) && !excludedRef.current.has(id));
+    // A section of a road already driven as a whole piece adds nothing new.
+    const fresh = ids.filter((id) => {
+      const base = baseChunkId(id);
+      return !drivenRef.current.has(id) && !drivenRef.current.has(base) && !excludedRef.current.has(base);
+    });
     if (fresh.length === 0) return [];
     const rows = fresh.map((id) => {
-      const seg = net.segs.get(id);
-      const shape = drivenShapesRef.current.get(id) ?? seg?.coords ?? null;
-      const county = drivenCountyRef.current.get(id) ?? seg?.c ?? null;
+      const shape = drivenShapesRef.current.get(id) ?? net.shapeOf(id);
+      const county = drivenCountyRef.current.get(id) ?? net.countyOf(id);
       rememberDriven(id, shape, county);
       drivenRef.current.add(id);
       return { id, shape, county };
@@ -511,10 +552,17 @@ function App() {
     setRecheckProgress(0);
     try {
       const allDrives = await store.loadDrives();
+      // Trails of deleted drives still waiting for their roads to be removed.
+      let forgotten: Point[][] = [];
+      try {
+        forgotten = JSON.parse((await store.getMeta('forgotten_trails')) || '[]');
+      } catch {
+        forgotten = [];
+      }
       const tiles = new Set<string>();
       const visited = new Set<string>();
-      for (const d of allDrives) {
-        for (const p of d.points) {
+      for (const points of [...allDrives.map((d) => d.points), ...forgotten]) {
+        for (const p of points) {
           const own = tileIdForPoint(p.latitude, p.longitude);
           if (visited.has(own)) continue;
           visited.add(own);
@@ -541,14 +589,13 @@ function App() {
         current,
         excludedRef.current,
         unmarkedRef.current,
-        (f) => setRecheckProgress(0.3 + f * 0.7)
+        (f) => setRecheckProgress(0.3 + f * 0.7),
+        forgotten
       );
       const net = netRef.current;
-      const addRows = result.add.map((id) => {
-        const seg = net.segs.get(id);
-        return { id, shape: seg?.coords ?? null, county: seg?.c ?? null };
-      });
-      await store.applyRecheck(addRows, result.remove);
+      const addRows = result.add.map((id) => ({ id, shape: net.shapeOf(id), county: net.countyOf(id) }));
+      await store.applyRecheck(addRows, result.remove, reason !== 'deleted');
+      await store.setMeta('forgotten_trails', '[]');
       await store.setDriveStats(result.stats);
       await store.replaceUnmatched(result.unmatched);
       await store.setMeta('recheck_pending', '');
@@ -757,12 +804,16 @@ function App() {
 
   const handleEditTap = (id: string) => {
     if (editAction === 'undrive') {
-      if (!drivenRef.current.has(id)) return;
-      drivenRef.current.delete(id);
-      forgetDriven(id);
+      // The tapped road piece, and any sections of it.
+      const gone = Array.from(drivenRef.current).filter((d) => baseChunkId(d) === id);
+      if (gone.length === 0) return;
+      for (const d of gone) {
+        drivenRef.current.delete(d);
+        forgetDriven(d);
+        store.removeDriven(d).catch((e) => setNote(`Couldn't save that change: ${(e as Error).message}`));
+      }
       unmarkedRef.current.set(id, Date.now());
       setDrivenIds(new Set(drivenRef.current));
-      store.removeDriven(id).catch((e) => setNote(`Couldn't save that change: ${(e as Error).message}`));
       store.markUnmarked(id).catch(() => undefined);
       return;
     }
@@ -834,6 +885,15 @@ function App() {
     setDeleteConfirmId(null);
     if (selectedDrive?.id === id) setSelectedDrive(null);
     try {
+      // Remember its trail until the re-check has removed the roads it earned.
+      const gone = await store.loadDrivePoints(id);
+      let forgotten: Point[][] = [];
+      try {
+        forgotten = JSON.parse((await store.getMeta('forgotten_trails')) || '[]');
+      } catch {
+        forgotten = [];
+      }
+      await store.setMeta('forgotten_trails', JSON.stringify([...forgotten, gone]));
       await store.deleteDrive(id);
       setDrives(await store.listDrives());
       const ok = await runRecheck('deleted');
@@ -1000,7 +1060,9 @@ function App() {
     const driven = new Array(n).fill(0);
     const excluded = new Array(n).fill(0);
     drivenIds.forEach((id) => {
-      if (excludedIds.has(id)) return;
+      const base = baseChunkId(id);
+      if (excludedIds.has(base)) return;
+      if (base !== id && drivenIds.has(base)) return; // whole piece already counted
       const c = drivenCountyRef.current.get(id);
       if (c === undefined || c >= n) return;
       driven[c] += lengthRef.current.get(id) ?? 0;
@@ -1042,7 +1104,7 @@ function App() {
   const drivenChains = useMemo(
     () =>
       buildChains(
-        Array.from(drivenIds).filter((id) => !excludedIds.has(id)),
+        Array.from(drivenIds).filter((id) => !excludedIds.has(baseChunkId(id))),
         (id) => drivenShapesRef.current.get(id)
       ),
     [drivenIds, excludedIds]
@@ -1061,16 +1123,44 @@ function App() {
   const liveChains = useMemo(() => buildChains(liveIds, (id) => drivenShapesRef.current.get(id)), [liveIds]);
 
   const editZoomedIn = visibleRegion.latitudeDelta <= EDIT_MAX_LAT_DELTA;
+  // Road pieces with anything driven on them (whole or in sections), for edit mode.
+  const drivenBases = useMemo(() => new Set(Array.from(drivenIds).map(baseChunkId)), [drivenIds]);
   const visibleEditSegments = useMemo(() => {
     if (!editMode || !editZoomedIn) return [] as RoadSegment[];
     return netRef.current.inBox(bounds.minLat, bounds.minLon, bounds.maxLat, bounds.maxLon);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editMode, editZoomedIn, bounds, netRev]);
 
-  const drawLine = (key: string, coords: Coord[], color: string, z = 2) => [
-    <Polyline key={`${key}-o`} coordinates={toLatLng(coords)} strokeColor="#0d3818" strokeWidth={7} lineCap="round" lineJoin="round" zIndex={z} />,
-    <Polyline key={key} coordinates={toLatLng(coords)} strokeColor={color} strokeWidth={4} lineCap="round" lineJoin="round" zIndex={z + 1} />,
-  ];
+  // Every dark outline is drawn first and every green line after, so no
+  // outline ever sits on top of green where two lines meet. Apple Maps
+  // stacks lines in the order they're added (it ignores zIndex), so the
+  // whole set is re-added whenever it changes to keep that order.
+  const drawRevs = useRef({ n: 0, map: new WeakMap<Chain[], number>() });
+  const drawLines = (prefix: string, chains: Chain[], thin: boolean) => {
+    // A new number only when this set of lines actually changes.
+    const revs = drawRevs.current;
+    let rev = revs.map.get(chains);
+    if (rev === undefined) {
+      rev = ++revs.n;
+      revs.map.set(chains, rev);
+    }
+    const outlines = thin
+      ? []
+      : chains.map((c, i) => (
+          <Polyline key={`${prefix}o${i}-${rev}`} coordinates={toLatLng(c.coords)} strokeColor="#0d3818" strokeWidth={7} lineCap="round" lineJoin="round" />
+        ));
+    const cores = chains.map((c, i) => (
+      <Polyline
+        key={`${prefix}c${i}-${rev}`}
+        coordinates={toLatLng(c.coords)}
+        strokeColor="#39d353"
+        strokeWidth={thin ? 3 : 4}
+        lineCap="round"
+        lineJoin="round"
+      />
+    ));
+    return [...outlines, ...cores];
+  };
 
   // ---------- Onboarding ----------
 
@@ -1142,7 +1232,7 @@ function App() {
         {editMode &&
           visibleEditSegments.map((seg) => {
             const isExcluded = excludedIds.has(seg.id);
-            const isDriven = drivenIds.has(seg.id);
+            const isDriven = drivenBases.has(seg.id);
             return (
               <Polyline
                 key={seg.id}
@@ -1158,14 +1248,9 @@ function App() {
             );
           })}
 
-        {!editMode &&
-          visibleChains.flatMap((c, i) =>
-            zoomedOut
-              ? [<Polyline key={`d${i}`} coordinates={toLatLng(c.coords)} strokeColor="#39d353" strokeWidth={3} zIndex={2} />]
-              : drawLine(`d${i}`, c.coords, '#39d353')
-          )}
+        {!editMode && drawLines('d', visibleChains, zoomedOut)}
 
-        {tracking && liveChains.flatMap((c, i) => drawLine(`live${i}`, c.coords, '#39d353', 4))}
+        {tracking && drawLines('live', liveChains, false)}
 
         {tracking && liveTrail.length > 1 && (
           <Polyline
