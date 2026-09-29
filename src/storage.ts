@@ -601,6 +601,21 @@ export async function applyRecheck(
   });
 }
 
+// When each driven road was first marked.
+export async function loadDrivenFirstAt(): Promise<Map<string, number>> {
+  const db = await getDb();
+  const rows = await db.getAllAsync<{ id: string; first_at: number }>('SELECT id, first_at FROM driven');
+  return new Map(rows.map((r) => [r.id, r.first_at]));
+}
+
+// Roads you put back by hand after a re-check: re-checks leave them alone.
+export async function loadPinned(): Promise<Set<string>> {
+  const db = await getDb();
+  await db.execAsync('CREATE TABLE IF NOT EXISTS pinned_roads (id TEXT PRIMARY KEY NOT NULL)');
+  const rows = await db.getAllAsync<{ id: string }>('SELECT id FROM pinned_roads');
+  return new Set(rows.map((r) => r.id));
+}
+
 export async function countRemoved(): Promise<number> {
   const db = await getDb();
   const row = await db.getFirstAsync<{ n: number }>('SELECT COUNT(*) AS n FROM driven_removed');
@@ -615,6 +630,8 @@ export async function restoreRemoved(): Promise<number> {
     await db.runAsync(
       'INSERT OR IGNORE INTO driven (id, shape, first_at, county) SELECT id, shape, first_at, county FROM driven_removed'
     );
+    await db.execAsync('CREATE TABLE IF NOT EXISTS pinned_roads (id TEXT PRIMARY KEY NOT NULL)');
+    await db.runAsync('INSERT OR IGNORE INTO pinned_roads (id) SELECT id FROM driven_removed');
     await db.runAsync('DELETE FROM driven_removed');
     // Anything restored shouldn't be taken away again by the next re-check.
     await db.runAsync('DELETE FROM unmarked WHERE id IN (SELECT id FROM driven)');
@@ -671,6 +688,8 @@ export async function resetProgress() {
     await db.runAsync('DELETE FROM driven_removed');
     await db.runAsync('DELETE FROM partial_coverage');
     await db.runAsync('DELETE FROM drive_roads');
+    await db.execAsync('CREATE TABLE IF NOT EXISTS pinned_roads (id TEXT PRIMARY KEY NOT NULL)');
+    await db.runAsync('DELETE FROM pinned_roads');
   });
 }
 

@@ -201,6 +201,23 @@ all = run('turn onto side street and through', drive([[0, 300], [0, 340], [120, 
   const ok = r.remove.sort().join() === ['way/1#3', 'way/10#0', 'way/60#0'].join() && r.add.length === 0 && r.driven.has('way/2#3') && r.driven.has('way/999#0');
   console.log(`${ok ? 'PASS' : 'FAIL'}  re-check removes stubs, keeps pre-trail roads, respects un-marks`);
   console.log(`      remove: ${r.remove.join(' ')}  add: ${r.add.join(' ')}  stats: ${JSON.stringify(r.stats)}`);
+  // 11b. A wrong piece far from any trail (e.g. the far side of a roundabout):
+  // kept when it's older than the saved trails, removed when it was marked since.
+  {
+    const cur = new Map<string, Coord[] | null>();
+    for (const id of rawChunks(1)) cur.set(id, net.segs.get(id)!.coords);
+    cur.set('way/51#1', net.segs.get('way/51#1')!.coords); // 100m+ from the main-road trail
+    const since = pts[0].timestamp;
+    const firstAt = new Map([...cur.keys()].map((id) => [id, since + 5000] as [string, number]));
+    const rNew = await recheckDrives(net, [{ id: 1, startedAt: since, points: pts }], cur, new Set(), new Map(), undefined, [], { firstAt, trailsSince: since, pinned: new Set() });
+    const firstOld = new Map(firstAt);
+    firstOld.set('way/51#1', since - 1000);
+    const rOld = await recheckDrives(net, [{ id: 1, startedAt: since, points: pts }], cur, new Set(), new Map(), undefined, [], { firstAt: firstOld, trailsSince: since, pinned: new Set() });
+    const rPin = await recheckDrives(net, [{ id: 1, startedAt: since, points: pts }], cur, new Set(), new Map(), undefined, [], { firstAt, trailsSince: since, pinned: new Set(['way/51#1']) });
+    const okFar = rNew.remove.includes('way/51#1') && !rOld.remove.includes('way/51#1') && !rPin.remove.includes('way/51#1');
+    console.log(`${okFar ? 'PASS' : 'FAIL'}  re-check: a piece far from any trail is removed if marked since trails began (kept if older, or put back by hand)`);
+    all = okFar && all;
+  }
   // 12. Deleting a drive removes the roads only it earned.
   seed = 5;
   const keepDrive = drive([[0, -5], [0, 605]]); // main road

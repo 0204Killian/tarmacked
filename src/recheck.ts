@@ -94,7 +94,12 @@ export async function recheckDrives(
   onProgress?: (fraction: number) => void,
   // GPS trails of drives that were deleted: they no longer earn roads, but
   // roads near them are re-checked (so a deleted drive's roads go away).
-  forgottenTrails: Point[][] = []
+  forgottenTrails: Point[][] = [],
+  // When each road was first marked, and the time GPS trails were first
+  // saved from. A road marked since then has to be earned again by a
+  // saved drive; only older roads (no trail to check them against) are
+  // kept as they are. pinned: roads you put back by hand — always kept.
+  history: { firstAt: Map<string, number>; trailsSince: number; pinned: Set<string> } | null = null
 ): Promise<RecheckResult> {
   const trail = new TrailIndex([...drives, ...forgottenTrails.map((points, i) => ({ id: -1 - i, startedAt: 0, points }))]);
 
@@ -107,12 +112,19 @@ export async function recheckDrives(
   // dropped (kept aside, can be put back) rather than counted twice.
   current.forEach((shape, id) => {
     const s = shape ?? net.shapeOf(id);
-    if (!s || !trail.touches(s)) {
+    if (history?.pinned.has(id)) {
+      driven.add(id);
+      return;
+    }
+    const first = history?.firstAt.get(id);
+    const preTrail = !history || first === undefined || first < history.trailsSince;
+    // Older than any saved trail and nowhere near one: nothing to check it against.
+    if (preTrail && (!s || !trail.touches(s))) {
       driven.add(id);
       return;
     }
     if (net.segs.has(baseChunkId(id))) return; // re-checked by the replay
-    const areaLoaded = s.some(([la, lo]) => net.candidates({ latitude: la, longitude: lo }).length > 0);
+    const areaLoaded = !!s && s.some(([la, lo]) => net.candidates({ latitude: la, longitude: lo }).length > 0);
     if (!areaLoaded) driven.add(id); // no road data here: can't judge, keep
   });
 
