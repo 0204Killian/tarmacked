@@ -2,6 +2,8 @@
 import { RoadNetwork, RoadSegment } from '../src/roadMatcher';
 import { DriveMatcher, Point, isPatchy, PieceIndex } from '../src/coverage';
 import { rankRoads, heatStep, heatColorAt } from '../src/heat';
+import { runLoopTests } from './loop';
+import { runSlipTests } from './slip';
 import { recheckDrives } from '../src/recheck';
 import { metersPerDegLon, METERS_PER_DEG_LAT, Coord } from '../src/geo';
 
@@ -347,6 +349,11 @@ all = run('turn onto side street and through', drive([[0, 300], [0, 340], [120, 
     const r = await recheckDrives(net, [{ id: 1, startedAt: 0, points: pts }], cur, new Set(), new Map());
     check('re-tile: stale old id dropped, undownloaded area kept', r.remove.includes('way/777#0') && r.driven.has('way/888#0') && !r.remove.some((id) => id.startsWith('way/1#')), `remove ${r.remove.join(' ')}`);
   }
+  // ---------- v0.14.1: route-aware matching ----------
+  const loopsOk = runLoopTests();
+  const slipsOk = runSlipTests();
+  v14.push(loopsOk, slipsOk);
+
   const allV14 = v14.every(Boolean);
   console.log(all && ok && ok2 && allV14 ? '\nALL PASS' : '\nSOME FAILED');
 })();

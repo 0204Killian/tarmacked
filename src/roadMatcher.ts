@@ -14,7 +14,6 @@ export type RoadSegment = {
 };
 
 export const SNAP_THRESHOLD_METERS = 25;
-const STICKY_METERS = 12;
 
 // Fine lookup grid (~220m x 135m cells): a point only checks the chunks
 // registered in its own cell, instead of every chunk in 9 road tiles.
@@ -68,7 +67,6 @@ export class RoadNetwork {
   }
 
   clear() {
-    this.nbCache.clear();
     this.secCache.clear();
     this.segs.clear();
     this.cum.clear();
@@ -78,8 +76,7 @@ export class RoadNetwork {
 
   add(segments: RoadSegment[]) {
     if (segments.length > 0) {
-      this.nbCache.clear();
-      this.secCache.clear(); // new roads can add junctions
+        this.secCache.clear(); // new roads can add junctions
     }
     for (const seg of segments) {
       if (this.segs.has(seg.id) || seg.coords.length < 2) continue;
@@ -238,6 +235,15 @@ export class RoadNetwork {
     return null;
   }
 
+  // Every point two chunks share (two pieces of a roundabout share both ends).
+  sharedVertices(a: string, b: string): Coord[] {
+    const sa = this.segs.get(a);
+    if (!sa) return [];
+    const out: Coord[] = [];
+    for (const c of sa.coords) if (this.chunksAt(c).includes(b) && !out.some((o) => o[0] === c[0] && o[1] === c[1])) out.push(c);
+    return out;
+  }
+
   // First shared point between two chunks, if they touch.
   sharedVertex(a: string, b: string): Coord | null {
     const sa = this.segs.get(a);
@@ -248,20 +254,6 @@ export class RoadNetwork {
     return null;
   }
 
-  // The chunk you were just on and the next/previous chunk of the same road.
-  neighbours(id: string): Set<string> {
-    let set = this.nbCache.get(id);
-    if (set) return set;
-    set = new Set([id]);
-    const p = parseChunkId(id);
-    if (p) {
-      set.add(`${p.way}#${p.idx - 1}`);
-      set.add(`${p.way}#${p.idx + 1}`);
-    }
-    this.nbCache.set(id, set);
-    return set;
-  }
-  private nbCache = new Map<string, Set<string>>();
 
   // An end of a chunk that no other road touches — a cul-de-sac or dead end.
   isDeadEnd(id: string, end: 'start' | 'end'): boolean {
@@ -271,24 +263,25 @@ export class RoadNetwork {
     return this.chunksAt(c).every((other) => other === id);
   }
 
+  // Is this chunk drawn as a closed loop (a roundabout in one piece)?
+  isLoop(id: string): boolean {
+    const c = this.segs.get(id)?.coords;
+    return !!c && c.length > 2 && c[0][0] === c[c.length - 1][0] && c[0][1] === c[c.length - 1][1];
+  }
+
   /**
-   * Nearest chunk within the snap distance. When a direction of travel is
-   * known it only accepts roads you could actually be driving along:
+   * Every chunk within the snap distance of a point, with its nearest
+   * position and distance. When a direction of travel is known it only
+   * accepts roads you could actually be driving along:
    *  - two-way roads: within maxAngleDeg of your heading, either direction
    *  - one-way roads: within maxAngleDeg of their direction of flow
+   * `rejected` is set when a road was in range but failed that check
+   * (a bridge overhead, the opposite carriageway).
    */
-  //
-  // `prefer` (the chunk you were just on) gives it and the rest of the same
-  // road a head start of STICKY_METERS, so noisy GPS doesn't hop you onto a
-  // parallel road a few metres away and back.
-  match(p: LatLon, headingDeg: number | null, maxAngleDeg: number, excluded: Set<string>, prefer: string | null = null): Match {
-    let bestId: string | null = null;
-    let bestScore = Infinity;
-    const preferred = prefer ? this.neighbours(prefer) : null;
-    let bestPos = 0;
-    let nearbyRejected = false;
+  near(p: LatLon, headingDeg: number | null, maxAngleDeg: number, excluded: Set<string>): { list: Candidate[]; rejected: boolean } {
+    const best = new Map<string, Candidate>();
+    let rejected = false;
     const mLon = metersPerDegLon(p.latitude);
-
     for (const id of this.candidates(p)) {
       if (excluded.has(id)) continue;
       const seg = this.segs.get(id)!;
@@ -307,8 +300,8 @@ export class RoadNetwork {
         const cy = ay + t * dy;
         const dist = Math.sqrt(cx * cx + cy * cy);
         if (dist >= SNAP_THRESHOLD_METERS) continue;
-        const score = preferred && preferred.has(id) ? dist - STICKY_METERS : dist;
-        if (score >= bestScore) continue;
+        const prev = best.get(id);
+        if (prev && prev.dist <= dist) continue;
         if (headingDeg !== null) {
           const bearing = (Math.atan2(dx, dy) * 180) / Math.PI;
           let diff: number;
@@ -320,15 +313,77 @@ export class RoadNetwork {
             diff = Math.min(diff, 180 - diff);
           }
           if (diff > maxAngleDeg) {
-            nearbyRejected = true;
+            rejected = true;
             continue;
           }
         }
-        bestScore = score;
-        bestId = id;
-        bestPos = cum[i] + t * (cum[i + 1] - cum[i]);
+        best.set(id, { id, pos: cum[i] + t * (cum[i + 1] - cum[i]), dist });
       }
     }
-    return { id: bestId, pos: bestPos, nearbyRejected: bestId === null && nearbyRejected };
+    return { list: Array.from(best.values()), rejected };
+  }
+
+  /**
+   * Road pieces you could reach from position `pos` on chunk `from` by
+   * driving at most `maxM` metres along the network (one-way rules
+   * respected), with the distance to each, where you'd join it, and the
+   * piece you'd come from. Looks up to `hops` junctions ahead.
+   */
+  reach(from: string, pos: number, maxM: number, hops = 3): Map<string, Reach> {
+    const out = new Map<string, Reach>();
+    out.set(from, { cost: 0, at: pos, prev: null, leave: 0 });
+    let frontier: { id: string; at: number; cost: number }[] = [{ id: from, at: pos, cost: 0 }];
+    for (let hop = 0; hop < hops && frontier.length; hop++) {
+      const next: { id: string; at: number; cost: number }[] = [];
+      for (const f of frontier) {
+        const seg = this.segs.get(f.id);
+        const cum = this.cum.get(f.id);
+        if (!seg || !cum) continue;
+        const loop = this.isLoop(f.id);
+        const len = cum[cum.length - 1];
+        for (let i = 0; i < seg.coords.length; i++) {
+          let d = cum[i] - f.at;
+          if (loop && seg.o === 1 && d < -3) d += len; // on round the roundabout
+          if (seg.o === 1 && d < -3) continue;
+          if (seg.o === -1 && d > 3) continue;
+          const cost = f.cost + Math.abs(d);
+          if (cost > maxM) continue;
+          for (const other of this.chunksAt(seg.coords[i])) {
+            if (other === f.id) continue;
+            const at = this.posOfVertex(other, seg.coords[i]);
+            if (at === null) continue;
+            const known = out.get(other);
+            if (known && known.cost <= cost) continue;
+            out.set(other, { cost, at, prev: f.id, leave: cum[i] });
+            next.push({ id: other, at, cost });
+          }
+        }
+      }
+      frontier = next;
+    }
+    return out;
+  }
+
+  /**
+   * The pieces driven getting from `fromPos` on `from` to `toPos` on `to`:
+   * each with where you joined it and left it (metres along it), shortest
+   * route first. null if there's no such route within maxM.
+   */
+  route(from: string, fromPos: number, to: string, toPos: number, maxM: number): { id: string; from: number; to: number }[] | null {
+    const r = this.reach(from, fromPos, maxM, 4);
+    const end = r.get(to);
+    if (!end || to === from) return null;
+    const legs: { id: string; from: number; to: number }[] = [{ id: to, from: end.at, to: toPos }];
+    let cur = end;
+    let guard = 0;
+    while (cur.prev && guard++ < 10) {
+      const prev = r.get(cur.prev)!;
+      legs.unshift({ id: cur.prev, from: prev.at, to: cur.leave });
+      cur = prev;
+    }
+    return legs;
   }
 }
+
+export type Reach = { cost: number; at: number; prev: string | null; leave: number };
+export type Candidate = { id: string; pos: number; dist: number };

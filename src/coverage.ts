@@ -3,22 +3,23 @@
 // A chunk only counts once you've covered it end to end (10m slack at each
 // end; 40m at a dead end, so turning around near the end of a cul-de-sac
 // still counts). Half-driving a chunk, or a stray GPS point landing on a
-// side street, no longer lights it up.
+// side street, doesn't light it up.
 //
 // How it works:
 //  1. Every GPS point (plus "bridge" points every 15m between consecutive
-//     points) is snapped to the nearest eligible chunk, giving a position
-//     along that chunk. The road you're already on gets a 12m head start,
-//     so noisy GPS doesn't hop you onto a parallel street and back.
-//  2. Consecutive samples on the same chunk form a "run". A run is where
-//     you drove on that chunk, from its lowest to highest position.
+//     points) gets a few candidate roads nearby. The road for each sample
+//     is chosen by route-aware matching (see push()): whole sequences are
+//     weighed by distance from the GPS and by whether the road network
+//     really lets you drive from one road to the next in that time. This
+//     keeps you off slip roads and parallel streets you didn't take.
+//  2. Consecutive samples on the same chunk form a "run": where you drove
+//     on that chunk, from its lowest to highest position (roundabouts
+//     drawn as a closed loop are handled as a continuous circle).
 //  3. Spikes are dropped: a short run (under 30m of travel) sitting between
-//     two runs that already connect to each other is GPS drift — e.g. one
-//     point landing on a side street as you pass it.
-//  4. Moving from one run to the next means you drove through the point
-//     where those chunks meet, so each run is extended to that junction.
-//     Chunks skipped over on the same road were driven in full; a short
-//     link between two roads counts between the two junctions only.
+//     two runs that already connect to each other is GPS drift.
+//  4. Moving from one run to the next, the actual route between them is
+//     credited: each run is extended to where you left or joined it, and
+//     short link pieces in between count between those two points only.
 //  5. A chunk is split into sections wherever another road joins it partway
 //     along. Each section counts once its covered stretches span it end to
 //     end — so turning off at a junction still credits the part you drove.
@@ -26,7 +27,7 @@
 // Pure logic with no React or storage, so it can be tested on its own and
 // re-run over saved drives at any time.
 
-import { RoadNetwork, Section, parseChunkId, baseChunkId } from './roadMatcher';
+import { RoadNetwork, Section, Match, Candidate, parseChunkId, baseChunkId } from './roadMatcher';
 import { distanceMeters, headingBetween } from './geo';
 
 // accuracy: GPS accuracy radius in metres (v0.14+; absent on older points).
@@ -164,7 +165,28 @@ const STUB_MIN_M = 5;
 // covered at least this share of it.
 const HEAT_MIN_SHARE = 0.5;
 
-type Run = { id: string; lo: number; hi: number; tStart: number; tEnd: number };
+// lo/hi: extent driven on the chunk. On a roundabout drawn as a closed
+// loop they're "unwrapped" (can run below 0 or past its length) so an arc
+// across the loop's start point stays one continuous stretch.
+// at: the latest position, in the same unwrapped terms.
+type Run = { id: string; lo: number; hi: number; at: number; first: number; tStart: number; tEnd: number };
+
+// Route-aware matching (see push()).
+const WINDOW_MAX = 80; // most samples held back before a road is decided (~1.2 km)
+const GPS_SIGMA_M = 10; // typical GPS error
+const ROUTE_BETA_M = 5; // how strictly the route must match the distance travelled
+const JUMP_COST = 40; // cost of a jump the road network can't explain (GPS spike, missing road)
+const REACH_SLACK_M = 60;
+const LINK_ROUTE_MAX_M = 400;
+const emissionCost = (dist: number) => (dist * dist) / (2 * GPS_SIGMA_M * GPS_SIGMA_M);
+
+type Layer = {
+  p: { latitude: number; longitude: number };
+  t: number;
+  cands: Candidate[];
+  trans: number[][] | null; // [previous layer's candidate][this layer's candidate]
+  real: boolean; // a GPS point (not an in-between sample)
+};
 
 export class DriveMatcher {
   private lastPoint: Point | null = null;
@@ -175,6 +197,8 @@ export class DriveMatcher {
   readonly touched = new Set<string>();
   private completedBuffer: string[] = [];
   lastChunkId: string | null = null;
+  private lastLayer: Layer | null = null; // last emitted sample, to link the next window to it
+  private lastChoice: number | null = null;
   // Where this drive itself went on each chunk (for the heatmap).
   private own = new Map<string, [number, number][]>();
   private firstMatch: { id: string; pos: number } | null = null;
@@ -224,17 +248,12 @@ export class DriveMatcher {
               latitude: prev.latitude + (p.latitude - prev.latitude) * f,
               longitude: prev.longitude + (p.longitude - prev.longitude) * f,
             };
-            const m = this.net.match(q, heading, HEADING_MAX_ANGLE_DEG, this.excluded, this.lastChunkId);
-            if (m.id) this.addSample(m.id, m.pos, prev.timestamp + (p.timestamp - prev.timestamp) * f);
+            this.push(q, heading, prev.timestamp + (p.timestamp - prev.timestamp) * f, false);
           }
         }
       }
-      const m = this.net.match(p, heading, HEADING_MAX_ANGLE_DEG, this.excluded, this.lastChunkId);
-      if (m.id) {
-        this.addSample(m.id, m.pos, p.timestamp);
-        if (!this.firstMatch) this.firstMatch = { id: m.id, pos: m.pos };
-        this.lastMatch = { id: m.id, pos: m.pos };
-      } else if (!m.nearbyRejected) unmatched.push(p);
+      const m = this.push(p, heading, p.timestamp, true);
+      if (!m.id && !m.nearbyRejected) unmatched.push(p);
       this.lastPoint = p;
     }
     this.settle(false);
@@ -244,6 +263,7 @@ export class DriveMatcher {
   // End of drive: everything still pending is finalised, and the road
   // pieces where the drive started and stopped get their credit.
   finish(): string[] {
+    this.flush();
     this.settle(true);
     for (const end of [this.firstMatch, this.lastMatch]) if (end) this.creditEnd(end.id, end.pos);
     return this.takeCompleted();
@@ -304,15 +324,189 @@ export class DriveMatcher {
     return out;
   }
 
+  // ---- Choosing roads: route-aware matching (a hidden Markov model) ----
+  //
+  // Each GPS sample has a few candidate roads nearby. Rather than taking
+  // the nearest road point by point, the matcher weighs whole sequences:
+  // how far each sample is from its road, and whether you could really
+  // have driven from one road to the next in the time between samples
+  // (network distance vs straight-line distance, one-way rules included).
+  // A slip road running 10 m beside the motorway loses, because getting
+  // onto it would mean going back to where it split off. Decisions are
+  // made WINDOW samples late, once the samples after them have been seen.
+
+  private win: Layer[] = [];
+  private anchor: number | null = null; // chosen candidate of the last emitted layer (row into win[0].trans)
+
+  private push(p: { latitude: number; longitude: number }, heading: number | null, t: number, real: boolean): Match {
+    const { list, rejected } = this.net.near(p, heading, HEADING_MAX_ANGLE_DEG, this.excluded);
+    if (list.length === 0) {
+      this.flush();
+      return { id: null, pos: 0, nearbyRejected: rejected };
+    }
+    const prev = this.win[this.win.length - 1] ?? this.lastLayer;
+    let trans: number[][] | null = null;
+    if (prev && t - prev.t <= LINK_MAX_MS) {
+      const straight = distanceMeters(prev.p, p);
+      trans = prev.cands.map((a) => list.map((b) => this.transCost(a, b, straight)));
+    } else {
+      this.flush();
+    }
+    if (this.win.length === 0) this.anchor = trans && this.lastChoice !== null ? this.lastChoice : null;
+    this.win.push({ p: { latitude: p.latitude, longitude: p.longitude }, t, cands: list, trans: this.win.length || this.anchor !== null ? trans : null, real });
+    // Decide the samples every possible route agrees on so far; if the
+    // window gets very long without agreeing, decide the oldest anyway.
+    const settled = this.converged();
+    if (settled > 0) this.emit(settled);
+    else if (this.win.length > WINDOW_MAX) this.emit(1);
+    return { id: list[0].id, pos: list[0].pos, nearbyRejected: false };
+  }
+
+  // Emits the oldest n layers along the best path through the window.
+  private emit(n: number) {
+    const path = this.bestPath();
+    for (let i = 0; i < n && this.win.length; i++) {
+      const layer = this.win.shift()!;
+      const c = layer.cands[path[i]];
+      this.anchor = path[i];
+      this.lastLayer = layer;
+      this.lastChoice = path[i];
+      this.addSample(c.id, c.pos, layer.t);
+      if (layer.real) {
+        if (!this.firstMatch) this.firstMatch = { id: c.id, pos: c.pos };
+        this.lastMatch = { id: c.id, pos: c.pos };
+      }
+    }
+  }
+
+  private flush() {
+    if (this.win.length) this.emit(this.win.length);
+    this.anchor = null;
+    this.lastLayer = null;
+    this.lastChoice = null;
+  }
+
+  // How many of the oldest layers are settled: every candidate in the
+  // newest layer traces back through the same choices for them.
+  private converged(): number {
+    const L = this.win.length;
+    if (L < 2) return 0;
+    const { back } = this.viterbi();
+    const paths = this.win[L - 1].cands.map((_, j) => {
+      const path = new Array(L);
+      for (let i = L - 1; i >= 0; i--) {
+        path[i] = j;
+        j = back[i][j];
+      }
+      return path;
+    });
+    let n = 0;
+    while (n < L - 1 && paths.every((pa) => pa[n] === paths[0][n])) n++;
+    return n;
+  }
+
+  private bestPath(): number[] {
+    const L = this.win.length;
+    const { cost, back } = this.viterbi();
+    const path = new Array(L).fill(0);
+    let j = 0;
+    for (let k = 1; k < cost[L - 1].length; k++) if (cost[L - 1][k] < cost[L - 1][j]) j = k;
+    for (let i = L - 1; i >= 0; i--) {
+      path[i] = j;
+      j = back[i][j];
+    }
+    return path;
+  }
+
+  // Viterbi over the window: lowest total cost to reach each candidate.
+  private viterbi(): { cost: number[][]; back: number[][] } {
+    const L = this.win.length;
+    const cost: number[][] = [];
+    const back: number[][] = [];
+    for (let i = 0; i < L; i++) {
+      const layer = this.win[i];
+      cost.push([]);
+      back.push([]);
+      for (let j = 0; j < layer.cands.length; j++) {
+        const e = emissionCost(layer.cands[j].dist);
+        if (i === 0) {
+          const tr = this.anchor !== null && layer.trans ? layer.trans[this.anchor]?.[j] ?? 0 : 0;
+          cost[0].push(e + tr);
+          back[0].push(-1);
+          continue;
+        }
+        let best = Infinity;
+        let arg = 0;
+        const tr = layer.trans;
+        for (let k = 0; k < this.win[i - 1].cands.length; k++) {
+          const c = cost[i - 1][k] + (tr ? tr[k][j] : 0);
+          if (c < best) {
+            best = c;
+            arg = k;
+          }
+        }
+        cost[i].push(e + best);
+        back[i].push(arg);
+      }
+    }
+    return { cost, back };
+  }
+
+  // How implausible it is to get from candidate a to candidate b, given
+  // the straight-line distance between their GPS samples.
+  private transCost(a: Candidate, b: Candidate, straight: number): number {
+    let route: number;
+    if (a.id === b.id) route = this.alongCost(a.id, a.pos, b.pos);
+    else {
+      const r = this.net.reach(a.id, a.pos, straight * 2 + REACH_SLACK_M).get(b.id);
+      route = r ? r.cost + this.alongCost(b.id, r.at, b.pos) : Infinity;
+    }
+    if (!Number.isFinite(route)) return JUMP_COST;
+    return Math.min(JUMP_COST, Math.abs(route - straight) / ROUTE_BETA_M);
+  }
+
+  // Metres driven along a chunk from one position to another; Infinity if
+  // that would mean going the wrong way up a one-way road (beyond GPS jitter).
+  private alongCost(id: string, from: number, to: number): number {
+    const o = this.net.segs.get(id)?.o;
+    let d = to - from;
+    if (this.net.isLoop(id)) {
+      const len = this.net.length(id);
+      if (o === 1 && d < -10) d += len;
+      else if (!o && Math.abs(d) > len / 2) d = len - Math.abs(d);
+    }
+    if (o === 1 && d < -10) return Infinity;
+    if (o === -1 && d > 10) return Infinity;
+    return Math.abs(d);
+  }
+
+  // A position on a closed loop brought back into 0..length.
+  private wrap(id: string, pos: number): number {
+    if (!this.net.isLoop(id)) return pos;
+    const len = this.net.length(id);
+    return len > 0 ? ((pos % len) + len) % len : pos;
+  }
+
+  // On a closed loop, the copy of pos (pos, pos ± length) nearest to ref.
+  private unwrap(id: string, pos: number, ref: number): number {
+    if (!this.net.isLoop(id)) return pos;
+    const len = this.net.length(id);
+    if (len <= 0) return pos;
+    const k = Math.round((ref - pos) / len);
+    return pos + k * len;
+  }
+
   private addSample(id: string, pos: number, t: number) {
     this.lastChunkId = id;
     const last = this.pending[this.pending.length - 1];
     if (last && last.id === id) {
-      if (pos < last.lo) last.lo = pos;
-      if (pos > last.hi) last.hi = pos;
+      const u = this.unwrap(id, pos, last.at);
+      if (u < last.lo) last.lo = u;
+      if (u > last.hi) last.hi = u;
+      last.at = u;
       last.tEnd = t;
     } else {
-      this.pending.push({ id, lo: pos, hi: pos, tStart: t, tEnd: t });
+      this.pending.push({ id, lo: pos, hi: pos, at: pos, first: pos, tStart: t, tEnd: t });
     }
   }
 
@@ -332,8 +526,10 @@ export class DriveMatcher {
         if (n.tStart - p.tEnd > LINK_MAX_MS) continue;
         if (!this.touches(p.id, n.id)) continue;
         if (p.id === n.id) {
-          p.lo = Math.min(p.lo, n.lo);
-          p.hi = Math.max(p.hi, n.hi);
+          const shift = this.unwrap(p.id, n.at, p.at) - n.at;
+          p.lo = Math.min(p.lo, n.lo + shift);
+          p.hi = Math.max(p.hi, n.hi + shift);
+          p.at = n.at + shift;
           p.tEnd = n.tEnd;
           this.pending.splice(i, 2);
         } else {
@@ -369,9 +565,33 @@ export class DriveMatcher {
   // collect chunks in between that were driven in full.
   private link(r: Run, next: Run, full: string[], partial: [string, number, number][]) {
     const net = this.net;
+    // Best: the actual route between where you left one road and joined
+    // the next (so a roundabout is credited the way you went round it).
+    if (r.id !== next.id) {
+      const legs = net.route(r.id, this.wrap(r.id, r.at), next.id, next.first, LINK_ROUTE_MAX_M);
+      const last = legs?.[legs.length - 1];
+      if (legs && last && Number.isFinite(this.alongCost(next.id, last.from, next.first))) {
+        this.extend(r, legs[0].to);
+        this.extend(next, last.from);
+        for (const leg of legs.slice(1, -1)) {
+          if (this.net.isLoop(leg.id) && leg.to < leg.from) partial.push([leg.id, leg.from, leg.to + net.length(leg.id)]);
+          else partial.push([leg.id, Math.min(leg.from, leg.to), Math.max(leg.from, leg.to)]);
+        }
+        return;
+      }
+    }
     const a = parseChunkId(r.id);
     const b = parseChunkId(next.id);
-    if (a && b && a.way === b.way && Math.abs(a.idx - b.idx) <= GAP_FILL_MAX_CHUNKS) {
+    // Pieces that meet directly join at that point — this also stops a
+    // roundabout split into several pieces from being "filled in" the long
+    // way round, from its last piece back to its first.
+    const direct = r.id !== next.id ? this.junctionBetween(r, next) : null;
+    if (direct) {
+      this.extend(r, net.posOfVertex(r.id, direct));
+      this.extend(next, net.posOfVertex(next.id, direct));
+      return;
+    }
+    if (a && b && a.way === b.way && a.idx !== b.idx && Math.abs(a.idx - b.idx) <= GAP_FILL_MAX_CHUNKS) {
       const forward = b.idx > a.idx;
       const lo = Math.min(a.idx, b.idx);
       const hi = Math.max(a.idx, b.idx);
@@ -381,12 +601,6 @@ export class DriveMatcher {
       }
       this.extend(r, forward ? net.length(r.id) : 0);
       this.extend(next, forward ? 0 : net.length(next.id));
-      return;
-    }
-    const v = net.sharedVertex(r.id, next.id);
-    if (v) {
-      this.extend(r, net.posOfVertex(r.id, v));
-      this.extend(next, net.posOfVertex(next.id, v));
       return;
     }
     const path = this.connect(r.id, next.id);
@@ -410,8 +624,39 @@ export class DriveMatcher {
     }
   }
 
+  // Where you crossed from one run's road to the next: of the points the
+  // two roads share, the one closest to where you left the first and
+  // joined the second.
+  private junctionBetween(r: Run, next: Run): [number, number] | null {
+    const shared = this.net.sharedVertices(r.id, next.id);
+    if (shared.length <= 1) return shared[0] ?? null;
+    const gap = (run: Run, pos: number | null) => {
+      if (pos === null) return Infinity;
+      const len = this.net.length(run.id);
+      const copies = this.net.isLoop(run.id) ? [pos - len, pos, pos + len] : [pos];
+      return Math.min(...copies.map((x) => (x < run.lo ? run.lo - x : x > run.hi ? x - run.hi : 0)));
+    };
+    let best = shared[0];
+    let bestCost = Infinity;
+    for (const v of shared) {
+      const cost = gap(r, this.net.posOfVertex(r.id, v)) + gap(next, this.net.posOfVertex(next.id, v));
+      if (cost < bestCost) {
+        bestCost = cost;
+        best = v;
+      }
+    }
+    return best;
+  }
+
   private extend(r: Run, pos: number | null) {
     if (pos === null) return;
+    if (this.net.isLoop(r.id)) {
+      // The copy of that point nearest the stretch already driven.
+      const len = this.net.length(r.id);
+      const c = [pos - len, pos, pos + len];
+      const gap = (x: number) => (x < r.lo ? r.lo - x : x > r.hi ? x - r.hi : 0);
+      pos = c.reduce((a, b) => (gap(b) < gap(a) ? b : a));
+    }
     if (pos < r.lo) r.lo = pos;
     if (pos > r.hi) r.hi = pos;
   }
@@ -444,6 +689,21 @@ export class DriveMatcher {
   // Records a covered stretch of a chunk, and reports any of its sections
   // that are now covered end to end.
   private cover(id: string, lo: number, hi: number) {
+    if (this.net.isLoop(id)) {
+      const len = this.net.length(id);
+      if (hi - lo >= len) {
+        lo = 0;
+        hi = len;
+      } else if (lo < 0 || hi > len) {
+        const k = Math.floor(lo / len);
+        lo -= k * len;
+        hi -= k * len;
+        if (hi > len) {
+          this.cover(id, 0, hi - len);
+          hi = len;
+        }
+      }
+    }
     const secs = this.net.sections(id);
     if (secs.length === 0) return;
     this.own.set(id, [...(this.own.get(id) || []), [lo, hi]]);
