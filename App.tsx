@@ -1,13 +1,17 @@
 import { Component, ReactNode, useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { StyleSheet, Text, View, Pressable, ScrollView, ActivityIndicator } from 'react-native';
+import { StyleSheet, Text, View, Pressable, ScrollView, ActivityIndicator, AppState, Linking, Animated, Easing, Image, Switch } from 'react-native';
 import MapView, { Polyline, UrlTile, PROVIDER_DEFAULT, MapPressEvent, MapType, Region } from 'react-native-maps';
 import * as Location from 'expo-location';
 import * as Battery from 'expo-battery';
-import * as TaskManager from 'expo-task-manager';
+import * as Notifications from 'expo-notifications';
+import * as SplashScreen from 'expo-splash-screen';
+import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { File, Paths } from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import * as DocumentPicker from 'expo-document-picker';
 import * as store from './src/storage';
+import * as bg from './src/background';
+import * as Motion from './modules/motion-activity';
 import { RoadNetwork, RoadSegment, parseChunkId, baseChunkId } from './src/roadMatcher';
 import { DriveMatcher, Point, PieceIndex, isPatchy } from './src/coverage';
 import { recheckDrives } from './src/recheck';
@@ -17,7 +21,6 @@ import { Coord, lineLengthMeters, distanceMeters, tileIdForPoint, neighbourTileI
 // Every road tile is fetched live from the public repo over GitHub's raw
 // file CDN. Tile ids must match scripts/tile-county.js (see src/geo.ts).
 const TILES_BASE_URL = 'https://raw.githubusercontent.com/0204Killian/tarmacked/main/tiles/';
-const LOCATION_TASK_NAME = 'tarmacked-background-location';
 
 // Edit mode only draws roads once zoomed in this far (a few km across).
 const EDIT_MAX_LAT_DELTA = 0.06;
@@ -53,12 +56,6 @@ const ACCURACY_MODES: { key: AccuracyMode; label: string; info: string }[] = [
   { key: 'saver', label: 'Saver', info: 'A point every ~35 m, big batches. Least battery; short roads may be missed.' },
   { key: 'auto', label: 'Auto', info: 'High while charging, Balanced on battery.' },
 ];
-function locationOptions(mode: 'high' | 'balanced' | 'saver') {
-  if (mode === 'high') return { accuracy: Location.Accuracy.BestForNavigation, timeInterval: 2000, distanceInterval: 10 };
-  if (mode === 'balanced')
-    return { accuracy: Location.Accuracy.High, timeInterval: 3000, distanceInterval: 20, deferredUpdatesInterval: 15000, deferredUpdatesDistance: 200 };
-  return { accuracy: Location.Accuracy.High, timeInterval: 5000, distanceInterval: 35, deferredUpdatesInterval: 60000, deferredUpdatesDistance: 800 };
-}
 const isCharging = (s: Battery.BatteryState) => s === Battery.BatteryState.CHARGING || s === Battery.BatteryState.FULL;
 type StatsTab = 'overview' | 'counties' | 'roads' | 'data';
 const STATS_TABS: { key: StatsTab; label: string }[] = [
@@ -166,26 +163,12 @@ function stitchLines(input: Coord[][]): Coord[][] {
   return lines;
 }
 
-// --- Background location: points land here and are picked up every 2s ---
-let recordedPoints: Point[] = [];
-
-TaskManager.defineTask(LOCATION_TASK_NAME, ({ data, error }) => {
-  if (error) {
-    console.error(error);
-    return;
-  }
-  if (data) {
-    const { locations } = data as { locations: Location.LocationObject[] };
-    for (const loc of locations) {
-      recordedPoints.push({
-        latitude: loc.coords.latitude,
-        longitude: loc.coords.longitude,
-        timestamp: loc.timestamp,
-        accuracy: loc.coords.accuracy ?? null,
-      });
-    }
-  }
-});
+// Keep the native splash up until the loading screen (which looks the
+// same) is ready to take over, so there's no flash between them.
+SplashScreen.preventAutoHideAsync().catch(() => undefined);
+// Never leave the splash up if something goes wrong before the loading screen shows.
+setTimeout(() => SplashScreen.hideAsync().catch(() => undefined), 8000);
+const LOADING_MIN_MS = 600;
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
@@ -199,6 +182,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 class CrashScreen extends Component<{ children: ReactNode }, { error: Error | null }> {
   state = { error: null as Error | null };
   static getDerivedStateFromError(error: Error) {
+    SplashScreen.hideAsync().catch(() => undefined);
     return { error };
   }
   render() {
@@ -274,13 +258,10 @@ function App() {
   const driveDistanceRef = useRef(0);
   const driveNewMRef = useRef(0);
   const lastLivePointRef = useRef<Point | null>(null);
-  const processedIndexRef = useRef(0);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const foregroundSub = useRef<Location.LocationSubscription | null>(null);
   const [liveIds, setLiveIds] = useState<string[]>([]);
   const [liveTrail, setLiveTrail] = useState<Point[]>([]);
   const [accuracyMode, setAccuracyMode] = useState<AccuracyMode>('high');
-  const activeModeRef = useRef<'high' | 'balanced' | 'saver'>('high');
+  const activeModeRef = useRef<bg.Mode>('high');
   const batterySub = useRef<{ remove(): void } | null>(null);
 
   // Heatmap: how many drives covered each chunk.
@@ -289,6 +270,12 @@ function App() {
   // A most-driven stretch picked from Stats → Roads, highlighted on the map.
   const [highlight, setHighlight] = useState<{ name: string; count: number; chunks: string[] } | null>(null);
   const [statsTab, setStatsTab] = useState<StatsTab>('overview');
+
+  // Automatic drive detection.
+  const [autoDetect, setAutoDetect] = useState(false);
+  const [offerAuto, setOfferAuto] = useState(false); // the "Never miss a drive" screen
+  const [autoMissing, setAutoMissing] = useState<string[]>([]); // permissions still needed
+  const [autoBusy, setAutoBusy] = useState(false);
 
   // Drives list / drive shown on the map.
   const [drives, setDrives] = useState<store.DriveSummary[] | null>(null);
@@ -311,6 +298,7 @@ function App() {
 
   // Map drawing.
   const [dataLoaded, setDataLoaded] = useState(false);
+  const [loadingGone, setLoadingGone] = useState(false);
   const [bootStep, setBootStep] = useState('Starting…');
 
   const setNote = useCallback((text: string) => {
@@ -318,9 +306,11 @@ function App() {
     if (noteTimer.current) clearTimeout(noteTimer.current);
     if (text) noteTimer.current = setTimeout(() => setNoteText(''), NOTE_MS);
   }, []);
+  // Also saved, so what happened in the background can be checked later.
   const addLog = useCallback((line: string) => {
     const d = new Date();
     setLog((prev) => [...prev.slice(-(LOG_LINES - 1)), `${pad2(d.getHours())}:${pad2(d.getMinutes())} ${line}`]);
+    store.appendLog(line).catch(() => undefined);
   }, []);
 
   // ---------- Driven-road bookkeeping ----------
@@ -598,12 +588,6 @@ function App() {
         addLog(`location permission failed: ${(e as Error).message}`);
       }
       try {
-        const bg = await withTimeout(Location.requestBackgroundPermissionsAsync(), 8000, 'background permission');
-        addLog(`background permission: ${bg.status}`);
-      } catch (e) {
-        addLog(`background permission failed: ${(e as Error).message}`);
-      }
-      try {
         const current = await withTimeout(Location.getCurrentPositionAsync({}), 8000, 'get current position');
         const here = { latitude: current.coords.latitude, longitude: current.coords.longitude, latitudeDelta: 0.05, longitudeDelta: 0.05 };
         setRegion(here);
@@ -640,8 +624,12 @@ function App() {
       }
       // Left-out drives earn nothing; their trails are only used to find
       // the roads to re-check (like a deleted drive's).
-      const counted = allDrives.filter((d) => !d.leftOut);
-      const leftOutTrails = allDrives.filter((d) => d.leftOut).map((d) => d.points);
+      // Auto-detected drives you haven't saved (pending, or still
+      // recording) don't count yet; a drive you started yourself counts
+      // while it records.
+      const counts = (d: store.DriveRecord) => d.status === 'done' || (d.status === 'recording' && !d.auto);
+      const counted = allDrives.filter((d) => counts(d) && !d.leftOut);
+      const leftOutTrails = allDrives.filter((d) => counts(d) && d.leftOut).map((d) => d.points);
       const tiles = new Set<string>();
       const visited = new Set<string>();
       for (const points of [...allDrives.map((d) => d.points), ...forgotten]) {
@@ -729,6 +717,13 @@ function App() {
   useEffect(() => {
     if (!dataLoaded || onboarded !== true) return;
     (async () => {
+      // A drive that ended while the app was closed is closed off first.
+      await bg.setupNotifications();
+      try {
+        await bg.settle();
+      } catch (e) {
+        addLog(`settle failed: ${(e as Error).message}`);
+      }
       const upgraded = await store.getMeta('v013_upgrade');
       const upgraded14 = await store.getMeta('v014_upgrade');
       const pending = await store.getMeta('recheck_pending');
@@ -754,7 +749,63 @@ function App() {
       } else if (pending === '1') {
         await runRecheck('manual');
       }
+      // Still recording (the app was closed mid-drive): pick it back up.
+      const rec = await store.getRecordingDrive();
+      if (rec && (await bg.currentWatch())) {
+        beginLive(rec.id, rec.startedAt, rec.auto);
+        addLog(`drive ${rec.id} resumed`);
+      }
+      // Opened by tapping a notification button while the app was closed.
+      try {
+        const last = await Notifications.getLastNotificationResponseAsync();
+        if (last) {
+          const key = `${last.notification.request.identifier}|${last.notification.date}|${last.actionIdentifier}`;
+          if ((await store.getMeta('last_response')) !== key) {
+            await store.setMeta('last_response', key);
+            await responseRef.current(last.actionIdentifier, last.notification.request.content.data);
+          }
+        }
+      } catch {
+        // none
+      }
+      if (!(await store.getMeta('autodetect_offered'))) setOfferAuto(true);
+      setAutoDetect(await bg.autoDetectEnabled());
     })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dataLoaded, onboarded]);
+
+  // Notification buttons tapped while the app is running.
+  useEffect(() => {
+    const sub = Notifications.addNotificationResponseReceivedListener((r) => {
+      const key = `${r.notification.request.identifier}|${r.notification.date}|${r.actionIdentifier}`;
+      store.setMeta('last_response', key).catch(() => undefined);
+      responseRef.current(r.actionIdentifier, r.notification.request.content.data);
+    });
+    return () => sub.remove();
+  }, []);
+
+  // Coming back to the app: close off a drive that ended while away, catch
+  // up on points, and re-check anything that needs it.
+  useEffect(() => {
+    if (!dataLoaded || onboarded !== true) return;
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state !== 'active') return;
+      (async () => {
+        try {
+          await bg.settle();
+          pollRef.current();
+          if (currentDriveIdRef.current === null) {
+            const rec = await store.getRecordingDrive();
+            if (rec && (await bg.currentWatch())) beginLive(rec.id, rec.startedAt, rec.auto);
+          }
+          if ((await store.getMeta('recheck_pending')) === '1' && !recheckRunning.current) await runRecheck('manual');
+          setDrives(await store.listDrives());
+        } catch (e) {
+          addLog(`resume failed: ${(e as Error).message}`);
+        }
+      })();
+    });
+    return () => sub.remove();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dataLoaded, onboarded]);
 
@@ -794,10 +845,6 @@ function App() {
       if (prev && p.timestamp - prev.timestamp <= 60_000) driveDistanceRef.current += distanceMeters(prev, p);
       lastLivePointRef.current = p;
     }
-    const driveId = currentDriveIdRef.current;
-    if (driveId !== null) {
-      store.addPoints(driveId, newPoints).catch((e) => setNote(`Couldn't save GPS points: ${(e as Error).message}`));
-    }
     setRawStats((prev) => ({ ...prev, points: prev.points + newPoints.length }));
     setLiveTrail((prev) => [...prev, ...newPoints]);
     store.touchTiles(Array.from(new Set(newPoints.map((p) => tileIdForPoint(p.latitude, p.longitude))))).catch(() => undefined);
@@ -817,156 +864,265 @@ function App() {
   const processRef = useRef(processPoints);
   processRef.current = processPoints;
 
+  // The live drive reads its new points from the database, where the
+  // background task saves every point (so nothing is lost if iOS closes
+  // the app mid-drive).
+  const lastPolledRef = useRef(0);
+  const pointCountRef = useRef(0);
+  const pollBusyRef = useRef(false);
+  const pollOnce = async () => {
+    const driveId = currentDriveIdRef.current;
+    if (driveId === null || pollBusyRef.current) return;
+    pollBusyRef.current = true;
+    try {
+      const pts = await store.loadPointsSince(driveId, lastPolledRef.current);
+      if (pts.length > 0) {
+        lastPolledRef.current = pts[pts.length - 1].timestamp;
+        pointCountRef.current += pts.length;
+        processRef.current(pts);
+      }
+    } catch (e) {
+      addLog(`couldn't read GPS points: ${(e as Error).message}`);
+    } finally {
+      pollBusyRef.current = false;
+    }
+  };
+  const pollRef = useRef(pollOnce);
+  pollRef.current = pollOnce;
+
   useEffect(() => {
     if (!tracking) return;
-    pollRef.current = setInterval(() => {
-      const newPoints = recordedPoints.slice(processedIndexRef.current);
-      processedIndexRef.current = recordedPoints.length;
-      processRef.current(newPoints);
-    }, 2000);
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
-    };
+    const h = setInterval(() => pollRef.current(), 2000);
+    return () => clearInterval(h);
   }, [tracking]);
 
-  const start = async () => {
-    recordedPoints = [];
-    processedIndexRef.current = 0;
-    matcherRef.current = new DriveMatcher(netRef.current, excludedRef.current, partialsRef.current);
-    driveStartRef.current = Date.now();
+  // An auto-detected drive recording: shown on the map, but its roads only
+  // count once you save it.
+  const [liveAuto, setLiveAuto] = useState(false);
+  const liveAutoRef = useRef(false);
+
+  // Shows a drive as the live one (just started, or resumed after the app
+  // was closed): its points so far are read in on the first poll.
+  const beginLive = (driveId: number, startedAt: number, auto: boolean) => {
+    currentDriveIdRef.current = driveId;
+    matcherRef.current = auto ? null : new DriveMatcher(netRef.current, excludedRef.current, partialsRef.current);
+    liveAutoRef.current = auto;
+    setLiveAuto(auto);
+    driveStartRef.current = startedAt;
     driveDistanceRef.current = 0;
     driveNewMRef.current = 0;
     lastLivePointRef.current = null;
+    lastPolledRef.current = startedAt - 1;
+    pointCountRef.current = 0;
     setLiveIds([]);
     setLiveTrail([]);
-    setSelectedDrive(null);
-    setHighlight(null);
-    setPanel(null);
-    setFollowing(true);
-    try {
-      currentDriveIdRef.current = await store.startDrive(driveStartRef.current);
-      setRawStats((prev) => ({ ...prev, drives: prev.drives + 1 }));
-    } catch (e) {
-      currentDriveIdRef.current = null;
-      setNote(`Couldn't start saving this drive (${(e as Error).message}) — roads will still be matched.`);
-    }
-    let mode: 'high' | 'balanced' | 'saver' = accuracyMode === 'auto' ? 'balanced' : accuracyMode;
-    if (accuracyMode === 'auto') {
-      try {
-        mode = isCharging(await Battery.getBatteryStateAsync()) ? 'high' : 'balanced';
-        batterySub.current = Battery.addBatteryStateListener(({ batteryState }) => {
-          const next = isCharging(batteryState) ? 'high' : 'balanced';
-          if (next !== activeModeRef.current) startUpdates(next).catch(() => undefined);
-        });
-      } catch (e) {
-        addLog(`battery state unavailable: ${(e as Error).message}`);
-      }
-    }
-    try {
-      await withTimeout(startUpdates(mode), 8000, 'start background tracking');
-    } catch (e) {
-      addLog(`background tracking unavailable: ${(e as Error).message}`);
-      try {
-        foregroundSub.current = await Location.watchPositionAsync(locationOptions(mode), (loc) => {
-          recordedPoints.push({
-            latitude: loc.coords.latitude,
-            longitude: loc.coords.longitude,
-            timestamp: loc.timestamp,
-            accuracy: loc.coords.accuracy ?? null,
-          });
-        });
-        setNote('Tracking only while the app is open (background location unavailable).');
-      } catch {
-        setNote('No GPS available.');
-      }
-    }
     setTracking(true);
+    pollRef.current();
   };
 
-  // (Re)starts background location in a mode; calling it again while
-  // tracking just changes the settings (Auto switching on charge).
-  const startUpdates = async (mode: 'high' | 'balanced' | 'saver') => {
-    activeModeRef.current = mode;
-    await Location.startLocationUpdatesAsync(LOCATION_TASK_NAME, {
-      ...locationOptions(mode),
-      activityType: Location.ActivityType.AutomotiveNavigation,
-      pausesUpdatesAutomatically: false,
-      showsBackgroundLocationIndicator: true,
-      foregroundService: { notificationTitle: 'tarmacked is tracking', notificationBody: 'Recording this drive' },
-    });
-    addLog(`GPS mode: ${mode}`);
-  };
-
-  const chooseAccuracy = (mode: AccuracyMode) => {
-    setAccuracyMode(mode);
-    store.setMeta('accuracy_mode', mode).catch(() => undefined);
-  };
-
-  const stop = async () => {
+  const endLiveUi = () => {
     if (batterySub.current) {
       batterySub.current.remove();
       batterySub.current = null;
     }
-    try {
-      await Location.stopLocationUpdatesAsync(LOCATION_TASK_NAME);
-    } catch {
-      // wasn't running as a background task
-    }
-    if (foregroundSub.current) {
-      foregroundSub.current.remove();
-      foregroundSub.current = null;
-    }
-    const newPoints = recordedPoints.slice(processedIndexRef.current);
-    processedIndexRef.current = recordedPoints.length;
-    processPoints(newPoints);
-    const matcher = matcherRef.current;
-    let ignored = 0;
-    let driveRoads: string[] = [];
-    if (matcher) {
-      const done = matcher.finish();
-      // Start/stop credit comes after the completed sections, so a section
-      // finished this drive replaces any stretch of it.
-      const { newM } = markDriven([...done, ...matcher.stubs]);
-      driveNewMRef.current += newM;
-      savePartialsFrom(matcher);
-      ignored = matcher.gps.ignored;
-      driveRoads = matcher.roadsCovered();
-    }
     matcherRef.current = null;
-    const driveId = currentDriveIdRef.current;
-    if (driveId !== null) {
-      if (recordedPoints.length < 2) {
-        store.deleteDrive(driveId).catch(() => undefined); // nothing recorded
-        setRawStats((prev) => ({ ...prev, drives: Math.max(0, prev.drives - 1) }));
-      } else {
-        store
-          .setDriveStats([
-            { id: driveId, endedAt: Date.now(), distanceM: driveDistanceRef.current, newM: driveNewMRef.current, ignoredN: ignored },
-          ])
-          .catch(() => undefined);
-        store
-          .setDriveRoads(driveId, driveRoads)
-          .then(() => store.loadRoadCounts())
-          .then(setRoadCounts)
-          .catch(() => undefined);
-        const patchy = isPatchy(ignored, recordedPoints.length);
-        setNote(
-          `Drive saved: ${km(driveDistanceRef.current)} km, ${km(driveNewMRef.current)} km of new road.` +
-            (patchy ? ' ⚠ Patchy GPS on this drive — check it in Drives.' : '')
-        );
-      }
-    }
     currentDriveIdRef.current = null;
+    liveAutoRef.current = false;
+    setLiveAuto(false);
     setTracking(false);
     setLiveIds([]);
     setLiveTrail([]);
-    if (drives !== null) store.listDrives().then(setDrives).catch(() => undefined);
+    store.listDrives().then(setDrives).catch(() => undefined);
   };
+
+  // Finishes matching a drive matched live (Stop pressed, or it ended by
+  // itself while the app was open), and saves its figures.
+  const finishLiveMatching = () => {
+    const matcher = matcherRef.current;
+    const driveId = currentDriveIdRef.current;
+    if (!matcher || driveId === null) return;
+    const done = matcher.finish();
+    // Start/stop credit comes after the completed sections, so a section
+    // finished this drive replaces any stretch of it.
+    const { newM } = markDriven([...done, ...matcher.stubs]);
+    driveNewMRef.current += newM;
+    savePartialsFrom(matcher);
+    const ignored = matcher.gps.ignored;
+    const driveRoads = matcher.roadsCovered();
+    matcherRef.current = null;
+    if (pointCountRef.current < 2) {
+      store.deleteDrive(driveId).catch(() => undefined); // nothing recorded
+      setRawStats((prev) => ({ ...prev, drives: Math.max(0, prev.drives - 1) }));
+      return;
+    }
+    store
+      .setDriveStats([{ id: driveId, endedAt: Date.now(), distanceM: driveDistanceRef.current, newM: driveNewMRef.current, ignoredN: ignored }])
+      .catch(() => undefined);
+    store
+      .setDriveRoads(driveId, driveRoads)
+      .then(() => store.loadRoadCounts())
+      .then(setRoadCounts)
+      .catch(() => undefined);
+    const patchy = isPatchy(ignored, pointCountRef.current);
+    setNote(
+      `Drive saved: ${km(driveDistanceRef.current)} km, ${km(driveNewMRef.current)} km of new road.` +
+        (patchy ? ' ⚠ Patchy GPS on this drive — check it in Drives.' : '')
+    );
+  };
+
+  // GPS mode for a new drive; in Auto, follows charging while it records.
+  const chooseMode = async (): Promise<bg.Mode> => {
+    if (accuracyMode !== 'auto') return accuracyMode;
+    try {
+      const mode: bg.Mode = isCharging(await Battery.getBatteryStateAsync()) ? 'high' : 'balanced';
+      batterySub.current = Battery.addBatteryStateListener(({ batteryState }) => {
+        const next: bg.Mode = isCharging(batteryState) ? 'high' : 'balanced';
+        if (next !== activeModeRef.current) {
+          activeModeRef.current = next;
+          bg.startUpdates(next).catch(() => undefined);
+        }
+      });
+      return mode;
+    } catch (e) {
+      addLog(`battery state unavailable: ${(e as Error).message}`);
+      return 'balanced';
+    }
+  };
+
+  // Start and Stop ignore taps while the last one is still being handled.
+  const busyRef = useRef(false);
+
+  const start = async () => {
+    if (busyRef.current || tracking) return;
+    busyRef.current = true;
+    try {
+      setSelectedDrive(null);
+      setHighlight(null);
+      setPanel(null);
+      setFollowing(true);
+      const mode = await chooseMode();
+      activeModeRef.current = mode;
+      try {
+        const bgPerm = await Location.getBackgroundPermissionsAsync();
+        if (bgPerm.status !== 'granted' && bgPerm.canAskAgain) await withTimeout(Location.requestBackgroundPermissionsAsync(), 8000, 'background permission');
+      } catch {
+        // records while the app is open at least
+      }
+      try {
+        // For "Still driving?" if you forget to press Stop.
+        const n = await Notifications.getPermissionsAsync();
+        if (n.status === 'undetermined' && n.canAskAgain) await withTimeout(Notifications.requestPermissionsAsync(), 8000, 'notification permission');
+      } catch {
+        // prompts just won't show
+      }
+      let w;
+      try {
+        w = await withTimeout(bg.startManualDrive(mode), 10000, 'start tracking');
+      } catch (e) {
+        addLog(`couldn't start tracking: ${(e as Error).message}`);
+        setNote(`Couldn't start GPS: ${(e as Error).message}`);
+        await bg.discardDrive().catch(() => undefined);
+        return;
+      }
+      setRawStats((prev) => ({ ...prev, drives: prev.drives + 1 }));
+      beginLive(w.driveId, Date.now() - 1000, w.auto);
+    } finally {
+      busyRef.current = false;
+    }
+  };
+
+  const stop = async () => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    try {
+      await pollRef.current(); // the last points
+      if (liveAutoRef.current) {
+        // Stop on an auto-detected drive = yes, this was a drive.
+        await bg.confirmDrive();
+        await bg.endDrive('Stop pressed', { trim: true, matched: false });
+        endLiveUi();
+        setNote('Drive saved — adding its roads to your map…');
+        await runRecheck('manual');
+        return;
+      }
+      finishLiveMatching();
+      await bg.endDrive('Stop pressed', { trim: false, matched: true });
+      endLiveUi();
+    } finally {
+      busyRef.current = false;
+    }
+  };
+
+  // Like a sat-nav: while a drive is recording and the map is following
+  // you, the screen stays on (the power button still locks it). Panning
+  // away from your position lets it sleep normally again.
+  useEffect(() => {
+    const keepOn = tracking && following && !editMode;
+    if (keepOn) activateKeepAwakeAsync('following').catch(() => undefined);
+    else Promise.resolve(deactivateKeepAwake('following')).catch(() => undefined);
+    return () => {
+      Promise.resolve(deactivateKeepAwake('following')).catch(() => undefined);
+    };
+  }, [tracking, following, editMode]);
+
+  // Things the background code did while the app was open.
+  const bgEventRef = useRef((e: bg.BgEvent) => {});
+  bgEventRef.current = (e: bg.BgEvent) => {
+    if (e.type === 'started' && currentDriveIdRef.current === null) {
+      store
+        .getRecordingDrive()
+        .then((rec) => rec && rec.id === e.driveId && beginLive(rec.id, rec.startedAt, rec.auto))
+        .catch(() => undefined);
+    } else if (e.type === 'ended' && currentDriveIdRef.current === e.driveId && !busyRef.current) {
+      // Ended by itself (parked 15+ minutes, or GPS came back after a long stop).
+      if (!liveAutoRef.current) finishLiveMatching();
+      endLiveUi();
+    } else if (e.type === 'points' && currentDriveIdRef.current === e.driveId) {
+      pollRef.current();
+    }
+  };
+  useEffect(() => bg.onChange((e) => bgEventRef.current(e)), []);
+
+  // Answers to the drive notifications (Save / Delete / End drive).
+  const handleResponse = async (action: string, data: Record<string, unknown> | undefined) => {
+    const driveId = Number(data?.driveId);
+    if (!Number.isFinite(driveId)) return;
+    const w = await bg.currentWatch();
+    const live = !!w && w.driveId === driveId;
+    try {
+      if (action === 'save') {
+        if (live) {
+          await bg.confirmDrive();
+          setNote('Saved. Still recording this drive — it ends when you park.');
+        } else {
+          await store.setDriveStatus(driveId, 'done');
+          setNote('Drive saved — adding its roads to your map…');
+          await runRecheck('manual');
+        }
+      } else if (action === 'delete') {
+        if (live) {
+          await bg.discardDrive();
+          if (currentDriveIdRef.current === driveId) endLiveUi();
+        } else await store.deleteDrive(driveId);
+        setNote('Drive deleted.');
+      } else if (action === 'end') {
+        if (live && currentDriveIdRef.current === driveId) await stop();
+        else if (live) await bg.endDrive('End drive tapped', { trim: true, matched: false });
+      } else if (action === Notifications.DEFAULT_ACTION_IDENTIFIER) {
+        setPanel('drives');
+      }
+    } catch (e) {
+      setNote(`Couldn't do that: ${(e as Error).message}`);
+    }
+    store.listDrives().then(setDrives).catch(() => undefined);
+  };
+  const responseRef = useRef(handleResponse);
+  responseRef.current = handleResponse;
 
   const onMapPress = (e: MapPressEvent) => {
     if (!tracking || editMode || !simulateTaps) return;
     const { latitude, longitude } = e.nativeEvent.coordinate;
-    recordedPoints.push({ latitude, longitude, timestamp: Date.now() });
+    bg.onPoints([{ latitude, longitude, timestamp: Date.now() }]).catch(() => undefined);
   };
 
   // ---------- Editing ----------
@@ -1075,6 +1231,120 @@ function App() {
   };
 
   // Leave a patchy drive out (it earns no roads) or put it back in.
+  const chooseAccuracy = (mode: AccuracyMode) => {
+    setAccuracyMode(mode);
+    store.setMeta('accuracy_mode', mode).catch(() => undefined);
+  };
+
+  // ---------- Automatic drive detection ----------
+
+  // Which permissions auto-detect still needs.
+  const autoPermissionsMissing = async (): Promise<string[]> => {
+    const missing: string[] = [];
+    if (!Motion.isAvailable()) missing.push('Motion & Fitness (not available on this phone)');
+    else if (Motion.authorizationStatus() !== 'authorized') missing.push('Motion & Fitness');
+    try {
+      if ((await Location.getBackgroundPermissionsAsync()).status !== 'granted') missing.push('Location: Always');
+    } catch {
+      missing.push('Location: Always');
+    }
+    try {
+      if ((await Notifications.getPermissionsAsync()).status !== 'granted') missing.push('Notifications');
+    } catch {
+      missing.push('Notifications');
+    }
+    return missing;
+  };
+
+  // Asks for each permission in turn (iOS shows its own prompt for each),
+  // then turns auto-detect on if they're all given.
+  const enableAutoDetect = async () => {
+    if (autoBusy) return;
+    setAutoBusy(true);
+    try {
+      if (Motion.isAvailable() && Motion.authorizationStatus() === 'notDetermined') await Motion.requestPermission();
+      try {
+        const fg = await Location.getForegroundPermissionsAsync();
+        if (fg.status !== 'granted') await Location.requestForegroundPermissionsAsync();
+        const bgPerm = await Location.getBackgroundPermissionsAsync();
+        if (bgPerm.status !== 'granted' && bgPerm.canAskAgain) await Location.requestBackgroundPermissionsAsync();
+      } catch (e) {
+        addLog(`location permission: ${(e as Error).message}`);
+      }
+      try {
+        const n = await Notifications.getPermissionsAsync();
+        if (n.status !== 'granted' && n.canAskAgain) await Notifications.requestPermissionsAsync();
+      } catch (e) {
+        addLog(`notification permission: ${(e as Error).message}`);
+      }
+      const missing = await autoPermissionsMissing();
+      setAutoMissing(missing);
+      if (missing.length === 0) {
+        await store.setMeta('autodetect', '1');
+        setAutoDetect(true);
+        if (!(await bg.currentWatch())) await bg.fenceHere();
+        addLog('auto-detect on');
+        setNote("Auto-detect is on. Drives you forget to start are recorded, and you're asked before they're saved.");
+      } else {
+        setNote(`Auto-detect needs: ${missing.join(', ')}. Turn them on in Settings.`);
+      }
+    } finally {
+      await store.setMeta('autodetect_offered', '1').catch(() => undefined);
+      setOfferAuto(false);
+      setAutoBusy(false);
+    }
+  };
+
+  const disableAutoDetect = async () => {
+    await store.setMeta('autodetect', '0');
+    setAutoDetect(false);
+    if (!(await bg.currentWatch())) await bg.clearFence();
+    addLog('auto-detect off');
+  };
+
+  const declineAutoDetect = () => {
+    store.setMeta('autodetect_offered', '1').catch(() => undefined);
+    setOfferAuto(false);
+  };
+
+  // Settings panel: show what's missing, if anything.
+  useEffect(() => {
+    if (panel !== 'dev') return;
+    autoPermissionsMissing().then(setAutoMissing).catch(() => undefined);
+    store
+      .loadLog(LOG_LINES)
+      .then((rows) => setLog(rows.map((r) => { const d = new Date(r.t); return `${pad2(d.getHours())}:${pad2(d.getMinutes())} ${r.line}`; })))
+      .catch(() => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [panel]);
+
+  const exportLog = async () => {
+    try {
+      const rows = await store.loadLog();
+      const file = new File(Paths.cache, `tarmacked-log-${new Date().toISOString().slice(0, 10)}.txt`);
+      if (file.exists) file.delete();
+      file.create();
+      file.write(rows.map((r) => `${new Date(r.t).toISOString()} ${r.line}`).join('\n'));
+      await Sharing.shareAsync(file.uri, { mimeType: 'text/plain', UTI: 'public.plain-text', dialogTitle: 'tarmacked log' });
+    } catch (e) {
+      setNote(`Couldn't export the log: ${(e as Error).message}`);
+    }
+  };
+
+  // Pending auto-detected drives, from the Drives list.
+  const savePending = async (id: number) => {
+    await store.setDriveStatus(id, 'done');
+    setDrives(await store.listDrives());
+    setNote('Drive saved — adding its roads to your map…');
+    await runRecheck('manual');
+  };
+  const deletePending = async (id: number) => {
+    if (selectedDrive?.id === id) setSelectedDrive(null);
+    await store.deleteDrive(id);
+    setDrives(await store.listDrives());
+    setNote('Drive deleted.');
+  };
+
   const toggleLeftOut = async (d: store.DriveSummary) => {
     try {
       await store.setDriveLeftOut(d.id, !d.leftOut);
@@ -1371,7 +1641,7 @@ function App() {
     [panel, statsTab, roadCounts, netRev]
   );
   const overview = useMemo(() => {
-    const list = (drives ?? []).filter((d) => !d.leftOut);
+    const list = (drives ?? []).filter((d) => !d.leftOut && d.status === 'done');
     const now = new Date();
     const weekStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - ((now.getDay() + 6) % 7)).getTime();
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
@@ -1464,13 +1734,15 @@ function App() {
 
   // ---------- Onboarding ----------
 
+  // The loading screen stays over whatever is underneath until the data
+  // is in (at least LOADING_MIN_MS), then fades away.
+  const bootReady = onboarded === false || (onboarded === true && dataLoaded);
+  const loadingOverlay = loadingGone ? null : (
+    <LoadingScreen step={bootStep} ready={bootReady} onGone={() => setLoadingGone(true)} />
+  );
+
   if (onboarded === null) {
-    return (
-      <View style={styles.onboardContainer}>
-        <ActivityIndicator color="#39d353" size="large" />
-        <Text style={[styles.onboardText, { marginTop: 16 }]}>{bootStep}</Text>
-      </View>
-    );
+    return <View style={styles.onboardContainer}>{loadingOverlay}</View>;
   }
 
   if (onboarded === false) {
@@ -1506,6 +1778,7 @@ function App() {
             </Pressable>
           </>
         )}
+        {loadingOverlay}
       </View>
     );
   }
@@ -1528,7 +1801,7 @@ function App() {
         followsUserLocation={following && !editMode}
         onPanDrag={() => following && setFollowing(false)}
         onPress={onMapPress}
-        onRegionChangeComplete={(r) => setVisibleRegion(r)}
+        onRegionChangeComplete={(r: Region) => setVisibleRegion(r)}
       >
         {MAP_TYPES[mapTypeIndex] === 'osm' && (
           <UrlTile
@@ -1818,21 +2091,39 @@ function App() {
               {drives.map((d) => {
                 const selected = selectedDrive?.id === d.id;
                 const patchy = isPatchy(d.ignoredN, d.pointCount);
+                const pending = d.status === 'pending';
+                const recording = d.status === 'recording';
+                const daysLeft = Math.max(1, Math.ceil((d.startedAt + 7 * 86_400_000 - Date.now()) / 86_400_000));
                 return (
                   <Pressable key={d.id} style={[styles.driveRow, selected && styles.driveRowSelected]} onPress={() => showDrive(d.id)}>
                     <View style={{ flex: 1, opacity: d.leftOut ? 0.55 : 1 }}>
                       <Text style={styles.driveWhen}>
                         {formatWhen(d.startedAt)}
+                        {recording && <Text style={styles.recordingTag}>{'  ● recording'}</Text>}
+                        {d.auto && !recording && <Text style={styles.driveInfo}>{'  auto'}</Text>}
                         {patchy && <Text style={styles.patchyTag}>{'  ⚠ patchy GPS'}</Text>}
                         {d.leftOut && <Text style={styles.driveInfo}>{'  left out'}</Text>}
                       </Text>
+                      {pending && (
+                        <Text style={styles.pendingTag}>Not saved yet · deletes in {daysLeft} day{daysLeft === 1 ? '' : 's'}</Text>
+                      )}
                       <Text style={styles.driveInfo}>
                         {d.endedAt ? `${formatDuration(d.endedAt - d.startedAt)} · ` : ''}
                         {d.distanceM !== null ? `${km(d.distanceM)} km` : `${d.pointCount} points`}
                         {d.newM !== null && d.newM > 0 ? ` · +${km(d.newM)} km new` : ''}
                       </Text>
                     </View>
-                    {selected && (patchy || d.leftOut) && (
+                    {pending && (
+                      <View style={styles.pendingButtons}>
+                        <Pressable style={[styles.smallButton, styles.smallButtonGreen]} onPress={() => savePending(d.id)} disabled={recheckProgress !== null}>
+                          <Text style={styles.chipText}>Save</Text>
+                        </Pressable>
+                        <Pressable style={styles.smallButton} onPress={() => deletePending(d.id)}>
+                          <Text style={styles.chipText}>Delete</Text>
+                        </Pressable>
+                      </View>
+                    )}
+                    {selected && !pending && !recording && (patchy || d.leftOut) && (
                       <Pressable
                         style={[styles.smallButton, { marginRight: 6 }]}
                         onPress={() => toggleLeftOut(d)}
@@ -1841,7 +2132,7 @@ function App() {
                         <Text style={styles.chipText}>{d.leftOut ? 'Include' : 'Leave out'}</Text>
                       </Pressable>
                     )}
-                    {selected && (
+                    {selected && !pending && !recording && (
                       <Pressable
                         style={[styles.smallButton, deleteConfirmId === d.id && styles.smallButtonDanger]}
                         onPress={() => deleteDrive(d.id)}
@@ -1869,7 +2160,32 @@ function App() {
       {panel === 'dev' && (
         <View style={styles.panel}>
           <ScrollView>
-            <Text style={styles.panelTitle}>GPS accuracy</Text>
+            <View style={styles.settingRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.panelTitle}>Auto-detect drives</Text>
+                <Text style={styles.small}>
+                  Records drives you forget to start and asks before saving them. Ends drives you forget to stop.
+                </Text>
+              </View>
+              <Switch
+                value={autoDetect}
+                disabled={autoBusy}
+                onValueChange={(on: boolean) => (on ? enableAutoDetect() : disableAutoDetect())}
+                trackColor={{ true: '#2f6f3a', false: '#333' }}
+              />
+            </View>
+            {autoMissing.length > 0 && (autoDetect || offerAuto === false) && (
+              <View style={styles.missingBox}>
+                <Text style={styles.missingText}>
+                  {autoDetect ? 'Auto-detect is missing: ' : 'Auto-detect needs: '}
+                  {autoMissing.join(', ')}.
+                </Text>
+                <Pressable style={[styles.smallButton, { alignSelf: 'flex-start', marginTop: 8 }]} onPress={() => Linking.openSettings()}>
+                  <Text style={styles.chipText}>Open iPhone Settings</Text>
+                </Pressable>
+              </View>
+            )}
+            <Text style={[styles.panelTitle, { marginTop: 16 }]}>GPS accuracy</Text>
             <View style={[styles.row, { marginTop: 0 }]}>
               {ACCURACY_MODES.map((m) => (
                 <Pressable
@@ -1948,7 +2264,12 @@ function App() {
               {'\n'}Driven: {drivenIds.size} · excluded: {excludedIds.size} · off-road GPS points: {unmatchedCount}
               {'\n'}Saved drives: {rawStats.drives} ({rawStats.points} points)
             </Text>
-            <Text style={[styles.panelTitle, { marginTop: 12 }]}>Log</Text>
+            <View style={[styles.row, { alignItems: 'center', marginTop: 12 }]}>
+              <Text style={[styles.panelTitle, { marginBottom: 0, flex: 1 }]}>Log</Text>
+              <Pressable style={styles.smallButton} onPress={exportLog}>
+                <Text style={styles.chipText}>Export log</Text>
+              </Pressable>
+            </View>
             <Text style={styles.logText}>{log.length ? log.join('\n') : '—'}</Text>
           </ScrollView>
         </View>
@@ -1997,11 +2318,16 @@ function App() {
             ) : (
               <Text style={styles.barDim}>Connect once to load road totals</Text>
             )}
-            {tracking && (
-              <Text style={styles.barLive}>
-                ● {formatDuration(elapsed)} · {km(driveDistanceRef.current)} km · +{km(driveNewMRef.current)} km new
-              </Text>
-            )}
+            {tracking &&
+              (liveAuto ? (
+                <Text style={styles.barLive}>
+                  ● Auto-detected · {formatDuration(elapsed)} · {km(driveDistanceRef.current)} km · Stop to save
+                </Text>
+              ) : (
+                <Text style={styles.barLive}>
+                  ● {formatDuration(elapsed)} · {km(driveDistanceRef.current)} km · +{km(driveNewMRef.current)} km new
+                </Text>
+              ))}
           </View>
           <Pressable
             style={[styles.mainButton, tracking && styles.mainButtonStop, !tracking && recheckProgress !== null && styles.mainButtonBusy]}
@@ -2023,7 +2349,81 @@ function App() {
           <Text style={styles.osmCreditText}>© OpenStreetMap contributors</Text>
         </View>
       )}
+
+      {offerAuto && loadingGone && !tracking && (
+        <View style={styles.offerBackdrop}>
+          <View style={styles.offerCard}>
+            <Text style={styles.offerTitle}>Never miss a drive</Text>
+            <Text style={styles.offerText}>
+              tarmacked can notice when you're driving and record it, even if you forget to press Start. It always asks before
+              saving a drive, and ends drives you forget to stop.
+            </Text>
+            <Text style={styles.offerPerm}>
+              <Text style={styles.offerPermName}>Motion & Fitness</Text> to tell driving from walking
+            </Text>
+            <Text style={styles.offerPerm}>
+              <Text style={styles.offerPermName}>Location: Always</Text> to notice you've set off while the app is closed
+            </Text>
+            <Text style={styles.offerPerm}>
+              <Text style={styles.offerPermName}>Notifications</Text> to ask before saving a drive
+            </Text>
+            <Text style={styles.small}>You can change this any time in Settings (⚙).</Text>
+            <View style={[styles.row, { marginTop: 16 }]}>
+              <Pressable style={[styles.button, styles.buttonGrey]} onPress={declineAutoDetect} disabled={autoBusy}>
+                <Text style={styles.buttonText}>Not now</Text>
+              </Pressable>
+              <Pressable style={[styles.button, styles.buttonGreen]} onPress={enableAutoDetect} disabled={autoBusy}>
+                <Text style={styles.buttonText}>{autoBusy ? 'Setting up…' : 'Turn on'}</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      )}
+
+      {loadingOverlay}
     </View>
+  );
+}
+
+// Shown from launch until your data is loaded. The mark sits exactly where
+// the native splash screen shows it, so the hand-over is invisible.
+function LoadingScreen({ step, ready, onGone }: { step: string; ready: boolean; onGone: () => void }) {
+  const fade = useRef(new Animated.Value(1)).current;
+  const line = useRef(new Animated.Value(0)).current;
+  const shownAt = useRef(Date.now());
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(line, { toValue: 1, duration: 1100, easing: Easing.inOut(Easing.cubic), useNativeDriver: false }),
+        Animated.timing(line, { toValue: 0, duration: 0, useNativeDriver: false }),
+      ])
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [line]);
+  useEffect(() => {
+    if (!ready) return;
+    const wait = Math.max(0, LOADING_MIN_MS - (Date.now() - shownAt.current));
+    const h = setTimeout(() => {
+      Animated.timing(fade, { toValue: 0, duration: 350, useNativeDriver: true }).start(() => onGone());
+    }, wait);
+    return () => clearTimeout(h);
+  }, [ready, fade, onGone]);
+  return (
+    <Animated.View
+      style={[styles.loading, { opacity: fade }]}
+      pointerEvents={ready ? 'none' : 'auto'}
+      onLayout={() => SplashScreen.hideAsync().catch(() => undefined)}
+    >
+      <Image source={require('./assets/splash-icon.png')} style={styles.loadingMark} />
+      <View style={styles.loadingBelow}>
+        <Text style={styles.loadingWord}>tarmacked</Text>
+        <View style={styles.loadingTrack}>
+          <Animated.View style={[styles.loadingLine, { width: line.interpolate({ inputRange: [0, 1], outputRange: ['0%', '100%'] }) }]} />
+        </View>
+        <Text style={styles.loadingStatus}>{step}</Text>
+      </View>
+    </Animated.View>
   );
 }
 
@@ -2038,6 +2438,33 @@ function StatTile({ label, value }: { label: string; value: string }) {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#111' },
+
+  // Loading screen: the mark is centred at the native splash's size
+  // (imageWidth in app.json), everything else hangs below it.
+  loading: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: '#0f1311', alignItems: 'center', justifyContent: 'center' },
+  loadingMark: { width: 120, height: 120 },
+  loadingBelow: { position: 'absolute', top: '50%', marginTop: 84, left: 0, right: 0, alignItems: 'center' },
+  loadingWord: { color: '#e8ede9', fontSize: 30, fontWeight: '900', letterSpacing: -0.8 },
+  loadingTrack: { width: 140, height: 4, borderRadius: 2, backgroundColor: '#26302b', marginTop: 16, overflow: 'hidden' },
+  loadingLine: { height: 4, borderRadius: 2, backgroundColor: '#39d353' },
+  loadingStatus: { color: '#93a098', fontSize: 13, marginTop: 14 },
+
+  // "Never miss a drive"
+  offerBackdrop: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center', padding: 20 },
+  offerCard: { backgroundColor: '#161c19', borderRadius: 16, padding: 22, borderWidth: 1, borderColor: '#26302b' },
+  offerTitle: { color: '#fff', fontSize: 24, fontWeight: '800', marginBottom: 10 },
+  offerText: { color: '#cfd8d2', fontSize: 15, lineHeight: 21, marginBottom: 14 },
+  offerPerm: { color: '#93a098', fontSize: 14, lineHeight: 20, marginBottom: 6 },
+  offerPermName: { color: '#39d353', fontWeight: '700' },
+
+  settingRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  missingBox: { backgroundColor: 'rgba(232,176,64,0.12)', borderRadius: 10, padding: 12, marginTop: 10 },
+  missingText: { color: '#e8c070', fontSize: 13, lineHeight: 18 },
+  recordingTag: { color: '#ff7a7a', fontSize: 12, fontWeight: '700' },
+  pendingTag: { color: '#e8c070', fontSize: 12, marginTop: 2 },
+  pendingButtons: { flexDirection: 'row', gap: 6 },
+  smallButtonGreen: { backgroundColor: '#2f6f3a' },
+  buttonGreen: { backgroundColor: '#2a6f2a' },
   map: { flex: 1 },
   onboardContainer: { flex: 1, backgroundColor: '#111', alignItems: 'center', justifyContent: 'center', padding: 24 },
   onboardTitle: { color: '#fff', fontSize: 32, fontWeight: '700', marginBottom: 20 },

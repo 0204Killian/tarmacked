@@ -21,6 +21,14 @@ jobs:
       - name: Generate native iOS project
         run: npx expo prebuild --platform ios --no-install
 
+      # Local notifications only: a free Apple ID can't sign the push
+      # notification entitlement that expo-notifications adds, so remove it.
+      - name: Remove push entitlement
+        run: |
+          for f in ios/*/*.entitlements; do
+            /usr/libexec/PlistBuddy -c "Delete :aps-environment" "$f" 2>/dev/null || true
+          done
+
       - name: Install CocoaPods
         run: cd ios && pod install
 

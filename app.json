@@ -2,28 +2,46 @@
   "expo": {
     "name": "tarmacked",
     "slug": "tarmacked",
-    "version": "0.14.2",
+    "version": "0.15.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "ios": {
       "bundleIdentifier": "com.tarmacked.app",
       "infoPlist": {
         "NSLocationWhenInUseUsageDescription": "tarmacked needs your location to record the roads you drive.",
-        "NSLocationAlwaysAndWhenInUseUsageDescription": "tarmacked needs background location so it keeps recording while your phone is locked.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "tarmacked uses your location in the background to keep recording while your phone is locked and, if you turn on auto-detect, to notice when you set off.",
         "UIBackgroundModes": [
           "location"
-        ]
+        ],
+        "NSMotionUsageDescription": "tarmacked uses Motion & Fitness to tell when you're driving, so it can record drives you forget to start."
       }
     },
     "plugins": [
       [
         "expo-location",
         {
-          "locationAlwaysAndWhenInUsePermission": "tarmacked needs background location so it keeps recording while your phone is locked."
+          "locationAlwaysAndWhenInUsePermission": "tarmacked uses your location in the background to keep recording while your phone is locked and, if you turn on auto-detect, to notice when you set off.",
+          "isIosBackgroundLocationEnabled": true
         }
       ],
       "expo-sqlite",
-      "expo-sharing"
-    ]
+      "expo-sharing",
+      [
+        "expo-notifications",
+        {
+          "enableBackgroundRemoteNotifications": false
+        }
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 120,
+          "resizeMode": "contain",
+          "backgroundColor": "#0f1311"
+        }
+      ]
+    ],
+    "backgroundColor": "#0f1311"
   }
 }

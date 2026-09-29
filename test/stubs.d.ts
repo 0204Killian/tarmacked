@@ -10,7 +10,11 @@ declare module 'react' {
 }
 declare module 'react-native' {
   export const StyleSheet: { create<T>(s: T): T };
-  export const Text: any, View: any, Pressable: any, ScrollView: any, ActivityIndicator: any;
+  export const Text: any, View: any, Pressable: any, ScrollView: any, ActivityIndicator: any, Image: any, Switch: any;
+  export const AppState: { currentState: string; addEventListener(t: 'change', cb: (s: 'active' | 'background' | 'inactive') => void): { remove(): void } };
+  export const Linking: { openSettings(): Promise<void>; openURL(u: string): Promise<void> };
+  export const Animated: any;
+  export const Easing: any;
   export const Dimensions: { get(w: 'window'): { width: number; height: number } };
 }
 declare module 'react-native-maps' {
@@ -22,10 +26,19 @@ declare module 'react-native-maps' {
 }
 declare module 'expo-location' {
   export type LocationObject = { coords: { latitude: number; longitude: number; accuracy: number | null }; timestamp: number };
+  export type PermissionResponse = { status: 'granted' | 'denied' | 'undetermined'; canAskAgain: boolean };
+  export function getForegroundPermissionsAsync(): Promise<PermissionResponse>;
+  export function getBackgroundPermissionsAsync(): Promise<PermissionResponse>;
+  export function hasStartedLocationUpdatesAsync(n: string): Promise<boolean>;
+  export enum GeofencingEventType { Enter = 1, Exit = 2 }
+  export type LocationRegion = { identifier?: string; latitude: number; longitude: number; radius: number; notifyOnEnter?: boolean; notifyOnExit?: boolean };
+  export function startGeofencingAsync(n: string, regions: LocationRegion[]): Promise<void>;
+  export function stopGeofencingAsync(n: string): Promise<void>;
+  export function hasStartedGeofencingAsync(n: string): Promise<boolean>;
   export type LocationSubscription = { remove(): void };
   export const Accuracy: { BestForNavigation: number; High: number; Balanced: number }; export const ActivityType: { AutomotiveNavigation: number };
-  export function requestForegroundPermissionsAsync(): Promise<{ status: string }>;
-  export function requestBackgroundPermissionsAsync(): Promise<{ status: string }>;
+  export function requestForegroundPermissionsAsync(): Promise<PermissionResponse>;
+  export function requestBackgroundPermissionsAsync(): Promise<PermissionResponse>;
   export function getCurrentPositionAsync(o: any): Promise<LocationObject>;
   export function getLastKnownPositionAsync(): Promise<LocationObject | null>;
   export function startLocationUpdatesAsync(n: string, o: any): Promise<void>;
@@ -64,4 +77,32 @@ declare module 'expo-battery' {
   export enum BatteryState { UNKNOWN = 0, UNPLUGGED = 1, CHARGING = 2, FULL = 3 }
   export function getBatteryStateAsync(): Promise<BatteryState>;
   export function addBatteryStateListener(cb: (e: { batteryState: BatteryState }) => void): { remove(): void };
+}
+declare module 'expo-notifications' {
+  export const DEFAULT_ACTION_IDENTIFIER: string;
+  export enum SchedulableTriggerInputTypes { TIME_INTERVAL = 'timeInterval' }
+  export type NotificationContentInput = { title?: string; body?: string; data?: Record<string, unknown>; categoryIdentifier?: string };
+  export type NotificationResponse = { actionIdentifier: string; notification: { date: number; request: { identifier: string; content: { data: Record<string, unknown> } } } };
+  export function setNotificationHandler(h: { handleNotification: () => Promise<{ shouldShowBanner: boolean; shouldShowList: boolean; shouldPlaySound: boolean; shouldSetBadge: boolean }> }): void;
+  export function setNotificationCategoryAsync(id: string, actions: { identifier: string; buttonTitle: string; options?: { opensAppToForeground?: boolean; isDestructive?: boolean } }[]): Promise<unknown>;
+  export function scheduleNotificationAsync(r: { identifier?: string; content: NotificationContentInput; trigger: { type: SchedulableTriggerInputTypes; seconds: number; repeats?: boolean } | null }): Promise<string>;
+  export function cancelScheduledNotificationAsync(id: string): Promise<void>;
+  export function dismissNotificationAsync(id: string): Promise<void>;
+  export function getPermissionsAsync(): Promise<{ status: 'granted' | 'denied' | 'undetermined'; canAskAgain: boolean }>;
+  export function requestPermissionsAsync(): Promise<{ status: 'granted' | 'denied' | 'undetermined'; canAskAgain: boolean }>;
+  export function getLastNotificationResponseAsync(): Promise<NotificationResponse | null>;
+  export function addNotificationResponseReceivedListener(cb: (r: NotificationResponse) => void): { remove(): void };
+}
+declare module 'expo-splash-screen' {
+  export function preventAutoHideAsync(): Promise<boolean>;
+  export function hideAsync(): Promise<void>;
+  export function setOptions(o: { duration?: number; fade?: boolean }): void;
+}
+declare module 'expo' {
+  export function requireOptionalNativeModule<T>(name: string): T | null;
+}
+declare function require(p: string): any;
+declare module 'expo-keep-awake' {
+  export function activateKeepAwakeAsync(tag?: string): Promise<void>;
+  export function deactivateKeepAwake(tag?: string): Promise<void>;
 }

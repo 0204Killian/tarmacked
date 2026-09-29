@@ -70,6 +70,18 @@ async function openDb() {
   if (!have.has('left_out')) await db.execAsync('ALTER TABLE drives ADD COLUMN left_out INTEGER NOT NULL DEFAULT 0');
   const pcols = await db.getAllAsync<{ name: string }>('PRAGMA table_info(points)');
   if (!pcols.some((c) => c.name === 'acc')) await db.execAsync('ALTER TABLE points ADD COLUMN acc REAL');
+  // v0.15: drive status (recording / pending confirmation / done), auto-detected
+  // drives, one row per GPS point (duplicates removed), and a saved log.
+  if (!have.has('status')) await db.execAsync("ALTER TABLE drives ADD COLUMN status TEXT NOT NULL DEFAULT 'done'");
+  if (!have.has('auto')) await db.execAsync('ALTER TABLE drives ADD COLUMN auto INTEGER NOT NULL DEFAULT 0');
+  const idx = await db.getAllAsync<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'points_unique'");
+  if (idx.length === 0) {
+    await db.execAsync(`
+      DELETE FROM points WHERE rowid NOT IN (SELECT MIN(rowid) FROM points GROUP BY drive_id, t);
+      CREATE UNIQUE INDEX IF NOT EXISTS points_unique ON points(drive_id, t);
+    `);
+  }
+  await db.execAsync('CREATE TABLE IF NOT EXISTS log (id INTEGER PRIMARY KEY AUTOINCREMENT, t INTEGER NOT NULL, line TEXT NOT NULL)');
   return db;
 }
 
@@ -201,7 +213,7 @@ export async function migrateIfNeeded(): Promise<string | null> {
       const driveId = res.lastInsertRowId;
       await bulk(
         db,
-        'INSERT INTO points (drive_id, lat, lon, t) VALUES (?, ?, ?, ?)',
+        'INSERT OR IGNORE INTO points (drive_id, lat, lon, t) VALUES (?, ?, ?, ?)',
         session.map((p) => [driveId, p.latitude, p.longitude, p.timestamp])
       );
       drivesMoved++;
@@ -332,9 +344,74 @@ export async function replaceUnmatched(points: StoredPoint[]) {
 
 // --- drives / raw trail ---
 
-export async function startDrive(startedAt: number): Promise<number> {
-  const res = await write((db) => db.runAsync('INSERT INTO drives (started_at) VALUES (?)', [startedAt]));
+// A new drive, recording. auto = started by automatic drive detection.
+export async function startDrive(startedAt: number, auto = false): Promise<number> {
+  const res = await write((db) =>
+    db.runAsync("INSERT INTO drives (started_at, status, auto) VALUES (?, 'recording', ?)", [startedAt, auto ? 1 : 0])
+  );
   return res.lastInsertRowId;
+}
+
+export type DriveStatus = 'recording' | 'pending' | 'done';
+
+export async function setDriveStatus(driveId: number, status: DriveStatus, endedAt?: number) {
+  await write((db) =>
+    endedAt !== undefined
+      ? db.runAsync('UPDATE drives SET status = ?, ended_at = ? WHERE id = ?', [status, endedAt, driveId])
+      : db.runAsync('UPDATE drives SET status = ? WHERE id = ?', [status, driveId])
+  );
+}
+
+// The drive currently recording, if any (e.g. after the app was closed mid-drive).
+export async function getRecordingDrive(): Promise<{ id: number; startedAt: number; auto: boolean; lastT: number | null } | null> {
+  const db = await getDb();
+  const row = await db.getFirstAsync<{ id: number; started_at: number; auto: number; last_t: number | null }>(
+    "SELECT d.id, d.started_at, d.auto, (SELECT MAX(t) FROM points p WHERE p.drive_id = d.id) AS last_t " +
+      "FROM drives d WHERE d.status = 'recording' ORDER BY d.started_at DESC LIMIT 1"
+  );
+  return row ? { id: row.id, startedAt: row.started_at, auto: row.auto === 1, lastT: row.last_t } : null;
+}
+
+// Points recorded after time t (the live drive reads new points this way).
+export async function loadPointsSince(driveId: number, t: number): Promise<StoredPoint[]> {
+  const db = await getDb();
+  const rows = await db.getAllAsync<{ lat: number; lon: number; t: number; acc: number | null }>(
+    'SELECT lat, lon, t, acc FROM points WHERE drive_id = ? AND t > ? ORDER BY t',
+    [driveId, t]
+  );
+  return rows.map((r) => ({ latitude: r.lat, longitude: r.lon, timestamp: r.t, accuracy: r.acc }));
+}
+
+// Drops points after endT (the parked tail of a drive that wasn't stopped).
+export async function trimDrive(driveId: number, endT: number) {
+  await write((db) => db.runAsync('DELETE FROM points WHERE drive_id = ? AND t > ?', [driveId, endT]));
+}
+
+// Auto-detected drives never confirmed within maxAgeMs are deleted.
+export async function deleteStalePending(maxAgeMs: number): Promise<number> {
+  const db = await getDb();
+  const old = await db.getAllAsync<{ id: number }>("SELECT id FROM drives WHERE status = 'pending' AND started_at < ?", [
+    Date.now() - maxAgeMs,
+  ]);
+  for (const d of old) await deleteDrive(d.id);
+  return old.length;
+}
+
+// --- saved log (for checking what happened in the background) ---
+
+const LOG_KEEP = 500;
+
+export async function appendLog(line: string) {
+  await write(async (db) => {
+    await db.runAsync('INSERT INTO log (t, line) VALUES (?, ?)', [Date.now(), line]);
+    await db.runAsync('DELETE FROM log WHERE id <= (SELECT MAX(id) FROM log) - ?', [LOG_KEEP]);
+  });
+}
+
+export async function loadLog(limit = LOG_KEEP): Promise<{ t: number; line: string }[]> {
+  const db = await getDb();
+  const rows = await db.getAllAsync<{ t: number; line: string }>('SELECT t, line FROM log ORDER BY id DESC LIMIT ?', [limit]);
+  return rows.reverse();
 }
 
 export async function addPoints(driveId: number, points: StoredPoint[]) {
@@ -342,20 +419,20 @@ export async function addPoints(driveId: number, points: StoredPoint[]) {
   await write(async (db) => {
     await bulk(
       db,
-      'INSERT INTO points (drive_id, lat, lon, t, acc) VALUES (?, ?, ?, ?, ?)',
+      'INSERT OR IGNORE INTO points (drive_id, lat, lon, t, acc) VALUES (?, ?, ?, ?, ?)',
       points.map((p) => [driveId, p.latitude, p.longitude, p.timestamp, p.accuracy ?? null])
     );
   });
 }
 
-export type DriveRecord = { id: number; startedAt: number; leftOut: boolean; points: StoredPoint[] };
+export type DriveRecord = { id: number; startedAt: number; leftOut: boolean; status: DriveStatus; auto: boolean; points: StoredPoint[] };
 
 // Every saved drive with its points, oldest first. Only loaded on demand
 // (re-checking drives, showing the raw trail) since it keeps growing.
 export async function loadDrives(): Promise<DriveRecord[]> {
   const db = await getDb();
-  const drives = await db.getAllAsync<{ id: number; started_at: number; left_out: number }>(
-    'SELECT id, started_at, left_out FROM drives ORDER BY started_at'
+  const drives = await db.getAllAsync<{ id: number; started_at: number; left_out: number; status: DriveStatus; auto: number }>(
+    'SELECT id, started_at, left_out, status, auto FROM drives ORDER BY started_at'
   );
   const rows = await db.getAllAsync<{ drive_id: number; lat: number; lon: number; t: number; acc: number | null }>(
     'SELECT drive_id, lat, lon, t, acc FROM points ORDER BY drive_id, t, rowid'
@@ -367,7 +444,14 @@ export async function loadDrives(): Promise<DriveRecord[]> {
     if (list) list.push(p);
     else byDrive.set(r.drive_id, [p]);
   }
-  return drives.map((d) => ({ id: d.id, startedAt: d.started_at, leftOut: d.left_out === 1, points: byDrive.get(d.id) || [] }));
+  return drives.map((d) => ({
+    id: d.id,
+    startedAt: d.started_at,
+    leftOut: d.left_out === 1,
+    status: d.status,
+    auto: d.auto === 1,
+    points: byDrive.get(d.id) || [],
+  }));
 }
 
 export async function loadDrivePoints(driveId: number): Promise<StoredPoint[]> {
@@ -388,6 +472,8 @@ export type DriveSummary = {
   pointCount: number;
   ignoredN: number | null;
   leftOut: boolean;
+  status: DriveStatus;
+  auto: boolean;
 };
 
 // For the Drives list, newest first.
@@ -401,10 +487,12 @@ export async function listDrives(): Promise<DriveSummary[]> {
     new_m: number | null;
     ignored_n: number | null;
     left_out: number;
+    status: DriveStatus;
+    auto: number;
     n: number;
     last_t: number | null;
   }>(
-    'SELECT d.id, d.started_at, d.ended_at, d.distance_m, d.new_m, d.ignored_n, d.left_out, COUNT(p.drive_id) AS n, MAX(p.t) AS last_t ' +
+    'SELECT d.id, d.started_at, d.ended_at, d.distance_m, d.new_m, d.ignored_n, d.left_out, d.status, d.auto, COUNT(p.drive_id) AS n, MAX(p.t) AS last_t ' +
       'FROM drives d LEFT JOIN points p ON p.drive_id = d.id GROUP BY d.id ORDER BY d.started_at DESC'
   );
   return rows.map((r) => ({
@@ -416,6 +504,8 @@ export async function listDrives(): Promise<DriveSummary[]> {
     pointCount: r.n,
     ignoredN: r.ignored_n,
     leftOut: r.left_out === 1,
+    status: r.status,
+    auto: r.auto === 1,
   }));
 }
 
@@ -430,6 +520,10 @@ export async function setDriveStats(
       rows.map((r) => [r.endedAt, r.distanceM, r.newM, r.ignoredN, r.id])
     );
   });
+}
+
+export async function setDriveDistance(driveId: number, distanceM: number) {
+  await write((db) => db.runAsync('UPDATE drives SET distance_m = ? WHERE id = ?', [distanceM, driveId]));
 }
 
 export async function setDriveLeftOut(driveId: number, leftOut: boolean) {
@@ -464,7 +558,7 @@ export async function loadDriveRoads(driveId: number): Promise<string[]> {
 export async function loadRoadCounts(): Promise<Map<string, number>> {
   const db = await getDb();
   const rows = await db.getAllAsync<{ chunk_id: string; n: number }>(
-    'SELECT r.chunk_id, COUNT(*) AS n FROM drive_roads r JOIN drives d ON d.id = r.drive_id WHERE d.left_out = 0 GROUP BY r.chunk_id'
+    "SELECT r.chunk_id, COUNT(*) AS n FROM drive_roads r JOIN drives d ON d.id = r.drive_id WHERE d.left_out = 0 AND d.status = 'done' GROUP BY r.chunk_id"
   );
   return new Map(rows.map((r) => [r.chunk_id, r.n]));
 }
@@ -771,7 +865,7 @@ export async function importBackup(data: any) {
       const driveId = res.lastInsertRowId;
       await bulk(
         db,
-        'INSERT INTO points (drive_id, lat, lon, t, acc) VALUES (?, ?, ?, ?, ?)',
+        'INSERT OR IGNORE INTO points (drive_id, lat, lon, t, acc) VALUES (?, ?, ?, ?, ?)',
         drive.points.map((p: number[]) => [driveId, p[0], p[1], p[2], p[3] ?? null])
       );
       drivesAdded++;
