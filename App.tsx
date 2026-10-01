@@ -1,6 +1,6 @@
 import { Component, ReactNode, useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { StyleSheet, Text, View, Pressable, ScrollView, ActivityIndicator, AppState, Linking, Animated, Easing, Image, Switch } from 'react-native';
-import MapView, { Polyline, UrlTile, PROVIDER_DEFAULT, MapPressEvent, MapType, Region } from 'react-native-maps';
+import { StyleSheet, Text, View, Pressable, ScrollView, ActivityIndicator, AppState, Linking, Animated, Easing, Image, Switch, Keyboard } from 'react-native';
+import MapView, { Polyline, UrlTile, Marker, PROVIDER_DEFAULT, MapPressEvent, MapType, Region } from 'react-native-maps';
 import * as Location from 'expo-location';
 import * as Battery from 'expo-battery';
 import * as Notifications from 'expo-notifications';
@@ -12,6 +12,10 @@ import * as DocumentPicker from 'expo-document-picker';
 import * as store from './src/storage';
 import * as bg from './src/background';
 import * as Motion from './modules/motion-activity';
+import * as NavKit from './modules/nav-kit';
+import * as Spotify from './modules/spotify-remote';
+import { Navigator, NavRoute, NavUpdate, newRoadOnRoute, drivenRanges } from './src/nav';
+import { SearchPanel, RouteChooser, RouteOption, NavBanner, NavFooter, SpotifyBar } from './src/navUi';
 import { RoadNetwork, RoadSegment, parseChunkId, baseChunkId } from './src/roadMatcher';
 import { DriveMatcher, Point, PieceIndex, isPatchy } from './src/coverage';
 import { recheckDrives, driveDistanceMeters } from './src/recheck';
@@ -328,6 +332,39 @@ function App() {
   const [rawSessions, setRawSessions] = useState<Point[][] | null>(null);
   const [recheckProgress, setRecheckProgress] = useState<number | null>(null);
   const [removedCount, setRemovedCount] = useState(0);
+
+  // Edit roads: this session's edits, newest last, for Undo (v0.16).
+  type Edit =
+    | { kind: 'unmark'; id: string; prevUnmarked: number | null; rows: Promise<store.DrivenRow[]> }
+    | { kind: 'exclude'; id: string };
+  const [editHistory, setEditHistory] = useState<Edit[]>([]);
+
+  // Sat-nav (v0.16).
+  type NavStage = 'off' | 'search' | 'choose' | 'driving';
+  type Dest = { name: string; at: Coord };
+  const [navStage, setNavStage] = useState<NavStage>('off');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<NavKit.Place[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [dest, setDest] = useState<Dest | null>(null);
+  const [routeOptions, setRouteOptions] = useState<RouteOption[]>([]);
+  const [chosenRoute, setChosenRoute] = useState(0);
+  const [routesLoading, setRoutesLoading] = useState(false);
+  const [routeError, setRouteError] = useState('');
+  const [navRoute, setNavRoute] = useState<NavRoute | null>(null);
+  const [navUpdate, setNavUpdate] = useState<NavUpdate | null>(null);
+  const [rerouting, setRerouting] = useState(false);
+  const [muted, setMuted] = useState(false);
+  const navRef = useRef<Navigator | null>(null);
+  const navDestRef = useRef<Dest | null>(null);
+  const navLastFixRef = useRef<Point | null>(null);
+  const rerouteAtRef = useRef(0);
+  const routeRequestRef = useRef(0); // ignores answers to older route requests
+  const mutedRef = useRef(false);
+
+  // Spotify (v0.16, behind a setting).
+  const [spotifyOn, setSpotifyOn] = useState(false);
+  const [spotify, setSpotify] = useState<Spotify.SpotifyState>({ connected: false });
   const [simulateTaps, setSimulateTaps] = useState(false);
   const [confirming, setConfirming] = useState<null | 'reset' | 'uninstall'>(null);
   const [backupBusy, setBackupBusy] = useState(false);
@@ -560,6 +597,11 @@ function App() {
         setRoadCounts(await store.loadRoadCounts());
         const savedMode = (await store.getMeta('accuracy_mode')) as AccuracyMode | null;
         if (savedMode && ACCURACY_MODES.some((m) => m.key === savedMode)) setAccuracyMode(savedMode);
+        mutedRef.current = (await store.getMeta('nav_muted')) === '1';
+        setMuted(mutedRef.current);
+        spotifyOnRef.current = (await store.getMeta('spotify_on')) === '1';
+        setSpotifyOn(spotifyOnRef.current);
+        spotifyQuiet().catch(() => undefined);
         const savedMap = await store.getMeta('map_type');
         if (savedMap && MAP_TYPES.includes(savedMap as MapChoice)) setMapTypeIndex(MAP_TYPES.indexOf(savedMap as MapChoice));
         const segs = data.tiles.flatMap((t) => t.segments);
@@ -939,6 +981,7 @@ function App() {
       (async () => {
         try {
           refreshPermsRef.current().catch(() => undefined);
+          spotifyQuietRef.current().catch(() => undefined);
           await bg.settle();
           pollRef.current();
           if (currentDriveIdRef.current === null) {
@@ -960,6 +1003,7 @@ function App() {
 
   const processPoints = (newPoints: Point[]) => {
     if (newPoints.length === 0) return;
+    if (navRef.current) navFeedRef.current(newPoints);
     // Fetch road data around you before you need it.
     const wanted = new Set<string>();
     for (const p of newPoints) neighbourTileIds(p.latitude, p.longitude).forEach((t) => wanted.add(t));
@@ -1139,7 +1183,10 @@ function App() {
   // Start and Stop ignore taps while the last one is still being handled.
   const busyRef = useRef(false);
 
-  const start = async () => {
+  // Start pressed. (Not passed straight to onPress: that would hand it the press event.)
+  const start = () => startRecording(null);
+  // forceMode: the sat-nav records in High (no batching, so prompts are on time).
+  const startRecording = async (forceMode: bg.Mode | null) => {
     if (busyRef.current || tracking) return;
     busyRef.current = true;
     try {
@@ -1147,7 +1194,7 @@ function App() {
       setHighlight(null);
       setPanel(null);
       setFollowing(true);
-      const mode = await chooseMode();
+      const mode = forceMode ?? (await chooseMode());
       activeModeRef.current = mode;
       try {
         const bgPerm = await Location.getBackgroundPermissionsAsync();
@@ -1285,21 +1332,8 @@ function App() {
 
   // ---------- Editing ----------
 
-  const handleEditTap = (id: string) => {
-    if (editAction === 'undrive') {
-      // The tapped road piece, and any sections of it.
-      const gone = Array.from(drivenRef.current).filter((d) => baseChunkId(d) === id);
-      if (gone.length === 0) return;
-      for (const d of gone) {
-        drivenRef.current.delete(d);
-        forgetDriven(d);
-        store.removeDriven(d).catch((e) => setNote(`Couldn't save that change: ${(e as Error).message}`));
-      }
-      unmarkedRef.current.set(id, Date.now());
-      setDrivenIds(new Set(drivenRef.current));
-      store.markUnmarked(id).catch(() => undefined);
-      return;
-    }
+  // Private / gone: toggles. Shared by tapping and Undo.
+  const toggleExcluded = (id: string) => {
     const nowExcluded = !excludedRef.current.has(id);
     const seg = netRef.current.segs.get(id);
     const info = { c: seg?.c ?? null, l: seg ? lineLengthMeters(seg.coords) : null };
@@ -1314,6 +1348,60 @@ function App() {
     store.setExcluded(id, nowExcluded, info.c, info.l).catch((e) => setNote(`Couldn't save that change: ${(e as Error).message}`));
   };
 
+  const handleEditTap = (id: string) => {
+    if (editAction === 'undrive') {
+      // The tapped road piece, and any sections of it.
+      const gone = Array.from(drivenRef.current).filter((d) => baseChunkId(d) === id);
+      if (gone.length === 0) return;
+      for (const d of gone) {
+        drivenRef.current.delete(d);
+        forgetDriven(d);
+      }
+      const prevUnmarked = unmarkedRef.current.get(id) ?? null;
+      unmarkedRef.current.set(id, Date.now());
+      setDrivenIds(new Set(drivenRef.current));
+      // Removed in one go, keeping the rows as they were for Undo.
+      const rows = store.removeDrivenPieces(gone);
+      rows.catch((e) => setNote(`Couldn't save that change: ${(e as Error).message}`));
+      store.markUnmarked(id).catch(() => undefined);
+      setEditHistory((h) => [...h, { kind: 'unmark', id, prevUnmarked, rows: rows.catch(() => [] as store.DrivenRow[]) }]);
+      return;
+    }
+    toggleExcluded(id);
+    setEditHistory((h) => [...h, { kind: 'exclude', id }]);
+  };
+
+  // Undo: steps back one edit of this edit-mode session.
+  const undoEdit = async () => {
+    const last = editHistory[editHistory.length - 1];
+    if (!last) return;
+    setEditHistory((h) => h.slice(0, -1));
+    if (last.kind === 'exclude') {
+      toggleExcluded(last.id);
+      return;
+    }
+    try {
+      const rows = await last.rows;
+      await store.restoreDriven(rows);
+      await store.setUnmarked(last.id, last.prevUnmarked);
+      if (last.prevUnmarked === null) unmarkedRef.current.delete(last.id);
+      else unmarkedRef.current.set(last.id, last.prevUnmarked);
+      for (const r of rows) {
+        drivenRef.current.add(r.id);
+        rememberDriven(r.id, r.shape ?? netRef.current.shapeOf(r.id), r.county);
+      }
+      setDrivenIds(new Set(drivenRef.current));
+    } catch (e) {
+      setNote(`Couldn't undo that: ${(e as Error).message}`);
+    }
+  };
+
+  // Each visit to edit mode starts a fresh undo list.
+  useEffect(() => {
+    setEditHistory([]);
+  }, [editMode]);
+
+
   // ---------- Map helpers ----------
 
   const recentre = async () => {
@@ -1327,6 +1415,290 @@ function App() {
       // no fix right now — following snaps to you on the next update anyway
     }
   };
+
+  // ---------- Sat-nav (v0.16) ----------
+  // Apple gives the routes (modules/nav-kit); following them, prompts and
+  // rerouting are src/nav.ts. Positions come from the recording drive, so
+  // navigating always records (in High, so prompts are on time).
+
+  const say = (text: string) => {
+    if (!mutedRef.current) NavKit.speak(text);
+  };
+
+  const hereNow = async (): Promise<Coord | null> => {
+    const p = lastLivePointRef.current;
+    if (p && Date.now() - p.timestamp < 60_000) return [p.latitude, p.longitude];
+    try {
+      const pos =
+        (await Location.getLastKnownPositionAsync({ maxAge: 60_000 })) ??
+        (await withTimeout(Location.getCurrentPositionAsync({}), 8000, 'get current position'));
+      return [pos.coords.latitude, pos.coords.longitude];
+    } catch {
+      return null;
+    }
+  };
+
+  const openSearch = () => {
+    setPanel(null);
+    setSearchQuery('');
+    setSearchResults([]);
+    setNavStage('search');
+  };
+
+  // Search as you type (a short pause first, so it isn't a request per letter).
+  useEffect(() => {
+    if (navStage !== 'search') return;
+    const q = searchQuery.trim();
+    if (q.length < 3) {
+      setSearchResults([]);
+      return;
+    }
+    let live = true;
+    const h = setTimeout(async () => {
+      setSearching(true);
+      try {
+        const res = await NavKit.search(q, await hereNow());
+        if (live) setSearchResults(res);
+      } catch {
+        if (live) setSearchResults([]);
+      } finally {
+        if (live) setSearching(false);
+      }
+    }, 350);
+    return () => {
+      live = false;
+      clearTimeout(h);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchQuery, navStage]);
+
+  // How much of each route you've never driven (downloads the road data along them first).
+  const measureNewRoad = async (routes: NavRoute[], req: number) => {
+    const tiles = new Set<string>();
+    for (const r of routes) for (let i = 0; i < r.coords.length; i += 5) tiles.add(tileIdForPoint(r.coords[i][0], r.coords[i][1]));
+    await ensureTiles(tiles);
+    if (req !== routeRequestRef.current) return;
+    const ranges = drivenRanges(netRef.current, drivenRef.current);
+    for (let i = 0; i < routes.length; i++) {
+      await tick();
+      if (req !== routeRequestRef.current) return;
+      const newRoad = newRoadOnRoute(netRef.current, ranges, routes[i].coords);
+      setRouteOptions((prev) => prev.map((o, k) => (k === i ? { ...o, newRoad } : o)));
+    }
+  };
+
+  const chooseDestination = async (d: Dest) => {
+    Keyboard.dismiss();
+    const req = ++routeRequestRef.current;
+    setDest(d);
+    setNavStage('choose');
+    setPanel(null);
+    setRouteOptions([]);
+    setChosenRoute(0);
+    setRouteError('');
+    setRoutesLoading(true);
+    try {
+      const from = await hereNow();
+      if (!from) throw new Error('No GPS position yet — try again in a moment.');
+      const routes = await NavKit.directions(from, d.at, true);
+      if (req !== routeRequestRef.current) return;
+      if (routes.length === 0) throw new Error('No driving route found.');
+      const fastest = routes.reduce((b, r, i) => (r.duration < routes[b].duration ? i : b), 0);
+      setRouteOptions(routes.map((route) => ({ route, newRoad: null })));
+      setChosenRoute(fastest);
+      setFollowing(false);
+      const pts = routes.flatMap((r) => r.coords.filter((_, i) => i % 10 === 0));
+      mapRef.current?.fitToCoordinates(toLatLng([...pts, d.at, from]), { edgePadding: { top: 120, right: 50, bottom: 360, left: 50 }, animated: true });
+      measureNewRoad(routes, req).catch(() => undefined);
+    } catch (e) {
+      if (req === routeRequestRef.current) setRouteError((e as Error).message);
+    } finally {
+      if (req === routeRequestRef.current) setRoutesLoading(false);
+    }
+  };
+
+  const cancelRoutes = () => {
+    routeRequestRef.current++;
+    setNavStage('off');
+    setDest(null);
+    setRouteOptions([]);
+    setRouteError('');
+  };
+
+  // Long-press the map: route to that spot.
+  const onMapLongPress = (e: MapPressEvent) => {
+    if (editMode || navStage === 'driving' || !NavKit.available()) return;
+    const { latitude, longitude } = e.nativeEvent.coordinate;
+    const at: Coord = [latitude, longitude];
+    chooseDestination({ name: 'Dropped pin', at }).catch(() => undefined);
+    NavKit.placeName(at).then((name) => {
+      if (name) setDest((d) => (d && d.at[0] === at[0] && d.at[1] === at[1] ? { ...d, name } : d));
+    });
+  };
+
+  const spokenName = (d: Dest) => (d.name === 'Dropped pin' ? '' : d.name);
+
+  const startNavigation = async () => {
+    const opt = routeOptions[chosenRoute];
+    if (!opt || !dest) return;
+    const nav = new Navigator(opt.route, spokenName(dest));
+    navRef.current = nav;
+    navDestRef.current = dest;
+    navLastFixRef.current = null;
+    rerouteAtRef.current = 0;
+    setNavRoute(opt.route);
+    setNavUpdate(null);
+    setNavStage('driving');
+    setPanel(null);
+    setFollowing(true);
+    say(nav.start());
+    addLog(`sat-nav to ${dest.name}: ${km(opt.route.distance)} km`);
+    if (!tracking) await startRecording('high');
+    else if (liveAutoRef.current) await bg.confirmDrive(); // navigating = definitely driving: keep it
+    if (tracking && activeModeRef.current !== 'high') {
+      activeModeRef.current = 'high';
+      bg.startUpdates('high').catch(() => undefined);
+    }
+  };
+
+  const endNavigation = () => {
+    navRef.current = null;
+    navDestRef.current = null;
+    routeRequestRef.current++;
+    NavKit.stopSpeaking();
+    setNavRoute(null);
+    setNavUpdate(null);
+    setNavStage('off');
+    setDest(null);
+    setRouteOptions([]);
+    setRerouting(false);
+  };
+
+  // Off the route: a new one from here (at most every 15 s; quietly keeps
+  // trying if there's no signal).
+  const reroute = async (from: Coord) => {
+    const d = navDestRef.current;
+    if (!d || Date.now() - rerouteAtRef.current < 15_000) return;
+    rerouteAtRef.current = Date.now();
+    setRerouting(true);
+    try {
+      const routes = await NavKit.directions(from, d.at, false);
+      if (!navRef.current || navDestRef.current !== d || routes.length === 0) return;
+      navRef.current = new Navigator(routes[0], spokenName(d));
+      setNavRoute(routes[0]);
+      addLog('sat-nav: new route');
+    } catch (e) {
+      addLog(`sat-nav: couldn't get a new route (${(e as Error).message})`);
+    } finally {
+      setRerouting(false);
+    }
+  };
+
+  // Each batch of GPS points from the recording drive.
+  const navFeed = (pts: Point[]) => {
+    const nav = navRef.current;
+    if (!nav) return;
+    const p = pts[pts.length - 1];
+    if (p.accuracy != null && p.accuracy > 50) return;
+    const prev = navLastFixRef.current;
+    const dt = prev ? (p.timestamp - prev.timestamp) / 1000 : 0;
+    const speed = prev && dt >= 1 && dt < 30 ? distanceMeters(prev, p) / dt : null;
+    navLastFixRef.current = p;
+    const u = nav.update([p.latitude, p.longitude], speed, p.accuracy ?? null);
+    setNavUpdate(u);
+    if (u.say) say(u.say);
+    if (u.offRoute) reroute([p.latitude, p.longitude]).catch(() => undefined);
+    if (u.arrived) {
+      addLog('sat-nav: arrived');
+      setTimeout(() => {
+        if (navRef.current === nav) endNavigation();
+      }, 8000);
+    }
+  };
+  const navFeedRef = useRef(navFeed);
+  navFeedRef.current = navFeed;
+
+  const toggleMute = () => {
+    const m = !mutedRef.current;
+    mutedRef.current = m;
+    setMuted(m);
+    if (m) NavKit.stopSpeaking();
+    store.setMeta('nav_muted', m ? '1' : '0').catch(() => undefined);
+  };
+
+  // ---------- Spotify (v0.16) ----------
+
+  const spotifyOnRef = useRef(false);
+  // Reconnects with the saved sign-in, without leaving the app.
+  const spotifyQuiet = async () => {
+    if (!spotifyOnRef.current || !Spotify.available()) return;
+    try {
+      if (await Spotify.configure()) await Spotify.connect();
+    } catch {
+      // shows "Connect Spotify"
+    }
+  };
+  const spotifyQuietRef = useRef(spotifyQuiet);
+  spotifyQuietRef.current = spotifyQuiet;
+  // The bar's "Connect": reconnect, or sign in via the Spotify app.
+  const spotifyConnect = async () => {
+    try {
+      const hasToken = await Spotify.configure();
+      if (hasToken && spotify.error === undefined && (await Spotify.connect())) return;
+      setSpotify((prev) => ({ ...prev, error: undefined }));
+      const installed = await Spotify.authorize();
+      if (!installed) setNote("Spotify isn't installed on this phone.");
+    } catch (e) {
+      setNote(`Spotify: ${(e as Error).message}`);
+    }
+  };
+  const setSpotifyEnabled = async (on: boolean) => {
+    spotifyOnRef.current = on;
+    setSpotifyOn(on);
+    await store.setMeta('spotify_on', on ? '1' : '0');
+    if (on) {
+      if (!Spotify.available()) {
+        setNote('Spotify needs the latest app build.');
+        return;
+      }
+      const hasToken = await Spotify.configure();
+      if (hasToken) await Spotify.connect();
+      else await spotifyConnect();
+    } else {
+      await Spotify.disconnect();
+      setSpotify({ connected: false });
+    }
+  };
+
+  useEffect(
+    () =>
+      Spotify.onState((e) =>
+        setSpotify((prev) => {
+          if (e.image !== undefined && e.imageId !== prev.imageId) return prev; // artwork for an earlier song
+          const next = { ...prev, ...e };
+          if (e.imageId !== undefined && e.imageId !== prev.imageId && e.image === undefined) next.image = undefined;
+          if (e.connected) next.error = e.error;
+          return next;
+        })
+      ),
+    []
+  );
+
+  // Spotify sends you back to tarmacked://spotify-callback after signing in.
+  useEffect(() => {
+    const handle = (url: string | null) => {
+      if (!url || !Spotify.isCallback(url)) return;
+      Spotify.configure()
+        .then(() => Spotify.handleURL(url))
+        .then((r) => {
+          if (r && r !== 'ok') setNote(`Spotify: ${r}`);
+        })
+        .catch(() => undefined);
+    };
+    Linking.getInitialURL().then(handle).catch(() => undefined);
+    const sub = Linking.addEventListener('url', (e) => handle(e.url));
+    return () => sub.remove();
+  }, []);
 
   // ---------- Drives ----------
 
@@ -1959,6 +2331,7 @@ function App() {
 
   const elapsed = tracking ? Date.now() - driveStartRef.current : 0;
   const togglePanel = (p: Panel) => setPanel((cur) => (cur === p ? null : p));
+  const showSpotify = spotifyOn && !editMode && navStage !== 'choose' && navStage !== 'search' && !panel;
 
   return (
     <View style={styles.container}>
@@ -1973,6 +2346,7 @@ function App() {
         followsUserLocation={following && !editMode}
         onPanDrag={() => following && setFollowing(false)}
         onPress={onMapPress}
+        onLongPress={onMapLongPress}
         onRegionChangeComplete={(r: Region) => setVisibleRegion(r)}
       >
         {MAP_TYPES[mapTypeIndex] === 'osm' && (
@@ -2034,6 +2408,49 @@ function App() {
           />
         )}
 
+        {/* Sat-nav: routes to choose from (the chosen one in blue), or the route being driven. */}
+        {navStage === 'choose' &&
+          routeOptions.map((o, i) =>
+            i === chosenRoute ? null : (
+              <Polyline
+                key={`alt-${i}-${baseRev}`}
+                coordinates={toLatLng(o.route.coords)}
+                strokeColor="#7f8b96"
+                strokeWidth={5}
+                lineCap="round"
+                lineJoin="round"
+                zIndex={8}
+                tappable
+                onPress={() => setChosenRoute(i)}
+              />
+            )
+          )}
+        {navStage === 'choose' && routeOptions[chosenRoute] && (
+          <Polyline
+            key={`route-${chosenRoute}-${baseRev}`}
+            coordinates={toLatLng(routeOptions[chosenRoute].route.coords)}
+            strokeColor="#3a8dff"
+            strokeWidth={7}
+            lineCap="round"
+            lineJoin="round"
+            zIndex={9}
+          />
+        )}
+        {navStage === 'driving' && navRoute && (
+          <Polyline
+            key={`nav-${baseRev}`}
+            coordinates={toLatLng(navRoute.coords)}
+            strokeColor="#3a8dff"
+            strokeWidth={7}
+            lineCap="round"
+            lineJoin="round"
+            zIndex={9}
+          />
+        )}
+        {(navStage === 'choose' || navStage === 'driving') && dest && (
+          <Marker coordinate={{ latitude: dest.at[0], longitude: dest.at[1] }} title={dest.name} pinColor="#e5332a" />
+        )}
+
         {/* Most-driven stretch picked from Stats → Roads. */}
         {highlight && drawLayers('hl', [{ chains: highlightChains, color: '#ffffff' }], false, baseRev, '#d0206a', 5)}
 
@@ -2051,7 +2468,22 @@ function App() {
           )}
       </MapView>
 
-      {/* Top bar */}
+      {/* Top bar (the sat-nav banner or search takes its place) */}
+      {navStage === 'driving' && <NavBanner update={navUpdate} rerouting={rerouting} />}
+      {navStage === 'search' && (
+        <SearchPanel
+          query={searchQuery}
+          onQuery={setSearchQuery}
+          results={searchResults}
+          searching={searching}
+          onPick={(p) => chooseDestination({ name: p.name || p.subtitle || 'Destination', at: [p.lat, p.lon] }).catch(() => undefined)}
+          onClose={() => {
+            Keyboard.dismiss();
+            setNavStage('off');
+          }}
+        />
+      )}
+      {(navStage === 'off' || navStage === 'choose') && (
       <View style={styles.topBar}>
         <View style={styles.topGroup}>
           <Pressable
@@ -2069,6 +2501,11 @@ function App() {
           <Pressable style={[styles.chip, panel === 'dev' && styles.chipActive]} onPress={() => togglePanel('dev')}>
             <Text style={styles.chipText}>⚙</Text>
           </Pressable>
+          {NavKit.available() && !editMode && navStage === 'off' && (
+            <Pressable style={styles.chip} onPress={openSearch}>
+              <Text style={styles.chipText}>Go</Text>
+            </Pressable>
+          )}
         </View>
         <View style={styles.topGroup}>
           <Pressable style={[styles.chip, heatOn && styles.chipHeat]} onPress={() => setHeatOn((v) => !v)}>
@@ -2086,9 +2523,10 @@ function App() {
           </Pressable>
         </View>
       </View>
+      )}
 
       {/* Heatmap legend, and the picked most-driven stretch */}
-      {(heatOn || highlight) && !panel && !editMode && (
+      {(heatOn || highlight) && !panel && !editMode && navStage === 'off' && (
         <View style={styles.heatBar}>
           {heatOn && (
             <View style={styles.legendRow}>
@@ -2112,11 +2550,11 @@ function App() {
 
       {/* Messages */}
       {recheckProgress !== null ? (
-        <View style={styles.toast}>
+        <View style={[styles.toast, showSpotify && { bottom: 172 }]}>
           <Text style={styles.toastText}>Re-checking your drives… {Math.round(recheckProgress * 100)}%</Text>
         </View>
       ) : note ? (
-        <Pressable style={styles.toast} onPress={() => setNote('')}>
+        <Pressable style={[styles.toast, showSpotify && { bottom: 172 }]} onPress={() => setNote('')}>
           <Text style={styles.toastText}>{note}</Text>
         </Pressable>
       ) : null}
@@ -2386,6 +2824,31 @@ function App() {
               </View>
             )}
             <Text style={styles.diagText}>{Motion.diagnostics()}</Text>
+            <View style={[styles.settingRow, { marginTop: 16 }]}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.panelTitle}>Spotify controls (beta)</Text>
+                <Text style={styles.small}>
+                  What's playing, with play / pause / skip on the map. Needs the Spotify app and a Premium account that's been added to
+                  tarmacked's Spotify developer app.
+                </Text>
+              </View>
+              <Switch
+                value={spotifyOn}
+                onValueChange={(on: boolean) => setSpotifyEnabled(on).catch(() => undefined)}
+                trackColor={{ true: '#2f6f3a', false: '#333' }}
+              />
+            </View>
+            {spotifyOn && spotify.connected && (
+              <Pressable
+                style={[styles.smallButton, { alignSelf: 'flex-start', marginTop: 8 }]}
+                onPress={async () => {
+                  await Spotify.signOut();
+                  setSpotify({ connected: false });
+                }}
+              >
+                <Text style={styles.chipText}>Sign out of Spotify</Text>
+              </Pressable>
+            )}
             <Text style={[styles.panelTitle, { marginTop: 16 }]}>GPS accuracy</Text>
             <View style={[styles.row, { marginTop: 0 }]}>
               {ACCURACY_MODES.map((m) => (
@@ -2497,10 +2960,32 @@ function App() {
               </Pressable>
             </View>
           </View>
-          <Pressable style={[styles.mainButton, styles.buttonBlue]} onPress={() => setEditMode(false)}>
-            <Text style={styles.buttonText}>Done</Text>
-          </Pressable>
+          <View style={{ gap: 6 }}>
+            <Pressable
+              style={[styles.smallButton, editHistory.length === 0 && { opacity: 0.4 }]}
+              onPress={undoEdit}
+              disabled={editHistory.length === 0}
+            >
+              <Text style={styles.chipText}>↶ Undo{editHistory.length > 1 ? ` (${editHistory.length})` : ''}</Text>
+            </Pressable>
+            <Pressable style={[styles.mainButton, styles.buttonBlue]} onPress={() => setEditMode(false)}>
+              <Text style={styles.buttonText}>Done</Text>
+            </Pressable>
+          </View>
         </View>
+      ) : navStage === 'choose' && dest ? (
+        <RouteChooser
+          destName={dest.name}
+          options={routeOptions}
+          chosen={chosenRoute}
+          loading={routesLoading}
+          error={routeError}
+          onChoose={setChosenRoute}
+          onGo={() => startNavigation().catch(() => undefined)}
+          onCancel={cancelRoutes}
+        />
+      ) : navStage === 'driving' ? (
+        <NavFooter update={navUpdate} muted={muted} onMute={toggleMute} onEnd={endNavigation} newM={tracking ? driveNewMRef.current : 0} />
       ) : (
         <View style={styles.bottomBar}>
           <View style={{ flex: 1 }}>
@@ -2537,6 +3022,18 @@ function App() {
                 : ACCURACY_MODES.find((m) => m.key === accuracyMode)?.label}
             </Text>
           </Pressable>
+        </View>
+      )}
+
+      {showSpotify && (
+        <View style={styles.spotifyWrap}>
+          <SpotifyBar
+            state={spotify}
+            onConnect={() => spotifyConnect().catch(() => undefined)}
+            onPrevious={Spotify.previous}
+            onToggle={() => (spotify.paused ? Spotify.play() : Spotify.pause())}
+            onNext={Spotify.next}
+          />
         </View>
       )}
 
@@ -2779,6 +3276,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   recentreText: { color: '#6aa9ff', fontSize: 24, fontWeight: '700' },
+  spotifyWrap: { position: 'absolute', left: 12, right: 76, bottom: 116 },
 
   bottomBar: {
     position: 'absolute',

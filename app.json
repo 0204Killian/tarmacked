@@ -2,7 +2,7 @@
   "expo": {
     "name": "tarmacked",
     "slug": "tarmacked",
-    "version": "0.15.2",
+    "version": "0.16.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "ios": {
@@ -11,9 +11,13 @@
         "NSLocationWhenInUseUsageDescription": "tarmacked needs your location to record the roads you drive.",
         "NSLocationAlwaysAndWhenInUseUsageDescription": "tarmacked uses your location in the background to keep recording while your phone is locked and, if you turn on auto-detect, to notice when you set off.",
         "UIBackgroundModes": [
-          "location"
+          "location",
+          "audio"
         ],
-        "NSMotionUsageDescription": "tarmacked uses Motion & Fitness to tell when you're driving, so it can record drives you forget to start."
+        "NSMotionUsageDescription": "tarmacked uses Motion & Fitness to tell when you're driving, so it can record drives you forget to start.",
+        "LSApplicationQueriesSchemes": [
+          "spotify"
+        ]
       }
     },
     "plugins": [
@@ -42,6 +46,7 @@
         }
       ]
     ],
-    "backgroundColor": "#0f1311"
+    "backgroundColor": "#0f1311",
+    "scheme": "tarmacked"
   }
 }

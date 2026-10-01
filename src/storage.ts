@@ -328,6 +328,55 @@ export async function removeDriven(id: string) {
   await write((db) => db.runAsync('DELETE FROM driven WHERE id = ?', [id]));
 }
 
+export type DrivenRow = { id: string; shape: Shape | null; firstAt: number; county: number | null };
+
+// Un-marking by hand (v0.16): removes these pieces and returns them as they
+// were, so the edit can be undone exactly (same shape, same first-driven time).
+export async function removeDrivenPieces(ids: string[]): Promise<DrivenRow[]> {
+  if (ids.length === 0) return [];
+  return write(async (db) => {
+    const out: DrivenRow[] = [];
+    for (const id of ids) {
+      const r = await db.getFirstAsync<{ id: string; shape: string | null; first_at: number; county: number | null }>(
+        'SELECT id, shape, first_at, county FROM driven WHERE id = ?',
+        [id]
+      );
+      if (!r) continue;
+      out.push({ id: r.id, shape: r.shape ? (JSON.parse(r.shape) as Shape) : null, firstAt: r.first_at, county: r.county });
+      await db.runAsync('DELETE FROM driven WHERE id = ?', [id]);
+    }
+    return out;
+  });
+}
+
+// Undo of an un-mark: the pieces go back exactly as they were.
+export async function restoreDriven(rows: DrivenRow[]) {
+  if (rows.length === 0) return;
+  await write(async (db) => {
+    await bulk(
+      db,
+      'INSERT OR REPLACE INTO driven (id, shape, first_at, county) VALUES (?, ?, ?, ?)',
+      rows.map((r) => [r.id, r.shape ? JSON.stringify(r.shape) : null, r.firstAt, r.county])
+    );
+  });
+}
+
+// The time a road was un-marked by hand, or null if it isn't.
+export async function getUnmarked(id: string): Promise<number | null> {
+  const db = await getDb();
+  const r = await db.getFirstAsync<{ at: number }>('SELECT at FROM unmarked WHERE id = ?', [id]);
+  return r ? r.at : null;
+}
+
+// Sets (or with null, clears) a road's un-marked time — for undo.
+export async function setUnmarked(id: string, at: number | null) {
+  await write((db) =>
+    at === null
+      ? db.runAsync('DELETE FROM unmarked WHERE id = ?', [id])
+      : db.runAsync('INSERT OR REPLACE INTO unmarked (id, at) VALUES (?, ?)', [id, at])
+  );
+}
+
 export async function setExcluded(id: string, excluded: boolean, county: number | null = null, lengthM: number | null = null) {
   await write((db) =>
     excluded

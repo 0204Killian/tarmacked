@@ -9,3 +9,5 @@ tsc --target es2020 --module commonjs --strict --skipLibCheck --outDir "$OUT" sr
 node test/background.test.js "$OUT" | grep -E "^FAIL|ALL PASS|SOME FAILED"
 tsc --target es2020 --module commonjs --strict --skipLibCheck --outDir "$OUT" src/storage.ts test/stubs.d.ts
 node --no-warnings test/storage.test.js "$OUT" | grep -E "^FAIL|ALL PASS|SOME FAILED"
+tsc --target es2020 --module commonjs --strict --outDir "$OUT" test/nav.test.ts
+node "$OUT/test/nav.test.js" | grep -E "^FAIL|ALL PASS|SOME FAILED"

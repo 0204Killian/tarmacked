@@ -10,9 +10,10 @@ declare module 'react' {
 }
 declare module 'react-native' {
   export const StyleSheet: { create<T>(s: T): T };
-  export const Text: any, View: any, Pressable: any, ScrollView: any, ActivityIndicator: any, Image: any, Switch: any;
+  export const Text: any, View: any, Pressable: any, ScrollView: any, ActivityIndicator: any, Image: any, Switch: any, TextInput: any;
+  export const Keyboard: { dismiss(): void };
   export const AppState: { currentState: string; addEventListener(t: 'change', cb: (s: 'active' | 'background' | 'inactive') => void): { remove(): void } };
-  export const Linking: { openSettings(): Promise<void>; openURL(u: string): Promise<void> };
+  export const Linking: { openSettings(): Promise<void>; openURL(u: string): Promise<void>; getInitialURL(): Promise<string | null>; addEventListener(t: 'url', cb: (e: { url: string }) => void): { remove(): void } };
   export const Animated: any;
   export const Easing: any;
   export const Dimensions: { get(w: 'window'): { width: number; height: number } };
@@ -22,7 +23,8 @@ declare module 'react-native-maps' {
   export type MapType = 'standard' | 'satellite' | 'hybrid';
   export type MapPressEvent = { nativeEvent: { coordinate: { latitude: number; longitude: number } } };
   export default class MapView { animateToRegion(r: Region, ms?: number): void; animateCamera(c: any, o?: any): void; fitToCoordinates(c: any[], o?: any): void; }
-  export const Polyline: any, LocalTile: any, UrlTile: any, PROVIDER_DEFAULT: any;
+  export const Polyline: any, LocalTile: any, UrlTile: any, PROVIDER_DEFAULT: any, Marker: any;
+  export type LongPressEvent = { nativeEvent: { coordinate: { latitude: number; longitude: number } } };
 }
 declare module 'expo-location' {
   export type LocationObject = { coords: { latitude: number; longitude: number; accuracy: number | null; speed?: number | null }; timestamp: number };

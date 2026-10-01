@@ -103,6 +103,21 @@ function check(name, ok, info = '') { results.push(ok); console.log(`${ok ? 'PAS
   const counts = await old.loadRoadCounts();
   check('heatmap: up-and-back (2) plus another drive (1) = 3', counts.get('way/x#0') === 3, JSON.stringify([...counts]));
 
+  // Undo for un-marking (v0.16): pieces come back exactly, un-mark cleared.
+  await old.applyRecheck([{ id: 'way/u#0~0-40', shape: [[1, 2], [1.1, 2]], county: 3 }, { id: 'way/u#0~40-90', shape: null, county: 3 }], [], false);
+  const firstBefore = (await old.loadDrivenFirstAt()).get('way/u#0~0-40');
+  const removed = await old.removeDrivenPieces(['way/u#0~0-40', 'way/u#0~40-90', 'way/nope#0']);
+  await old.markUnmarked('way/u#0');
+  const goneOk = removed.length === 2 && !(await old.loadDrivenFirstAt()).has('way/u#0~0-40');
+  await old.restoreDriven(removed);
+  await old.setUnmarked('way/u#0', null);
+  const back = await old.loadDrivenFirstAt();
+  check('undo un-mark: pieces back with their shape and first-driven time, un-mark cleared',
+    goneOk && back.get('way/u#0~0-40') === firstBefore && back.has('way/u#0~40-90') && (await old.getUnmarked('way/u#0')) === null &&
+    JSON.stringify(removed[0].shape) === '[[1,2],[1.1,2]]');
+  await old.setUnmarked('way/u#0', 1234);
+  check('undo restores an older un-mark time', (await old.getUnmarked('way/u#0')) === 1234);
+
   // Bulk writes go through the synchronous path, all-or-nothing.
   syncCalls.n = 0;
   const many = new Map([[1, new Map(Array.from({ length: 5000 }, (_, i) => [`way/${i}#0`, 1]))]]);
