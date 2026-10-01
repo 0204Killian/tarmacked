@@ -19,13 +19,19 @@
 //    app. If you were parked 15+ minutes, the old drive has ended
 //    (trimmed back to where you stopped) and, with auto-detect on, a new
 //    one starts.
+//  - Leaving the fence on foot (walking to the car) starts a quiet trial:
+//    GPS runs for up to 4 minutes, and only becomes a drive once you're
+//    moving at car speed. Otherwise it's thrown away without a trace.
+//  - Whenever no drive is recording and auto-detect is on, a fence is kept
+//    around where you are (ensureFence) — without one, nothing would ever
+//    wake the app again.
 
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
 import * as Notifications from 'expo-notifications';
 import * as store from './storage';
 import * as Motion from '../modules/motion-activity';
-import { Watch, newWatch, updateWatch, hasEnded, PROMPT_AFTER_MS, MOVE_RADIUS_M } from './driveWatch';
+import { Watch, newWatch, updateWatch, hasEnded, trialStep, PROMPT_AFTER_MS, MOVE_RADIUS_M, TRIAL_MS } from './driveWatch';
 import { distanceMeters } from './geo';
 
 export const LOCATION_TASK = 'tarmacked-background-location';
@@ -108,12 +114,20 @@ async function currentMode(): Promise<Mode> {
 // --- location updates ---
 
 export async function startUpdates(mode: Mode) {
+  // iOS pauses GPS by itself once you've been parked a while (saves
+  // battery if a drive is never stopped) — and only the wake-up fence can
+  // resume it. The fence needs "Always" location; without it, a long stop
+  // in traffic would end the recording, so GPS is never paused then.
+  let canResume = false;
+  try {
+    canResume = (await Location.getBackgroundPermissionsAsync()).status === 'granted';
+  } catch {
+    // assume not
+  }
   await Location.startLocationUpdatesAsync(LOCATION_TASK, {
     ...locationOptions(mode),
     activityType: Location.ActivityType.AutomotiveNavigation,
-    // iOS pauses GPS by itself once you've been parked a while (saves
-    // battery if a drive is never stopped); the wake-up fence resumes it.
-    pausesUpdatesAutomatically: true,
+    pausesUpdatesAutomatically: canResume,
     showsBackgroundLocationIndicator: true,
     foregroundService: { notificationTitle: 'tarmacked is tracking', notificationBody: 'Recording this drive' },
   });
@@ -146,6 +160,7 @@ async function setFence(at: [number, number]): Promise<boolean> {
     await Location.startGeofencingAsync(GEOFENCE_TASK, [
       { identifier: FENCE_ID, latitude: at[0], longitude: at[1], radius: FENCE_RADIUS_M, notifyOnEnter: false, notifyOnExit: true },
     ]);
+    await store.setMeta('fence_at', JSON.stringify(at));
     return true;
   } catch (e) {
     log(`fence failed: ${(e as Error).message}`);
@@ -159,16 +174,63 @@ export async function clearFence() {
   } catch {
     // none set
   }
+  await store.setMeta('fence_at', '').catch(() => undefined);
+}
+
+// Where you are: a recent fix if there is one, else a fresh one (up to 8 s).
+async function hereNow(): Promise<[number, number] | null> {
+  try {
+    const last = await Location.getLastKnownPositionAsync({ maxAge: 2 * 60_000 });
+    if (last) return [last.coords.latitude, last.coords.longitude];
+  } catch {
+    // try a fresh fix
+  }
+  try {
+    const pos = await Promise.race([
+      Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
+      new Promise<null>((r) => setTimeout(() => r(null), 8000)),
+    ]);
+    if (pos) return [pos.coords.latitude, pos.coords.longitude];
+  } catch {
+    // no fix
+  }
+  return null;
+}
+
+// Makes sure a wake-up fence is set around where you are (auto-detect on,
+// no drive recording). Leaving the fence is the only thing that wakes the
+// app, so if it's missing — or you're already outside it — auto-detect
+// would silently stop working until you next turned it off and on.
+// `fallback`: a position to use if no fix can be had right now.
+export async function ensureFence(fallback: [number, number] | null = null) {
+  if (!(await autoDetectEnabled())) return;
+  if (await loadWatch()) return; // a recording drive moves its own fence
+  const here = (await hereNow()) ?? fallback;
+  if (!here) {
+    log('wake-up fence: no position yet');
+    return;
+  }
+  let fenceAt: [number, number] | null = null;
+  try {
+    const raw = await store.getMeta('fence_at');
+    fenceAt = raw ? (JSON.parse(raw) as [number, number]) : null;
+  } catch {
+    fenceAt = null;
+  }
+  let running = false;
+  try {
+    running = await Location.hasStartedGeofencingAsync(GEOFENCE_TASK);
+  } catch {
+    running = false;
+  }
+  const inside = !!fenceAt && distanceMeters({ latitude: fenceAt[0], longitude: fenceAt[1] }, { latitude: here[0], longitude: here[1] }) < FENCE_RADIUS_M * 0.6;
+  if (running && inside) return;
+  if (await setFence(here)) log(running ? 'wake-up fence moved to where you are' : 'wake-up fence set');
 }
 
 // Puts the fence where you are now (after turning auto-detect on).
 export async function fenceHere() {
-  try {
-    const pos = await Location.getLastKnownPositionAsync();
-    if (pos) await setFence([pos.coords.latitude, pos.coords.longitude]);
-  } catch {
-    // no position yet: set on the next drive
-  }
+  await ensureFence();
 }
 
 // --- notifications ---
@@ -207,6 +269,7 @@ async function cancelPrompt() {
 // time you move.
 async function schedulePrompt(w: Watch) {
   await cancelPrompt();
+  if (w.trial) return; // not a drive yet
   const km = (w.distanceM / 1000).toFixed(1);
   const askToSave = w.auto && !w.confirmed;
   if (askToSave && w.distanceM < MIN_AUTO_DRIVE_M) return;
@@ -236,13 +299,24 @@ async function schedulePrompt(w: Watch) {
 
 // --- drives ---
 
-async function beginDrive(auto: boolean, at: number, where: [number, number] | null): Promise<Watch> {
+async function beginDrive(auto: boolean, at: number, where: [number, number] | null, trial = false): Promise<Watch> {
   const driveId = await store.startDrive(at, auto);
   const w = newWatch(driveId, auto, at, where);
+  if (trial) w.trial = { until: at + TRIAL_MS, ref: null, fast: 0 };
   await saveWatch(w);
-  log(`drive ${driveId} started (${auto ? 'auto-detected' : 'Start pressed'})`);
-  emit({ type: 'started', driveId });
+  log(`drive ${driveId} started (${trial ? 'left on foot: waiting for car speed' : auto ? 'auto-detected' : 'Start pressed'})`);
+  if (!trial) emit({ type: 'started', driveId });
   return w;
+}
+
+// A trial that never reached car speed: thrown away, fence re-set.
+async function dropTrial(w: Watch, reason: string) {
+  await stopUpdates();
+  await cancelPrompt();
+  await store.deleteDrive(w.driveId);
+  await saveWatch(null);
+  log(`drive ${w.driveId} dropped (${reason})`);
+  await ensureFence(w.last);
 }
 
 // Ends the drive at its last movement. Auto drives you haven't confirmed
@@ -251,7 +325,7 @@ async function beginDrive(auto: boolean, at: number, where: [number, number] | n
 async function finishDrive(w: Watch, reason: string, opts: { trim: boolean; matched: boolean }): Promise<store.DriveStatus | 'dropped'> {
   await cancelPrompt();
   let status: store.DriveStatus | 'dropped';
-  if (w.auto && !w.confirmed && w.distanceM < MIN_AUTO_DRIVE_M) {
+  if (w.trial || (w.auto && !w.confirmed && w.distanceM < MIN_AUTO_DRIVE_M)) {
     await store.deleteDrive(w.driveId);
     status = 'dropped';
   } else {
@@ -259,11 +333,12 @@ async function finishDrive(w: Watch, reason: string, opts: { trim: boolean; matc
     status = w.auto && !w.confirmed ? 'pending' : 'done';
     await store.setDriveStatus(w.driveId, status, opts.trim ? w.lastMoveAt : w.lastT);
     if (!opts.matched) await store.setDriveDistance(w.driveId, w.distanceM);
-    if (status === 'done' && !opts.matched) await store.setMeta('recheck_pending', '1');
+    // Matched on its own next time the app is open (not a full re-check).
+    if (status === 'done' && !opts.matched) await store.queueMatch(w.driveId);
   }
   await saveWatch(null);
   if (await autoDetectEnabled()) {
-    if (w.anchor[0] !== 0) await setFence(w.anchor);
+    if (!(w.anchor[0] !== 0 && (await setFence(w.anchor)))) await ensureFence(w.last);
   } else {
     await clearFence();
   }
@@ -323,7 +398,7 @@ export function discardDrive() {
     await store.deleteDrive(w.driveId);
     await saveWatch(null);
     if (await autoDetectEnabled()) {
-      if (w.last) await setFence(w.last);
+      if (!(w.last && (await setFence(w.last)))) await ensureFence();
     } else await clearFence();
     log(`drive ${w.driveId} deleted while recording`);
     emit({ type: 'ended', driveId: w.driveId });
@@ -342,11 +417,17 @@ export function settle(): Promise<'none' | 'recording' | 'ended'> {
       const rec = await store.getRecordingDrive();
       if (rec) {
         await store.setDriveStatus(rec.id, rec.auto ? 'pending' : 'done', rec.lastT ?? rec.startedAt);
-        if (!rec.auto) await store.setMeta('recheck_pending', '1');
+        if (!rec.auto) await store.queueMatch(rec.id);
         log(`drive ${rec.id} was left recording: closed`);
+        await ensureFence();
         return 'ended';
       }
+      await ensureFence();
       return 'none';
+    }
+    if (w.trial && Date.now() >= w.trial.until) {
+      await dropTrial(w, 'no car speed after leaving on foot');
+      return 'ended';
     }
     if (hasEnded(w, Date.now())) {
       await stopUpdates();
@@ -391,6 +472,22 @@ export function onPoints(newPoints: store.StoredPoint[]) {
       points = points.filter((p) => p.timestamp >= away.timestamp);
     }
     await store.addPoints(w.driveId, points);
+    if (w.trial) {
+      const r = trialStep(w, points, Date.now());
+      if (r.state === 'over') {
+        await dropTrial(w, 'no car speed after leaving on foot');
+        return;
+      }
+      if (r.state === 'driving') {
+        // A drive after all: keep it from just before you got going (the
+        // walk to the car isn't part of it) and show it.
+        w.trial = undefined;
+        if (r.from !== undefined) await store.trimDriveStart(w.driveId, r.from);
+        w.distanceM = 0;
+        log(`drive ${w.driveId}: car speed — recording`);
+        emit({ type: 'started', driveId: w.driveId });
+      }
+    }
     const moved = updateWatch(w, points);
     if (moved && w.lastMoveAt - w.promptFor > 30_000) {
       w.promptFor = w.lastMoveAt;
@@ -438,18 +535,17 @@ function onFenceExit() {
     } catch {
       // unknown
     }
-    if (onFoot) {
-      if (where) await setFence(where);
-      log('left the fence on foot: not a drive');
-      return;
-    }
-    const drive = await beginDrive(true, now, where);
+    // On foot (often just walking to the car — the motion chip takes a
+    // minute or so to notice you're driving): GPS runs quietly for a few
+    // minutes and it only becomes a drive once you're moving at car speed.
+    const drive = await beginDrive(true, now, where, onFoot);
     try {
       await startUpdates(await currentMode());
     } catch (e) {
       log(`couldn't start GPS for an auto drive: ${(e as Error).message}`);
       await store.deleteDrive(drive.driveId);
       await saveWatch(null);
+      await ensureFence(where);
     }
   });
 }
@@ -464,7 +560,13 @@ TaskManager.defineTask(LOCATION_TASK, async ({ data, error }) => {
   const { locations } = (data ?? {}) as { locations?: Location.LocationObject[] };
   if (!locations || locations.length === 0) return;
   await onPoints(
-    locations.map((l) => ({ latitude: l.coords.latitude, longitude: l.coords.longitude, timestamp: l.timestamp, accuracy: l.coords.accuracy ?? null }))
+    locations.map((l) => ({
+      latitude: l.coords.latitude,
+      longitude: l.coords.longitude,
+      timestamp: l.timestamp,
+      accuracy: l.coords.accuracy ?? null,
+      speed: l.coords.speed ?? null, // not stored; used to tell walking from driving
+    }))
   );
 });
 

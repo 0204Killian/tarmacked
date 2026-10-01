@@ -16,7 +16,8 @@ const fake = {
     updates: false, fences: null, lastKnown: null, bgPerm: 'granted', starts: 0,
     Accuracy: { BestForNavigation: 6, High: 4, Balanced: 3 }, ActivityType: { AutomotiveNavigation: 2 },
     GeofencingEventType: { Enter: 1, Exit: 2 },
-    async startLocationUpdatesAsync() { fake.location.updates = true; fake.location.starts++; },
+    lastOpts: null,
+    async startLocationUpdatesAsync(_t, o) { fake.location.updates = true; fake.location.starts++; fake.location.lastOpts = o; },
     async stopLocationUpdatesAsync() { fake.location.updates = false; },
     async hasStartedLocationUpdatesAsync() { return fake.location.updates; },
     async getBackgroundPermissionsAsync() { return { status: fake.location.bgPerm, canAskAgain: true }; },
@@ -24,6 +25,7 @@ const fake = {
     async stopGeofencingAsync() { fake.location.fences = null; },
     async hasStartedGeofencingAsync() { return !!fake.location.fences; },
     async getLastKnownPositionAsync() { return fake.location.lastKnown ? { coords: { latitude: fake.location.lastKnown[0], longitude: fake.location.lastKnown[1] } } : null; },
+    async getCurrentPositionAsync() { return fake.location.lastKnown ? { coords: { latitude: fake.location.lastKnown[0], longitude: fake.location.lastKnown[1] } } : null; },
   },
   tm: { defineTask(name, fn) { tasks[name] = fn; } },
   notif: {
@@ -49,6 +51,8 @@ const store = {
   async setDriveDistance(id, m) { const d = db.drives.get(id); if (d) d.distanceM = m; },
   async deleteDrive(id) { db.drives.delete(id); db.points.delete(id); },
   async getRecordingDrive() { const d = [...db.drives.values()].find((x) => x.status === 'recording'); return d ? { id: d.id, startedAt: d.startedAt, auto: d.auto, lastT: null } : null; },
+  async queueMatch(id) { const q = JSON.parse(db.meta.match_queue || '[]'); if (!q.includes(id)) q.push(id); db.meta.match_queue = JSON.stringify(q); },
+  async trimDriveStart(id, t) { db.points.set(id, db.points.get(id).filter((p) => p.timestamp >= t)); },
   async deleteStalePending(ms) { let n = 0; for (const d of [...db.drives.values()]) if (d.status === 'pending' && d.startedAt < now - ms) { db.drives.delete(d.id); n++; } return n; },
 };
 const origLoad = Module._load;
@@ -61,19 +65,22 @@ Module._load = function (req, parent, isMain) {
   return origLoad.apply(this, arguments);
 };
 const bg = require(path.join(OUT, 'src/background.js'));
+const events = [];
+bg.onChange((e) => events.push(e));
+const queued = () => JSON.parse(db.meta.match_queue || '[]');
 
 // ---- helpers ----
 const M_LAT = 111320, M_LON = 111320 * Math.cos((53 * Math.PI) / 180);
 const at = (x, y) => [53 + y / M_LAT, -7.3 + x / M_LON]; // metres east/north of a fixed point
-async function gps(x, y) {
+async function gps(x, y, speed = null) {
   const [la, lo] = at(x, y);
   fake.location.lastKnown = [la, lo];
-  await tasks[bg.LOCATION_TASK]({ data: { locations: [{ coords: { latitude: la, longitude: lo, accuracy: 5 }, timestamp: now }] } });
+  await tasks[bg.LOCATION_TASK]({ data: { locations: [{ coords: { latitude: la, longitude: lo, accuracy: 5, speed }, timestamp: now }] } });
 }
 // Drive east at `speed` m/s for `metres`, a point every 2 s.
 async function driveEast(fromX, metres, speed = 20) {
   let x = fromX;
-  while (x < fromX + metres) { now += 2000; x += speed * 2; await gps(x, 0); }
+  while (x < fromX + metres) { now += 2000; x += speed * 2; await gps(x, 0, speed); }
   return x;
 }
 let jseed = 7;
@@ -84,7 +91,7 @@ async function park(x, minutes) {
 async function fenceExit() { await tasks[bg.GEOFENCE_TASK]({ data: { eventType: 2 } }); }
 function reset() {
   db.meta = {}; db.drives.clear(); db.points.clear(); db.log = []; db.nextId = 1;
-  fake.location.updates = false; fake.location.fences = null; fake.location.starts = 0; fake.notif.scheduled.clear(); fake.notif.log = []; fake.motion.acts = [];
+  fake.location.updates = false; fake.location.fences = null; fake.location.starts = 0; fake.location.bgPerm = 'granted'; fake.location.lastOpts = null; fake.notif.scheduled.clear(); fake.notif.log = []; fake.motion.acts = []; events.length = 0;
 }
 const results = [];
 function check(name, ok, info = '') { results.push(ok); console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${info ? `\n      ${info}` : ''}`); }
@@ -108,7 +115,7 @@ const onlyDrive = () => [...db.drives.values()][0];
   const d = onlyDrive();
   const lastPt = db.points.get(1).slice(-1)[0];
   check('manual: ended once parked 15+ min, trimmed back to the stop', r === 'ended' && d.status === 'done' && Math.abs(d.endedAt - stopAt) < 3000 && lastPt.timestamp <= stopAt && !fake.location.updates, `status ${d.status}, end ${(d.endedAt - stopAt) / 1000}s from stop`);
-  check('manual: forgotten drive gets re-checked', db.meta.recheck_pending === '1');
+  check('manual: forgotten drive queued for matching (no full re-check)', queued().join() === '1' && !db.meta.recheck_pending);
 
   // 2. Stopping at lights/traffic for 8 minutes doesn't end the drive.
   reset();
@@ -132,16 +139,50 @@ const onlyDrive = () => [...db.drives.values()][0];
   check('auto: "Save this drive?" due 5 min after parking, with the distance', p3 && p3.content.title === 'Save this drive?' && /[78]\.\d km/.test(p3.content.body) && Math.abs(p3.at - (autoStop + 5 * 60000)) < 35000, p3 && p3.content.body);
   await park(x, 16);
   await bg.settle();
-  check('auto: unanswered, ends as pending (not counted), distance saved', onlyDrive().status === 'pending' && onlyDrive().distanceM > 7900 && !db.meta.recheck_pending);
+  check('auto: unanswered, ends as pending (not counted), distance saved', onlyDrive().status === 'pending' && onlyDrive().distanceM > 7900 && !db.meta.recheck_pending && queued().length === 0);
   check('auto: wake-up fence left where you parked', fake.location.fences && Math.abs(fake.location.fences[0].longitude - at(x, 0)[1]) < 0.001);
 
-  // 4. Walking out of the fence isn't a drive.
+  // 4. Walking out of the fence: a quiet trial that's thrown away when you
+  //    never reach car speed (a walk to the shop).
   reset();
   db.meta.autodetect = '1';
   fake.location.lastKnown = at(200, 0);
-  fake.motion.acts = [{ start: now - 60000, automotive: false, walking: true, running: false, cycling: false, stationary: false, unknown: false, confidence: 2 }];
+  const walking = [{ start: now - 60000, automotive: false, walking: true, running: false, cycling: false, stationary: false, unknown: false, confidence: 2 }];
+  fake.motion.acts = walking;
   await fenceExit();
-  check('auto: walking out of the fence starts nothing', db.drives.size === 0 && !fake.location.updates && !!fake.location.fences);
+  check('auto: walking out of the fence starts a quiet trial (GPS on, nothing shown)', db.drives.size === 1 && fake.location.updates && events.length === 0, `drives ${db.drives.size} updates ${fake.location.updates} events ${events.length}`);
+  let wx = 200;
+  for (let i = 0; i < 150 && db.drives.size; i++) { now += 2000; wx += 2.8; await gps(wx, 0, 1.4); } // walk until the trial gives up (4 min)
+  check('auto: walk never reaches car speed: dropped, GPS off, no prompt', db.drives.size === 0 && !fake.location.updates && !fake.notif.log.length && !(await bg.currentWatch()), `drives ${db.drives.size} log ${db.log.join(' / ')}`);
+  check('auto: after a dropped walk, the fence is around where you are', fake.location.fences && Math.abs(fake.location.fences[0].longitude - at(wx, 0)[1]) < 0.0005);
+
+  // 4b. Walking to the car (motion still says walking when the fence is
+  //     crossed), then driving off: becomes a drive, minus the walk.
+  reset();
+  db.meta.autodetect = '1';
+  fake.location.lastKnown = at(0, 0);
+  fake.motion.acts = walking;
+  await fenceExit();
+  wx = 0;
+  for (let i = 0; i < 40; i++) { now += 2000; wx += 2.8; await gps(wx, 0, 1.4); } // 80 s walk
+  const walkEnd = now;
+  x = await driveEast(wx, 3000);
+  const d4b = onlyDrive();
+  const pts4b = db.points.get(d4b.id);
+  check('auto: on-foot start then car speed = an auto drive', d4b.auto && d4b.status === 'recording' && events.some((e) => e.type === 'started') && !(await bg.currentWatch()).trial);
+  check('auto: the walk to the car is trimmed off', pts4b[0].timestamp >= walkEnd - 20000 && pts4b.length > 60, `first point ${(pts4b[0].timestamp - walkEnd) / 1000}s from the walk's end, ${pts4b.length} points`);
+  const p4b = fake.notif.scheduled.get(bg.PROMPT_ID);
+  check('auto: on-foot start still asks "Save this drive?" with the drive distance only', p4b && p4b.content.title === 'Save this drive?' && /[23]\.\d km/.test(p4b.content.body), p4b && p4b.content.body);
+
+  // 4c. Trial with no GPS at all (stood still): dropped on the next settle.
+  reset();
+  db.meta.autodetect = '1';
+  fake.location.lastKnown = at(0, 0);
+  fake.motion.acts = walking;
+  await fenceExit();
+  now += 5 * 60000;
+  await bg.settle();
+  check('auto: a trial that hears nothing is dropped on settle', db.drives.size === 0 && !fake.location.updates);
 
   // 5. A "drive" that goes nowhere (motion unsure, GPS wander) is dropped quietly.
   reset();
@@ -166,7 +207,7 @@ const onlyDrive = () => [...db.drives.values()][0];
   check('auto: after Save, the prompt becomes "Still driving?"', fake.notif.scheduled.get(bg.PROMPT_ID).content.title === 'Still driving?');
   await park(x, 16);
   await bg.settle();
-  check('auto: a saved auto drive ends as done (counted)', onlyDrive().status === 'done' && db.meta.recheck_pending === '1');
+  check('auto: a saved auto drive ends as done and is queued for matching', onlyDrive().status === 'done' && queued().join() === String(onlyDrive().id));
 
   // 7. Delete tapped while recording: gone, GPS off.
   reset();
@@ -227,6 +268,35 @@ const onlyDrive = () => [...db.drives.values()][0];
   await gps(x + 300, 0);
   const d12 = db.drives.get(2);
   check('points after a 20 min gap, moving off (auto-detect on): new auto drive', db.drives.get(1).status === 'done' && d12 && d12.auto && d12.status === 'recording' && db.points.get(2).length === 1, `drives ${[...db.drives.values()].map((d) => `${d.id}:${d.status}:${d.auto}`)} pts2 ${db.points.get(2) && db.points.get(2).length} log ${db.log.join(' / ')}`);
+
+  // 13. Self-healing fence: auto-detect on, nothing recording, no fence
+  //     (lost) — settle puts one back where you are.
+  reset();
+  db.meta.autodetect = '1';
+  fake.location.lastKnown = at(0, 0);
+  await bg.settle();
+  check('fence missing: settle sets one where you are', fake.location.fences && Math.abs(fake.location.fences[0].latitude - at(0, 0)[0]) < 1e-6);
+  // ...and if you're already outside it (moved without it firing), it's moved.
+  fake.location.lastKnown = at(1000, 0);
+  await bg.settle();
+  check('outside the fence: settle moves it to you', Math.abs(fake.location.fences[0].longitude - at(1000, 0)[1]) < 1e-6);
+  const before = JSON.stringify(fake.location.fences);
+  fake.location.lastKnown = at(1020, 0);
+  await bg.settle();
+  check('inside the fence: left alone', JSON.stringify(fake.location.fences) === before);
+  db.meta.autodetect = '0';
+  fake.location.fences = null;
+  await bg.settle();
+  check('auto-detect off: no fence set', !fake.location.fences);
+
+  // 14. GPS auto-pause only when the fence can resume it ("Always" location).
+  reset();
+  fake.location.bgPerm = 'denied';
+  await bg.startManualDrive('high');
+  check('"While Using" only: GPS never auto-paused', fake.location.lastOpts && fake.location.lastOpts.pausesUpdatesAutomatically === false);
+  reset();
+  await bg.startManualDrive('high');
+  check('"Always": GPS auto-pause on', fake.location.lastOpts && fake.location.lastOpts.pausesUpdatesAutomatically === true);
 
   console.log(results.every(Boolean) ? '\nALL PASS' : '\nSOME FAILED');
 })();

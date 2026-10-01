@@ -3,7 +3,7 @@
 
 import { distanceMeters } from './geo';
 
-export type WatchPoint = { latitude: number; longitude: number; timestamp: number };
+export type WatchPoint = { latitude: number; longitude: number; timestamp: number; speed?: number | null; accuracy?: number | null };
 
 // A position counts as "moving" once it's this far from where you last were
 // still. GPS wanders a few tens of metres while parked.
@@ -27,7 +27,43 @@ export type Watch = {
   distanceM: number; // driven so far (rough, for notifications)
   fence: [number, number] | null; // centre of the wake-up fence
   promptFor: number; // lastMoveAt the prompt notification was scheduled for
+  // Set while we're not sure it's a drive yet: you left the fence on foot
+  // (walking to the car looks like walking). GPS runs, but nothing is shown
+  // or asked until you're moving at car speed; if that doesn't happen by
+  // `until`, the "drive" is quietly thrown away.
+  trial?: { until: number; ref: { lat: number; lon: number; t: number } | null; fast: number };
 };
+
+// --- on-foot trial ---
+// How long to wait for car speed after leaving the fence on foot.
+export const TRIAL_MS = 4 * 60_000;
+// Car speed: faster than anyone walks or runs, and most cycling.
+export const DRIVING_SPEED_MS = 8; // ~29 km/h
+const TRIAL_SPAN_MS = 10_000; // speed measured over at least this long (GPS jitter)
+
+// Folds new points into a trial. 'driving' = car speed seen (the trial is
+// over and this is a drive); 'over' = time's up without it; 'waiting'.
+// Returns the time the drive should start from when it's 'driving'.
+export function trialStep(w: Watch, points: WatchPoint[], now: number): { state: 'driving' | 'waiting' | 'over'; from?: number } {
+  const tr = w.trial;
+  if (!tr) return { state: 'driving' };
+  for (const p of points) {
+    if (p.accuracy != null && p.accuracy > 30) continue;
+    // The phone's own speed reading (Doppler, good to ~1 m/s): two in a row.
+    if (p.speed != null && p.speed >= DRIVING_SPEED_MS) {
+      tr.fast++;
+      if (tr.fast >= 2) return { state: 'driving', from: (tr.ref?.t ?? p.timestamp) - 15_000 };
+    } else if (p.speed != null) tr.fast = 0;
+    // Or distance over time between fixes at least 10 s apart.
+    if (!tr.ref) tr.ref = { lat: p.latitude, lon: p.longitude, t: p.timestamp };
+    else if (p.timestamp - tr.ref.t >= TRIAL_SPAN_MS) {
+      const v = distanceMeters({ latitude: tr.ref.lat, longitude: tr.ref.lon }, p) / ((p.timestamp - tr.ref.t) / 1000);
+      if (v >= DRIVING_SPEED_MS) return { state: 'driving', from: tr.ref.t - 15_000 };
+      tr.ref = { lat: p.latitude, lon: p.longitude, t: p.timestamp };
+    }
+  }
+  return { state: now >= tr.until ? 'over' : 'waiting' };
+}
 
 export function newWatch(driveId: number, auto: boolean, at: number, where: [number, number] | null): Watch {
   return {

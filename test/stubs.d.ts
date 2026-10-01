@@ -25,7 +25,7 @@ declare module 'react-native-maps' {
   export const Polyline: any, LocalTile: any, UrlTile: any, PROVIDER_DEFAULT: any;
 }
 declare module 'expo-location' {
-  export type LocationObject = { coords: { latitude: number; longitude: number; accuracy: number | null }; timestamp: number };
+  export type LocationObject = { coords: { latitude: number; longitude: number; accuracy: number | null; speed?: number | null }; timestamp: number };
   export type PermissionResponse = { status: 'granted' | 'denied' | 'undetermined'; canAskAgain: boolean };
   export function getForegroundPermissionsAsync(): Promise<PermissionResponse>;
   export function getBackgroundPermissionsAsync(): Promise<PermissionResponse>;
@@ -40,7 +40,7 @@ declare module 'expo-location' {
   export function requestForegroundPermissionsAsync(): Promise<PermissionResponse>;
   export function requestBackgroundPermissionsAsync(): Promise<PermissionResponse>;
   export function getCurrentPositionAsync(o: any): Promise<LocationObject>;
-  export function getLastKnownPositionAsync(): Promise<LocationObject | null>;
+  export function getLastKnownPositionAsync(o?: { maxAge?: number; requiredAccuracy?: number }): Promise<LocationObject | null>;
   export function startLocationUpdatesAsync(n: string, o: any): Promise<void>;
   export function stopLocationUpdatesAsync(n: string): Promise<void>;
   export function watchPositionAsync(o: any, cb: (l: LocationObject) => void): Promise<LocationSubscription>;
@@ -56,7 +56,7 @@ declare module 'expo-file-system' {
 declare module '@react-native-async-storage/async-storage' { const A: { getItem(k: string): Promise<string | null> }; export default A; }
 declare module 'expo-sqlite' {
   export interface SQLiteRunResult { changes: number; lastInsertRowId: number }
-  export interface SQLiteStatement { executeAsync(p: any[]): Promise<any>; finalizeAsync(): Promise<void> }
+  export interface SQLiteStatement { executeAsync(p: any[]): Promise<any>; executeSync(p: any[]): any; finalizeAsync(): Promise<void> }
   export interface SQLiteDatabase {
     execAsync(s: string): Promise<void>; runAsync(s: string, p?: any[]): Promise<SQLiteRunResult>;
     getFirstAsync<T>(s: string, p?: any[]): Promise<T | null>; getAllAsync<T>(s: string, p?: any[]): Promise<T[]>;

@@ -1,4 +1,4 @@
-// Heatmap: how many drives covered each road, as colours and a
+// Heatmap: how many times each road was driven, as colours and a
 // most-driven roads list. Pure logic, so it can be tested on its own.
 
 import { RoadNetwork, baseChunkId, parseChunkId } from './roadMatcher';
@@ -28,7 +28,7 @@ export function heatColorAt(t: number): string {
   return '#e5332a';
 }
 
-// Where a drive count sits on the scale, 0..1. Log scale, so one road
+// Where a count sits on the scale, 0..1. Log scale, so one road
 // driven 200 times (outside home) doesn't turn everything else green.
 export function heatT(count: number, max: number): number {
   if (max <= 1 || count <= 1) return 0;
@@ -45,7 +45,7 @@ export type RoadRank = {
   key: string;
   name: string; // "N77 Kilkenny Road", or "Unnamed road"
   county: number | null;
-  count: number; // drives on its most-driven bit
+  count: number; // times driven, on its most-driven bit
   hotChunks: string[]; // chunks at that count (the most-driven bit)
   hotM: number; // length of the most-driven bit
 };

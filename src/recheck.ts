@@ -6,7 +6,11 @@
 // re-checked — that's what catches the old short stubs at junctions. The
 // catch: a road you drove before trails were saved, and have since only
 // crossed, gets re-checked too and may be removed. Everything removed is
-// kept aside and can be put back from Dev.
+// kept aside in driven_removed.
+//
+// v0.15.2: roads put back by hand (the old "Put back", now gone) no longer
+// get a pass. They were kept whenever a trail ran near them — which is
+// exactly where slip-road stubs sit, so those could never be cleared.
 
 import { RoadNetwork, baseChunkId } from './roadMatcher';
 import { DriveMatcher, GpsFilter, PieceIndex, Point } from './coverage';
@@ -27,8 +31,8 @@ export type RecheckResult = {
   unmatched: Point[];
   // Partly-driven chunks: what's been covered so far, across all drives.
   partials: Map<string, [number, number][]>;
-  // Chunks each drive covered (for the heatmap and showing a drive).
-  driveRoads: Map<number, string[]>;
+  // Chunks each drive covered, and how many times (for the heatmap and showing a drive).
+  driveRoads: Map<number, Map<string, number>>;
 };
 
 // Distance over the points that pass the wild-GPS filter.
@@ -98,8 +102,8 @@ export async function recheckDrives(
   // When each road was first marked, and the time GPS trails were first
   // saved from. A road marked since then has to be earned again by a
   // saved drive; only older roads (no trail to check them against) are
-  // kept as they are. pinned: roads you put back by hand — always kept.
-  history: { firstAt: Map<string, number>; trailsSince: number; pinned: Set<string> } | null = null
+  // kept as they are.
+  history: { firstAt: Map<string, number>; trailsSince: number } | null = null
 ): Promise<RecheckResult> {
   const trail = new TrailIndex([...drives, ...forgottenTrails.map((points, i) => ({ id: -1 - i, startedAt: 0, points }))]);
 
@@ -114,12 +118,6 @@ export async function recheckDrives(
     const s = shape ?? net.shapeOf(id);
     const first = history?.firstAt.get(id);
     const preTrail = !history || first === undefined || first < history.trailsSince;
-    // Put back by hand: kept, unless it was marked since trails began and no
-    // trail goes anywhere near it (then it can't have been driven).
-    if (history?.pinned.has(id) && (preTrail || (!!s && trail.touches(s)))) {
-      driven.add(id);
-      return;
-    }
     // Older than any saved trail and nowhere near one: nothing to check it against.
     if (preTrail && (!s || !trail.touches(s))) {
       driven.add(id);
@@ -137,7 +135,7 @@ export async function recheckDrives(
   const sorted = drives.slice().sort((a, b) => a.startedAt - b.startedAt);
   // Shared by every drive, oldest first, so coverage adds up across drives.
   const partials = new Map<string, [number, number][]>();
-  const driveRoads = new Map<number, string[]>();
+  const driveRoads = new Map<number, Map<string, number>>();
   const index = new PieceIndex(driven);
   // Adds a road piece unless one already covers it; drops pieces it now
   // covers. Returns the metres it adds.
@@ -174,7 +172,7 @@ export async function recheckDrives(
       if (unmarkedAt !== undefined && unmarkedAt >= d.startedAt) return; // you un-marked it after this drive
       newM += addPiece(id);
     });
-    driveRoads.set(d.id, m.roadsCovered());
+    driveRoads.set(d.id, m.roadPasses());
     const last = d.points[d.points.length - 1];
     stats.push({ id: d.id, endedAt: last ? last.timestamp : null, distanceM: driveDistanceMeters(d.points), newM, ignoredN: m.gps.ignored });
   }

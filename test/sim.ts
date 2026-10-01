@@ -209,14 +209,23 @@ all = run('turn onto side street and through', drive([[0, 300], [0, 340], [120, 
     cur.set('way/51#1', net.segs.get('way/51#1')!.coords); // 100m+ from the main-road trail
     const since = pts[0].timestamp;
     const firstAt = new Map([...cur.keys()].map((id) => [id, since + 5000] as [string, number]));
-    const rNew = await recheckDrives(net, [{ id: 1, startedAt: since, points: pts }], cur, new Set(), new Map(), undefined, [], { firstAt, trailsSince: since, pinned: new Set() });
+    const rNew = await recheckDrives(net, [{ id: 1, startedAt: since, points: pts }], cur, new Set(), new Map(), undefined, [], { firstAt, trailsSince: since });
     const firstOld = new Map(firstAt);
     firstOld.set('way/51#1', since - 1000);
-    const rOld = await recheckDrives(net, [{ id: 1, startedAt: since, points: pts }], cur, new Set(), new Map(), undefined, [], { firstAt: firstOld, trailsSince: since, pinned: new Set() });
-    const rPin = await recheckDrives(net, [{ id: 1, startedAt: since, points: pts }], cur, new Set(), new Map(), undefined, [], { firstAt, trailsSince: since, pinned: new Set(['way/51#1']) });
-    const okFar = rNew.remove.includes('way/51#1') && !rOld.remove.includes('way/51#1') && rPin.remove.includes('way/51#1');
-    console.log(`${okFar ? 'PASS' : 'FAIL'}  re-check: a piece far from any trail is removed if marked since trails began (kept if older; put back by hand doesn't save it)`);
+    const rOld = await recheckDrives(net, [{ id: 1, startedAt: since, points: pts }], cur, new Set(), new Map(), undefined, [], { firstAt: firstOld, trailsSince: since });
+    const okFar = rNew.remove.includes('way/51#1') && !rOld.remove.includes('way/51#1');
+    console.log(`${okFar ? 'PASS' : 'FAIL'}  re-check: a piece far from any trail is removed if marked since trails began (kept if older)`);
     all = okFar && all;
+    // v0.15.2: a wrong stub RIGHT BESIDE the trail (like a slip-road taper),
+    // marked since trails began, is removed — even if it was once put back by hand.
+    const cur2 = new Map(cur);
+    cur2.set('way/10#0', net.segs.get('way/10#0')!.coords);
+    const firstAt2 = new Map(firstAt);
+    firstAt2.set('way/10#0', since + 5000);
+    const rNear = await recheckDrives(net, [{ id: 1, startedAt: since, points: pts }], cur2, new Set(), new Map(), undefined, [], { firstAt: firstAt2, trailsSince: since });
+    const okNear = rNear.remove.includes('way/10#0');
+    console.log(`${okNear ? 'PASS' : 'FAIL'}  re-check: a stub beside the trail is removed (put-back roads no longer kept)`);
+    all = okNear && all;
   }
   // 12. Deleting a drive removes the roads only it earned.
   seed = 5;
@@ -336,7 +345,7 @@ all = run('turn onto side street and through', drive([[0, 300], [0, 340], [120, 
     new Map()
   );
   const counts = new Map<string, number>();
-  rH.driveRoads.forEach((ids) => ids.forEach((id) => counts.set(id, (counts.get(id) ?? 0) + 1)));
+  rH.driveRoads.forEach((passes) => passes.forEach((n, id) => counts.set(id, (counts.get(id) ?? 0) + n)));
   for (const seg of segs) if (seg.id.startsWith('way/1#')) seg.n = 'N77 Main Road';
   for (const seg of segs) if (seg.id.startsWith('way/12#')) seg.n = 'Side Street';
   const ranks = rankRoads(net, counts);
@@ -366,6 +375,86 @@ all = run('turn onto side street and through', drive([[0, 300], [0, 340], [120, 
     const r = await recheckDrives(net, [{ id: 1, startedAt: 0, points: pts }], cur, new Set(), new Map());
     check('re-tile: stale old id dropped, undownloaded area kept', r.remove.includes('way/777#0') && r.driven.has('way/888#0') && !r.remove.some((id) => id.startsWith('way/1#')), `remove ${r.remove.join(' ')}`);
   }
+  // ---------- v0.15.2: heatmap counts every pass within a drive ----------
+  {
+    const passesOf = (pts: Point[]) => {
+      const m = new DriveMatcher(net, new Set());
+      const got = new Set<string>();
+      for (let i = 0; i < pts.length; i += 50) m.feed(pts.slice(i, i + 50)).completed.forEach((id) => got.add(id));
+      m.finish().forEach((id) => got.add(id));
+      return { passes: m.roadPasses(), got };
+    };
+    const show = (p: Map<string, number>) => [...p].sort().map(([id, n]) => `${id}:${n}`).join(' ');
+    // Up the main road and back down it.
+    seed = 11;
+    const upDown = passesOf(drive([[0, -5], [0, 605], [0, -5]]));
+    const mainIds = rawChunks(1);
+    check('heat: up a road and back down it in one drive = 2', mainIds.every((id) => upDown.passes.get(id) === 2), show(upDown.passes));
+    seed = 11;
+    const upOnly = passesOf(drive([[0, -5], [0, 605]]));
+    check('heat: one way along it = 1', mainIds.every((id) => upOnly.passes.get(id) === 1), show(upOnly.passes));
+    check('heat: turning back doesn\'t change which roads count as driven', [...upDown.got].sort().join() === [...upOnly.got].sort().join(), `${[...upDown.got].sort().join(' ')} vs ${[...upOnly.got].sort().join(' ')}`);
+    // Stopped at lights for a minute: GPS wobbles back and forth, still one pass.
+    seed = 12;
+    const a = drive([[0, -5], [0, 300]]);
+    const tStop = a[a.length - 1].timestamp;
+    const wobble: Point[] = [];
+    for (let k = 1; k <= 30; k++) {
+      const [la, lo] = ll(gauss() * 6, 300 + gauss() * 8);
+      wobble.push({ latitude: la, longitude: lo, timestamp: tStop + k * 2000 });
+    }
+    const b = drive([[0, 300], [0, 605]], 11, 4, tStop + 62_000);
+    const lights = passesOf([...a, ...wobble, ...b]);
+    check('heat: GPS wobble while stopped at lights is still one pass', mainIds.every((id) => lights.passes.get(id) === 1), show(lights.passes));
+    // Round the block twice: main road y 220..340 driven twice, the rest once.
+    seed = 13;
+    const block: [number, number][] = [[0, -5], [0, 340], [120, 340], [120, 220], [0, 220], [0, 340], [120, 340], [120, 220], [0, 220], [0, 100]];
+    const twice = passesOf(drive(block, 9));
+    const p = twice.passes;
+    check(
+      'heat: round the block twice counts the block twice',
+      (p.get('way/12#0') ?? 0) === 2 && (p.get('way/11#0') ?? 0) === 2 && (p.get('way/1#0') ?? 0) === 1,
+      show(p)
+    );
+  }
+
+  // ---------- v0.15.2: matching only the new drive ----------
+  // Adding drives one at a time on top of the map (as App's matchQueued
+  // does: own DriveMatcher, shared partly-driven stretches, PieceIndex
+  // merge like markDriven) gives the same map as replaying them all.
+  {
+    const ds = [
+      { id: 1, path: [[0, -5], [0, 330]] as [number, number][], t0: 1_000_000 },
+      { id: 2, path: [[0, 300], [0, 605]] as [number, number][], t0: 9_000_000 }, // finishes the main road
+      { id: 3, path: [[0, 95], [0, 100], [120, 100], [120, 300]] as [number, number][], t0: 19_000_000 },
+    ].map((d, i) => {
+      seed = 100 + i;
+      return { id: d.id, startedAt: d.t0, points: drive(d.path, 11, 4, d.t0) };
+    });
+    const full = await recheckDrives(net, ds, new Map(), new Set(), new Map());
+    const partials = new Map<string, [number, number][]>();
+    const driven = new Set<string>();
+    for (const d of ds) {
+      const m = new DriveMatcher(net, new Set(), partials);
+      const ids: string[] = [];
+      for (let i = 0; i < d.points.length; i += 200) ids.push(...m.feed(d.points.slice(i, i + 200)).completed);
+      ids.push(...m.finish(), ...m.stubs);
+      const index = new PieceIndex(driven);
+      for (const id of ids) {
+        if (index.coveredBy(id)) continue;
+        for (const old of index.within(id)) {
+          index.delete(old);
+          driven.delete(old);
+        }
+        index.add(id);
+        driven.add(id);
+      }
+    }
+    const a = [...full.driven].sort().join(' ');
+    const b = [...driven].sort().join(' ');
+    check('matching just the new drive = replaying every drive', a === b && driven.size > 5, a === b ? `${driven.size} pieces` : `full: ${a}\n      incremental: ${b}`);
+  }
+
   // ---------- v0.14.1: route-aware matching ----------
   const loopsOk = runLoopTests();
   const slipsOk = runSlipTests();

@@ -161,15 +161,20 @@ const GAP_OK_M = 25;
 // stretch actually driven.
 export const STUB_WHOLE_M = 35;
 const STUB_MIN_M = 5;
-// A drive counts as having driven a chunk (for the heatmap) when it
-// covered at least this share of it.
+// Heatmap: each pass over a chunk that covers at least this share of it
+// counts once — so up a road and back down it in one drive counts 2.
 const HEAT_MIN_SHARE = 0.5;
+// Turning back along a two-way road by more than this starts a new pass
+// (GPS wobble while stopped at lights is well under it).
+const REVERSE_M = 30;
 
 // lo/hi: extent driven on the chunk. On a roundabout drawn as a closed
 // loop they're "unwrapped" (can run below 0 or past its length) so an arc
 // across the loop's start point stays one continuous stretch.
 // at: the latest position, in the same unwrapped terms.
-type Run = { id: string; lo: number; hi: number; at: number; first: number; tStart: number; tEnd: number };
+// dir: which way along the chunk you're going (1 = in coords order, -1 =
+// against, 0 = not clear yet); a two-way road only.
+type Run = { id: string; lo: number; hi: number; at: number; first: number; tStart: number; tEnd: number; dir?: 0 | 1 | -1 };
 
 // Route-aware matching (see push()).
 const WINDOW_MAX = 80; // most samples held back before a road is decided (~1.2 km)
@@ -201,7 +206,9 @@ export class DriveMatcher {
   private lastLayer: Layer | null = null; // last emitted sample, to link the next window to it
   private lastChoice: number | null = null;
   // Where this drive itself went on each chunk (for the heatmap).
-  private own = new Map<string, [number, number][]>();
+  // Each pass is a list of stretches (a ring crossing its own start point
+  // gives two stretches for one pass).
+  private own = new Map<string, [number, number][][]>();
   private firstMatch: { id: string; pos: number } | null = null;
   private lastMatch: { id: string; pos: number } | null = null;
   private stubList: string[] = [];
@@ -276,15 +283,25 @@ export class DriveMatcher {
     return this.stubList;
   }
 
-  // Chunks this drive itself covered at least half of (for the heatmap).
-  roadsCovered(): string[] {
-    const out: string[] = [];
-    this.own.forEach((st, id) => {
+  // How many times this drive went over each chunk (for the heatmap):
+  // passes that each covered at least half of it. A chunk covered at least
+  // half-way only by adding several partial passes together counts once.
+  roadPasses(): Map<string, number> {
+    const out = new Map<string, number>();
+    this.own.forEach((passes, id) => {
       const len = this.net.length(id);
-      const got = mergeStretches(st).reduce((m, [a, b]) => m + (b - a), 0);
-      if (len > 0 && got >= len * HEAT_MIN_SHARE) out.push(id);
+      if (len <= 0) return;
+      const got = (st: [number, number][]) => mergeStretches(st).reduce((m, [a, b]) => m + (b - a), 0);
+      let n = passes.filter((st) => got(st) >= len * HEAT_MIN_SHARE).length;
+      if (n === 0 && got(passes.flat()) >= len * HEAT_MIN_SHARE) n = 1;
+      if (n > 0) out.set(id, n);
     });
     return out;
+  }
+
+  // Chunks this drive covered at least half of.
+  roadsCovered(): string[] {
+    return Array.from(this.roadPasses().keys());
   }
 
   // The drive started or stopped at `pos` on chunk `id`. If the section
@@ -523,6 +540,16 @@ export class DriveMatcher {
     const last = this.pending[this.pending.length - 1];
     if (last && last.id === id && !this.wrapsBack(id, last.at, pos)) {
       const u = this.unwrap(id, pos, last.at);
+      // Turned back along a two-way road: a second pass over it.
+      if (!this.net.segs.get(id)?.o && !this.net.isLoop(id)) {
+        if (!last.dir) {
+          if (Math.abs(u - last.first) >= 10) last.dir = u > last.first ? 1 : -1;
+        } else if ((last.dir === 1 && u < last.hi - REVERSE_M) || (last.dir === -1 && u > last.lo + REVERSE_M)) {
+          const turn = last.dir === 1 ? last.hi : last.lo;
+          this.pending.push({ id, lo: Math.min(u, turn), hi: Math.max(u, turn), at: u, first: turn, tStart: t, tEnd: t, dir: last.dir === 1 ? -1 : 1 });
+          return;
+        }
+      }
       if (u < last.lo) last.lo = u;
       if (u > last.hi) last.hi = u;
       last.at = u;
@@ -737,7 +764,8 @@ export class DriveMatcher {
 
   // Records a covered stretch of a chunk, and reports any of its sections
   // that are now covered end to end.
-  private cover(id: string, lo: number, hi: number) {
+  // samePass: part of the pass recorded just before (a ring crossing its start).
+  private cover(id: string, lo: number, hi: number, samePass = false) {
     if (this.net.isLoop(id)) {
       const len = this.net.length(id);
       if (hi - lo >= len) {
@@ -748,14 +776,18 @@ export class DriveMatcher {
         lo -= k * len;
         hi -= k * len;
         if (hi > len) {
-          this.cover(id, 0, hi - len);
+          this.cover(id, 0, hi - len, samePass);
           hi = len;
+          samePass = true;
         }
       }
     }
     const secs = this.net.sections(id);
     if (secs.length === 0) return;
-    this.own.set(id, [...(this.own.get(id) || []), [lo, hi]]);
+    const passes = this.own.get(id) || [];
+    if (samePass && passes.length) passes[passes.length - 1].push([lo, hi]);
+    else passes.push([[lo, hi]]);
+    this.own.set(id, passes);
     const merged = mergeStretches([...(this.coverage.get(id) || []), [lo, hi]]);
     this.coverage.set(id, merged);
     this.touched.add(id);
