@@ -178,6 +178,7 @@ const ROUTE_BETA_M = 5; // how strictly the route must match the distance travel
 const JUMP_COST = 40; // cost of a jump the road network can't explain (GPS spike, missing road)
 const REACH_SLACK_M = 60;
 const LINK_ROUTE_MAX_M = 400;
+const WRAP_BACK_M = 15; // further back than GPS jitter on a one-way piece = went round
 const emissionCost = (dist: number) => (dist * dist) / (2 * GPS_SIGMA_M * GPS_SIGMA_M);
 
 type Layer = {
@@ -496,10 +497,31 @@ export class DriveMatcher {
     return pos + k * len;
   }
 
+  // Did you come back onto a one-way piece behind where you last were on
+  // it? Then you went round a ring drawn in several pieces (the pieces in
+  // between may have had no GPS points at all).
+  private wrapsBack(id: string, from: number, to: number): boolean {
+    if (this.net.isLoop(id)) return false; // one closed piece: unwrap() handles it
+    const o = this.net.segs.get(id)?.o;
+    return (o === 1 && to < from - WRAP_BACK_M) || (o === -1 && to > from + WRAP_BACK_M);
+  }
+
+  // Would going straight from run p onto run n mean driving backwards along
+  // one-way n (joining it before the point where p meets it)?
+  private joinsBehind(p: Run, n: Run): boolean {
+    const o = this.net.segs.get(n.id)?.o;
+    if (!o || this.net.isLoop(n.id)) return false;
+    const v = this.junctionBetween(p, n);
+    if (!v) return false;
+    const at = this.net.posOfVertex(n.id, v);
+    if (at === null) return false;
+    return this.wrapsBack(n.id, at, n.first);
+  }
+
   private addSample(id: string, pos: number, t: number) {
     this.lastChunkId = id;
     const last = this.pending[this.pending.length - 1];
-    if (last && last.id === id) {
+    if (last && last.id === id && !this.wrapsBack(id, last.at, pos)) {
       const u = this.unwrap(id, pos, last.at);
       if (u < last.lo) last.lo = u;
       if (u > last.hi) last.hi = u;
@@ -525,6 +547,10 @@ export class DriveMatcher {
         if (r.hi - r.lo >= SPIKE_MAX_EXTENT_M) continue;
         if (n.tStart - p.tEnd > LINK_MAX_MS) continue;
         if (!this.touches(p.id, n.id)) continue;
+        if (p.id === n.id && this.wrapsBack(p.id, p.at, n.first)) continue; // went round: keep both
+        // Joining p straight onto n would mean going the wrong way along n
+        // (you joined n behind where p meets it): r is the way round, not noise.
+        if (p.id !== n.id && this.joinsBehind(p, n)) continue;
         if (p.id === n.id) {
           const shift = this.unwrap(p.id, n.at, p.at) - n.at;
           p.lo = Math.min(p.lo, n.lo + shift);
@@ -565,11 +591,34 @@ export class DriveMatcher {
   // collect chunks in between that were driven in full.
   private link(r: Run, next: Run, full: string[], partial: [string, number, number][]) {
     const net = this.net;
+    // Back onto the same one-way piece behind where you left it: round the
+    // rest of the ring.
+    if (r.id === next.id && this.wrapsBack(r.id, r.at, next.first)) {
+      const around = net.routeAround(r.id, next.first, LINK_ROUTE_MAX_M);
+      if (around) {
+        this.extend(r, net.length(r.id));
+        this.extend(next, around.back);
+        for (const leg of around.legs) partial.push([leg.id, Math.min(leg.from, leg.to), Math.max(leg.from, leg.to)]);
+      }
+      return;
+    }
     // Best: the actual route between where you left one road and joined
     // the next (so a roundabout is credited the way you went round it).
     if (r.id !== next.id) {
       const legs = net.route(r.id, this.wrap(r.id, r.at), next.id, next.first, LINK_ROUTE_MAX_M);
       const last = legs?.[legs.length - 1];
+      // Joined next "behind" its end: carry on round the ring back to it.
+      if (legs && last && !Number.isFinite(this.alongCost(next.id, last.from, next.first))) {
+        const around = net.routeAround(next.id, next.first, LINK_ROUTE_MAX_M);
+        if (around) {
+          this.extend(r, legs[0].to);
+          for (const leg of legs.slice(1, -1)) partial.push([leg.id, Math.min(leg.from, leg.to), Math.max(leg.from, leg.to)]);
+          partial.push([next.id, last.from, net.length(next.id)]);
+          for (const leg of around.legs) partial.push([leg.id, Math.min(leg.from, leg.to), Math.max(leg.from, leg.to)]);
+          this.extend(next, around.back);
+          return;
+        }
+      }
       if (legs && last && Number.isFinite(this.alongCost(next.id, last.from, next.first))) {
         this.extend(r, legs[0].to);
         this.extend(next, last.from);

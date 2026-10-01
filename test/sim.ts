@@ -214,8 +214,8 @@ all = run('turn onto side street and through', drive([[0, 300], [0, 340], [120, 
     firstOld.set('way/51#1', since - 1000);
     const rOld = await recheckDrives(net, [{ id: 1, startedAt: since, points: pts }], cur, new Set(), new Map(), undefined, [], { firstAt: firstOld, trailsSince: since, pinned: new Set() });
     const rPin = await recheckDrives(net, [{ id: 1, startedAt: since, points: pts }], cur, new Set(), new Map(), undefined, [], { firstAt, trailsSince: since, pinned: new Set(['way/51#1']) });
-    const okFar = rNew.remove.includes('way/51#1') && !rOld.remove.includes('way/51#1') && !rPin.remove.includes('way/51#1');
-    console.log(`${okFar ? 'PASS' : 'FAIL'}  re-check: a piece far from any trail is removed if marked since trails began (kept if older, or put back by hand)`);
+    const okFar = rNew.remove.includes('way/51#1') && !rOld.remove.includes('way/51#1') && rPin.remove.includes('way/51#1');
+    console.log(`${okFar ? 'PASS' : 'FAIL'}  re-check: a piece far from any trail is removed if marked since trails began (kept if older; put back by hand doesn't save it)`);
     all = okFar && all;
   }
   // 12. Deleting a drive removes the roads only it earned.

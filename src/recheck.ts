@@ -112,12 +112,14 @@ export async function recheckDrives(
   // dropped (kept aside, can be put back) rather than counted twice.
   current.forEach((shape, id) => {
     const s = shape ?? net.shapeOf(id);
-    if (history?.pinned.has(id)) {
+    const first = history?.firstAt.get(id);
+    const preTrail = !history || first === undefined || first < history.trailsSince;
+    // Put back by hand: kept, unless it was marked since trails began and no
+    // trail goes anywhere near it (then it can't have been driven).
+    if (history?.pinned.has(id) && (preTrail || (!!s && trail.touches(s)))) {
       driven.add(id);
       return;
     }
-    const first = history?.firstAt.get(id);
-    const preTrail = !history || first === undefined || first < history.trailsSince;
     // Older than any saved trail and nowhere near one: nothing to check it against.
     if (preTrail && (!s || !trail.touches(s))) {
       driven.add(id);

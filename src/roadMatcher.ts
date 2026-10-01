@@ -365,6 +365,52 @@ export class RoadNetwork {
   }
 
   /**
+   * Round a ring drawn in several pieces: leaving one-way piece `id` at its
+   * end and coming back onto it at or before `toPos` (you went round the
+   * rest of the roundabout). Returns the pieces in between and where you
+   * rejoined `id`, or null.
+   */
+  routeAround(id: string, toPos: number, maxM: number): { legs: Leg[]; back: number } | null {
+    const seg = this.segs.get(id);
+    if (!seg || seg.o !== 1) return null;
+    const endV = seg.coords[seg.coords.length - 1];
+    let best: { legs: Leg[]; back: number } | null = null;
+    let bestCost = Infinity;
+    for (const x of this.chunksAt(endV)) {
+      if (x === id) continue;
+      const xAt = this.posOfVertex(x, endV);
+      if (xAt === null) continue;
+      const r = this.reach(x, xAt, maxM, 4);
+      r.forEach((info, y) => {
+        if (y === id) return;
+        const ys = this.segs.get(y);
+        const ycum = this.cum.get(y);
+        if (!ys || !ycum) return;
+        for (let i = 0; i < ys.coords.length; i++) {
+          const back = this.posOfVertex(id, ys.coords[i]);
+          if (back === null || back > toPos + 3) continue;
+          const along = ycum[i] - info.at;
+          if (ys.o === 1 && along < -3) continue;
+          if (ys.o === -1 && along > 3) continue;
+          const cost = info.cost + Math.abs(along) + (toPos - back);
+          if (cost >= bestCost) continue;
+          bestCost = cost;
+          const legs: Leg[] = [{ id: y, from: info.at, to: ycum[i] }];
+          let cur = info;
+          let guard = 0;
+          while (cur.prev && guard++ < 10) {
+            const prev = r.get(cur.prev)!;
+            legs.unshift({ id: cur.prev, from: prev.at, to: cur.leave });
+            cur = prev;
+          }
+          best = { legs, back };
+        }
+      });
+    }
+    return best;
+  }
+
+  /**
    * The pieces driven getting from `fromPos` on `from` to `toPos` on `to`:
    * each with where you joined it and left it (metres along it), shortest
    * route first. null if there's no such route within maxM.
@@ -385,5 +431,6 @@ export class RoadNetwork {
   }
 }
 
+export type Leg = { id: string; from: number; to: number };
 export type Reach = { cost: number; at: number; prev: string | null; leave: number };
 export type Candidate = { id: string; pos: number; dist: number };

@@ -99,7 +99,7 @@ declare module 'expo-splash-screen' {
   export function setOptions(o: { duration?: number; fade?: boolean }): void;
 }
 declare module 'expo' {
-  export function requireOptionalNativeModule<T>(name: string): T | null;
+  export const requireOptionalNativeModule: (<T>(name: string) => T | null) | undefined;
 }
 declare function require(p: string): any;
 declare module 'expo-keep-awake' {
