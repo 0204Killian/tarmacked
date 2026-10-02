@@ -1,24 +1,25 @@
-// Builds tarmacked's road data from an OpenStreetMap extract (Geofabrik),
-// after run.sh has filtered and exported it with osmium. Writes a
-// versioned folder of tiles plus a manifest, ready to upload to R2:
+// Builds one PART of a region's road data from an OpenStreetMap extract
+// (Geofabrik), after run.sh has cut the part and exported it with osmium.
+// Small regions are one part; big countries are cut into several so a part
+// never needs more memory than Ireland does. merge.js then joins the parts.
 //
-//   out/manifest.json                      which version each region is on
-//   out/<region>/<version>/t_<a>_<b>.json  road pieces, compact format v2
-//   out/<region>/<version>/index.json      every tile, and the tiles of each county
-//   out/<region>/<version>/stats.json      road totals per county (and per road type)
-//   out/<region>/<version>/places.json     towns and villages (for search later)
-//   out/<region>/<version>/restrictions.json  turn restrictions (for routing)
-//   out/<region>/<version>/graph.json     main-roads routing graph (graph.js)
+//   node build.js <region> <data dir> <part out dir> <areas.json> [bbox] [main] [country]
+//     bbox     minLat,minLon,maxLat,maxLon: road totals only count pieces
+//              whose middle is in it (parts overlap where roads cross)
+//     main     road types in the routing graph (regions.js), default 10
+//     country  ISO code, for what "DE:rural"-style limits mean
 //
-// Usage (run.sh does this): node build.js <region> <version> <data dir> <out dir>
+// Reads from the data dir: roads.geojsonseq (with node IDs), nodes.geojsonseq
+// (traffic lights, signs, level crossings, toll booths), ferries.geojsonseq,
+// places.geojsonseq, restrictions.opl. Writes to the part dir: tiles/*.json
+// (compact v2, see lib.js), graph.json (partial, by OSM node ID),
+// stats.json, places.json, restrictions.json.
 
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 const L = require('./lib');
-const { GraphBuilder } = require('./graph');
-
-const [region = 'ie', version = new Date().toISOString().slice(0, 10), dataDir = 'data', outDir = 'out'] = process.argv.slice(2);
+const { GraphBuilder, FERRY } = require('./graph');
 
 // osmium writes GeoJSON Text Sequences: one feature per line, optionally
 // starting with an ASCII record separator.
@@ -37,33 +38,59 @@ async function* features(file) {
   }
 }
 
-// --- county boundaries (Republic only) ---
+// --- areas (counties etc.): polygons with a grid of candidates per cell ---
+const CELL = 0.05;
+function indexAreas(areas) {
+  const cells = new Map();
+  const shapes = areas.polys.map((rings, code) => {
+    if (!rings) return null;
+    let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
+    for (const ring of rings) {
+      for (const [la, lo] of ring) {
+        if (la < minLat) minLat = la;
+        if (la > maxLat) maxLat = la;
+        if (lo < minLon) minLon = lo;
+        if (lo > maxLon) maxLon = lo;
+      }
+    }
+    for (let x = Math.floor(minLat / CELL); x <= Math.floor(maxLat / CELL); x++) {
+      for (let y = Math.floor(minLon / CELL); y <= Math.floor(maxLon / CELL); y++) {
+        const k = `${x},${y}`;
+        if (!cells.has(k)) cells.set(k, []);
+        cells.get(k).push(code);
+      }
+    }
+    return bandIndex(rings);
+  });
+  return (lat, lon) => {
+    for (const code of cells.get(`${Math.floor(lat / CELL)},${Math.floor(lon / CELL)}`) ?? []) {
+      if (insideBands(shapes[code], lat, lon)) return code;
+    }
+    return -1;
+  };
+}
+
+// Ray casting over edges bucketed by latitude band; holes work because
+// every ring's edges count.
 const BAND = 0.01;
-function buildCounty(geometry) {
-  const polys = geometry.type === 'Polygon' ? [geometry.coordinates] : geometry.type === 'MultiPolygon' ? geometry.coordinates : [];
+function bandIndex(rings) {
   const bands = new Map();
-  let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
-  for (const poly of polys) {
-    for (const ring of poly) {
-      for (let i = 0; i < ring.length - 1; i++) {
-        const [x1, y1] = ring[i];
-        const [x2, y2] = ring[i + 1];
-        minLat = Math.min(minLat, y1); maxLat = Math.max(maxLat, y1);
-        minLon = Math.min(minLon, x1); maxLon = Math.max(maxLon, x1);
-        const seg = [y1, x1, y2, x2];
-        for (let k = Math.floor(Math.min(y1, y2) / BAND); k <= Math.floor(Math.max(y1, y2) / BAND); k++) {
-          if (!bands.has(k)) bands.set(k, []);
-          bands.get(k).push(seg);
-        }
+  for (const ring of rings) {
+    for (let i = 0; i < ring.length - 1; i++) {
+      const [y1, x1] = ring[i];
+      const [y2, x2] = ring[i + 1];
+      const seg = [y1, x1, y2, x2];
+      for (let k = Math.floor(Math.min(y1, y2) / BAND); k <= Math.floor(Math.max(y1, y2) / BAND); k++) {
+        if (!bands.has(k)) bands.set(k, []);
+        bands.get(k).push(seg);
       }
     }
   }
-  return { bands, minLat, maxLat, minLon, maxLon };
+  return bands;
 }
-// Ray casting; holes work because every ring's edges count.
-function inside(county, lat, lon) {
-  if (lat < county.minLat || lat > county.maxLat || lon < county.minLon || lon > county.maxLon) return false;
-  const list = county.bands.get(Math.floor(lat / BAND));
+function insideBands(bands, lat, lon) {
+  if (!bands) return false;
+  const list = bands.get(Math.floor(lat / BAND));
   if (!list) return false;
   let ins = false;
   for (const [y1, x1, y2, x2] of list) {
@@ -96,26 +123,23 @@ function parseOplRelation(line) {
   return out;
 }
 
-async function main() {
-  const t0 = Date.now();
-  const dir = path.join(outDir, region, version);
-  fs.mkdirSync(dir, { recursive: true });
+async function buildPart(opts) {
+  const { region, dataDir, outDir, areas, bbox = null, main = 10, country = '' } = opts;
+  fs.mkdirSync(path.join(outDir, 'tiles'), { recursive: true });
+  const areaAt = indexAreas(areas);
+  const clip = areas.clip ? bandIndex(areas.clip) : null;
+  const inClip = (la, lo) => !clip || insideBands(clip, la, lo);
+  const inPart = (la, lo) => !bbox || (la >= bbox[0] && lo >= bbox[1] && la < bbox[2] && lo < bbox[3]);
+  const nAreas = areas.names.length;
 
-  // 1. Counties.
-  const counties = new Map(); // code -> boundary
-  for await (const f of features(path.join(dataDir, 'admin.geojsonseq'))) {
+  // 1. Nodes that cost time (and toll booths).
+  const delays = new Map(); // OSM node id -> { s, toll }
+  for await (const f of features(path.join(dataDir, 'nodes.geojsonseq'))) {
     const p = f.properties || {};
-    const code = L.COUNTY_CODES.indexOf(p.name);
-    if (code < 0 || p.boundary !== 'administrative' || !f.geometry) continue;
-    // Prefer the county level when a name appears at two levels.
-    if (counties.has(code) && p.admin_level !== '6') continue;
-    counties.set(code, buildCounty(f.geometry));
+    const kind = L.nodeKind(p);
+    if (!kind || p['@id'] === undefined) continue;
+    delays.set(Number(p['@id']), { s: L.NODE_DELAY_S[kind], toll: kind === 'toll_booth' });
   }
-  console.log(`counties: ${counties.size}/${L.COUNTY_CODES.length}`);
-  const countyAt = (lat, lon) => {
-    for (const [code, c] of counties) if (inside(c, lat, lon)) return code;
-    return -1;
-  };
 
   // 2. Turn restrictions (via a node): which nodes we need positions for.
   const restrictions = [];
@@ -136,12 +160,13 @@ async function main() {
     }
   }
 
-  // 3. Roads -> pieces -> tiles.
+  // 3. Roads -> pieces -> tiles; every way also goes to the routing graph.
   const tiles = new Map(); // tile id -> segments
-  const totals = new Array(L.COUNTY_CODES.length).fill(0);
-  const byClass = L.COUNTY_CODES.map(() => new Array(L.ROAD_CLASSES.length).fill(0));
-  let ways = 0, pieces = 0, skipped = 0;
-  const graph = new GraphBuilder();
+  const totals = new Array(nAreas).fill(0);
+  const byClass = areas.names.map(() => new Array(L.ROAD_CLASSES.length).fill(0));
+  let outside = 0; // metres in no area (or the area of a part's neighbour)
+  let ways = 0, pieces = 0, skipped = 0, cut = 0;
+  const graph = new GraphBuilder(main, (id) => delays.get(id) ?? null);
   for await (const f of features(path.join(dataDir, 'roads.geojsonseq'))) {
     const p = f.properties || {};
     if (!f.geometry || f.geometry.type !== 'LineString' || p['@type'] === 'node') continue;
@@ -162,112 +187,92 @@ async function main() {
     const o = L.onewayOf(p);
     const n = L.roadName(p);
     const h = L.ROAD_CLASSES.indexOf(p.highway);
-    const sp = L.speedOf(p);
+    const sp = L.speedOf(p, country);
     const r = p.junction === 'roundabout' || p.junction === 'circular';
-    graph.addWay(wayId, nodes, coords, { o, h, sp, r, n });
+    const t = L.tollOf(p);
+    const u = L.unpavedOf(p);
+    graph.addWay(wayId, nodes, coords, { o, h, sp, r, n, t, u });
     L.splitIntoChunks(coords).forEach((cc, i) => {
       if (cc.length < 2) return;
       const mid = cc[Math.floor(cc.length / 2)];
-      const c = countyAt(mid[0], mid[1]);
-      const seg = { way: wayId, idx: i, coords: cc, o, n, h, sp, r, c: c >= 0 ? c : undefined };
+      if (!inClip(mid[0], mid[1])) {
+        cut++;
+        return; // the neighbouring country's road: its own region has it
+      }
+      const c = areaAt(mid[0], mid[1]);
+      const seg = { way: wayId, idx: i, coords: cc, o, n, h, sp, r, t, u, c: c >= 0 ? c : undefined };
       const tid = L.tileIdForPoint(cc[0][0], cc[0][1]);
       if (!tiles.has(tid)) tiles.set(tid, []);
       tiles.get(tid).push(seg);
       pieces++;
+      if (!inPart(mid[0], mid[1])) return; // counted by the part it's in
+      let len = 0;
+      for (let k = 0; k < cc.length - 1; k++) len += L.haversine(cc[k], cc[k + 1]);
       if (c >= 0) {
-        let len = 0;
-        for (let k = 0; k < cc.length - 1; k++) len += L.haversine(cc[k], cc[k + 1]);
         totals[c] += len;
         byClass[c][h] += len;
-      }
+      } else outside += len;
     });
   }
-  console.log(`roads: ${ways} ways kept (${skipped} not public/drivable), ${pieces} pieces, ${tiles.size} tiles`);
 
-  // 4. Write tiles + index.
-  const countyTiles = L.COUNTY_CODES.map(() => new Set());
+  // 3b. Car ferries: routing graph only (they aren't roads you drive).
+  let ferries = 0;
+  for await (const f of features(path.join(dataDir, 'ferries.geojsonseq'))) {
+    const p = f.properties || {};
+    if (!f.geometry || f.geometry.type !== 'LineString' || !L.carFerry(p)) continue;
+    const coords = f.geometry.coordinates.map(([lon, lat]) => [L.round(lat), L.round(lon)]);
+    graph.addWay(Number(p['@id']), p['@way_nodes'], coords, { o: L.onewayOf(p), h: FERRY, sp: 0, r: false, n: p.name || null, ferryTags: p });
+    ferries++;
+  }
+
+  // 4. Tiles, and which tiles each area has (to download a home county).
   let bytes = 0;
+  const areaTiles = areas.names.map(() => new Set());
   for (const [tid, segs] of tiles) {
     segs.sort((a, b) => a.way - b.way || a.idx - b.idx);
-    for (const s of segs) if (s.c !== undefined) countyTiles[s.c].add(tid);
+    for (const sg of segs) if (sg.c !== undefined) areaTiles[sg.c].add(tid);
     const json = JSON.stringify(L.encodeTile(segs));
     bytes += json.length;
-    fs.writeFileSync(path.join(dir, `${tid}.json`), json);
+    fs.writeFileSync(path.join(outDir, 'tiles', `${tid}.json`), json);
   }
-  const index = {
-    v: 2,
-    region,
-    version,
-    tiles: Array.from(tiles.keys()).sort(),
-    counties: Object.fromEntries(L.COUNTY_CODES.map((name, i) => [name, Array.from(countyTiles[i]).sort()])),
-    classes: L.ROAD_CLASSES,
-  };
-  fs.writeFileSync(path.join(dir, 'index.json'), JSON.stringify(index));
 
-  // 5. Stats (same shape the app already reads, plus per road type).
-  const national = totals.reduce((a, b) => a + b, 0);
-  fs.writeFileSync(
-    path.join(dir, 'stats.json'),
-    JSON.stringify({
-      generatedAt: Date.now(),
-      version,
-      counties: L.COUNTY_CODES,
-      totalMeters: totals.map(Math.round),
-      nationalMeters: Math.round(national),
-      classes: L.ROAD_CLASSES,
-      byClass: byClass.map((row) => row.map(Math.round)),
-    })
-  );
-
-  // 6. Places and restrictions (used by the sat-nav later).
+  // 5. Places (ones inside the part's box; the border cut applies too).
   const places = [];
   for await (const f of features(path.join(dataDir, 'places.geojsonseq'))) {
     const p = f.properties || {};
     const kind = L.PLACE_KINDS.indexOf(p.place);
     if (kind < 0 || !p.name || !f.geometry || f.geometry.type !== 'Point') continue;
     const [lon, lat] = f.geometry.coordinates;
+    if (!inPart(lat, lon) || !inClip(lat, lon)) continue;
     places.push([p.name, L.round(lat), L.round(lon), kind]);
   }
-  fs.writeFileSync(path.join(dir, 'places.json'), JSON.stringify({ kinds: L.PLACE_KINDS, places }));
-  const rOut = restrictions
-    .filter(([, via]) => viaNodes.get(via))
-    .map(([from, via, to, kind]) => [from, ...viaNodes.get(via), to, kind]);
-  fs.writeFileSync(path.join(dir, 'restrictions.json'), JSON.stringify({ kinds: L.RESTRICTIONS, r: rOut }));
+  const rOut = restrictions.filter(([, via]) => viaNodes.get(via)).map(([from, via, to, kind]) => [from, ...viaNodes.get(via), to, kind]);
+  const g = graph.buildPart();
 
-  // 6b. Routing graph (main roads) for the sat-nav.
-  const g = graph.build(region, version);
-  const graphJson = JSON.stringify(g.graph);
-  fs.writeFileSync(path.join(dir, 'graph.json'), graphJson);
-
-  // 7. Manifest (other regions kept as they are).
-  const manifestPath = path.join(outDir, 'manifest.json');
-  let manifest = { v: 1, regions: {} };
-  try {
-    manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-  } catch {
-    // first build
-  }
-  manifest.regions = manifest.regions || {};
-  manifest.regions[region] = { version, path: `${region}/${version}/`, tiles: tiles.size, builtAt: Date.now() };
-  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
-
-  // Summary.
-  console.log(`tiles: ${(bytes / 1e6).toFixed(1)} MB before compression`);
-  console.log(`places: ${places.length}, turn restrictions: ${rOut.length}/${restrictions.length}`);
-  console.log(`routing graph: ${g.graph.nodes.length / 2} junctions, ${g.graph.edges.length} links, ${(g.meters / 1000).toFixed(0)} km of main road, ${(graphJson.length / 1e6).toFixed(1)} MB`);
-  console.log('\nRoad totals:');
-  L.COUNTY_CODES.forEach((c, i) => console.log(`  ${c.padEnd(18)} ${(totals[i] / 1000).toFixed(0).padStart(6)} km${counties.has(i) ? '' : '   (NO BOUNDARY FOUND)'}`));
-  console.log(`  ${'Republic'.padEnd(18)} ${(national / 1000).toFixed(0).padStart(6)} km`);
-  const missing = L.COUNTY_CODES.filter((_, i) => !counties.has(i) || totals[i] === 0);
-  if (missing.length) console.log(`\nWARNING: check these counties: ${missing.join(', ')}`);
-  console.log(`\nDone in ${((Date.now() - t0) / 1000).toFixed(0)} s → ${dir}`);
+  fs.writeFileSync(path.join(outDir, 'graph.json'), JSON.stringify({ nodes: g.nodes, edges: g.edges }));
+  fs.writeFileSync(path.join(outDir, 'places.json'), JSON.stringify(places));
+  fs.writeFileSync(path.join(outDir, 'restrictions.json'), JSON.stringify(rOut));
+  fs.writeFileSync(path.join(outDir, 'stats.json'), JSON.stringify({ totals, byClass, outside, areaTiles: areaTiles.map((t) => [...t]) }));
+  const summary = { region, ways, skipped, pieces, cut, ferries, tiles: tiles.size, bytes, graphLinks: g.edges.length, graphKm: Math.round(g.meters / 1000), places: places.length, restrictions: rOut.length };
+  fs.writeFileSync(path.join(outDir, 'part.json'), JSON.stringify(summary));
+  return summary;
 }
+
+module.exports = { buildPart, parseOplRelation, indexAreas, bandIndex, insideBands };
 
 if (require.main === module) {
-  main().catch((e) => {
-    console.error(e);
-    process.exit(1);
-  });
+  const [region, dataDir, outDir, areasFile, bboxArg, mainArg, country] = process.argv.slice(2);
+  const t0 = Date.now();
+  const bbox = bboxArg && bboxArg !== '-' ? bboxArg.split(',').map(Number) : null;
+  buildPart({ region, dataDir, outDir, areas: JSON.parse(fs.readFileSync(areasFile, 'utf8')), bbox, main: Number(mainArg) || 10, country: country || '' })
+    .then((s) =>
+      console.log(
+        `  part: ${s.ways} roads (${s.skipped} not public), ${s.pieces} pieces in ${s.tiles} tiles, ${(s.bytes / 1e6).toFixed(1)} MB` +
+          `${s.cut ? `, ${s.cut} pieces over the border left out` : ''}; graph ${s.graphLinks} links / ${s.graphKm} km, ${s.ferries} ferries; ${((Date.now() - t0) / 1000).toFixed(0)} s`
+      )
+    )
+    .catch((e) => {
+      console.error(e);
+      process.exit(1);
+    });
 }
-
-module.exports = { parseOplRelation, buildCounty, inside };

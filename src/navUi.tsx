@@ -4,7 +4,7 @@
 import { StyleSheet, Text, View, Pressable, TextInput, ScrollView, ActivityIndicator } from 'react-native';
 import type { NavUpdate } from './nav';
 import { shortDistance } from './nav';
-import type { PlannedRoute } from './router';
+import type { PlannedRoute, Avoid } from './router';
 import type { Place } from './places';
 
 const km = (m: number) => (m >= 10_000 ? (m / 1000).toFixed(0) : (m / 1000).toFixed(1));
@@ -20,7 +20,7 @@ const clock = (t: number) => {
 // An arrow for each kind of manoeuvre (Ireland: roundabouts go clockwise).
 const ARROWS: Record<string, string> = {
   straight: '↑', 'slight-left': '↖', 'slight-right': '↗', left: '←', right: '→', 'sharp-left': '↙', 'sharp-right': '↘',
-  'u-turn': '↶', roundabout: '↻', merge: '↑', exit: '↗', arrive: '⚑', depart: '↑',
+  'u-turn': '↶', roundabout: '↻', merge: '↑', exit: '↗', arrive: '⚑', depart: '↑', ferry: '⛴',
 };
 
 // --- search ---
@@ -86,6 +86,8 @@ export function RouteChooser(props: {
   onChoose: (i: number) => void;
   onGo: () => void;
   onCancel: () => void;
+  avoid: Avoid;
+  onAvoid: (k: keyof Avoid) => void;
 }) {
   const fastest = props.options.find((o) => o.mode === 'fastest') ?? props.options[0];
   return (
@@ -99,6 +101,14 @@ export function RouteChooser(props: {
           <Text style={s.loadingText}>{props.loading}</Text>
         </View>
       )}
+      <View style={s.avoidRow}>
+        <Text style={s.avoidLabel}>Avoid</Text>
+        {AVOIDS.map(([k, label]) => (
+          <Pressable key={k} style={[s.avoidChip, props.avoid[k] && s.avoidChipOn]} onPress={() => props.onAvoid(k)} disabled={!!props.loading}>
+            <Text style={[s.avoidText, props.avoid[k] && s.avoidTextOn]}>{label}</Text>
+          </Pressable>
+        ))}
+      </View>
       {!!props.error && <Text style={s.error}>{props.error}</Text>}
       {props.options.map((o, i) => {
         const extra = fastest && o !== fastest ? Math.round((o.duration - fastest.duration) / 60) : 0;
@@ -109,8 +119,9 @@ export function RouteChooser(props: {
                 {minutes(o.duration)} <Text style={s.routeDim}>· {km(o.distance)} km</Text>
               </Text>
               <Text style={s.routeSub} numberOfLines={1}>
-                {o.roadNames.length ? `via ${o.roadNames.filter((n) => /^[MNR]\d/.test(n)).slice(0, 3).join(', ') || o.roadNames.slice(0, 2).join(', ')}` : ''}
+                {o.roadNames.length ? `via ${o.roadNames.filter((n) => /^[MNRAB]\d/.test(n)).slice(0, 3).join(', ') || o.roadNames.slice(0, 2).join(', ')}` : ''}
               </Text>
+              {usesNote(o) ? <Text style={s.usesNote}>{usesNote(o)}</Text> : null}
             </View>
             <View style={{ alignItems: 'flex-end' }}>
               <Text style={s.routeNew}>{km(o.newM)} km new</Text>
@@ -131,6 +142,26 @@ export function RouteChooser(props: {
       </View>
     </View>
   );
+}
+
+const AVOIDS: [keyof Avoid, string][] = [
+  ['tolls', 'Tolls'],
+  ['motorways', 'Motorways'],
+  ['unpaved', 'Unpaved'],
+  ['ferries', 'Ferries'],
+];
+
+// What a route uses that you might mind: always tolls and ferries; the
+// rest only when you asked to avoid them and there was no way round.
+function usesNote(r: PlannedRoute): string {
+  const u = r.uses;
+  const out: string[] = [];
+  const forced = (asked: boolean | undefined) => (asked ? ' (no way round)' : '');
+  if (u.tollM > 0) out.push(`ⓘ Tolls${forced(r.avoid.tolls)}`);
+  if (u.ferryM > 0) out.push(`⛴ Ferry${forced(r.avoid.ferries)}`);
+  if (r.avoid.motorways && u.motorwayM > 0) out.push('Motorway (no way round)');
+  if (r.avoid.unpaved && u.unpavedM > 0) out.push('Unpaved road (no way round)');
+  return out.join(' · ');
 }
 
 // --- driving ---
@@ -224,6 +255,13 @@ const s = StyleSheet.create({
   tag: { color: '#cfd8d2', fontSize: 11, fontWeight: '700', marginTop: 3 },
   tagNew: { color: '#39d353' },
   chooserButtons: { flexDirection: 'row', gap: 10, marginTop: 6 },
+  avoidRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 8, flexWrap: 'wrap' },
+  avoidLabel: { color: '#9aa59f', fontSize: 12, fontWeight: '700', marginRight: 2 },
+  avoidChip: { paddingVertical: 5, paddingHorizontal: 10, borderRadius: 14, backgroundColor: '#262d29' },
+  avoidChipOn: { backgroundColor: '#8a5a1a' },
+  avoidText: { color: '#cfd8d2', fontSize: 12, fontWeight: '600' },
+  avoidTextOn: { color: '#fff' },
+  usesNote: { color: '#e8c070', fontSize: 12, marginTop: 3, fontWeight: '600' },
   bigButton: { borderRadius: 12, paddingVertical: 13, paddingHorizontal: 22, alignItems: 'center', justifyContent: 'center' },
   bigButtonText: { color: '#fff', fontSize: 16, fontWeight: '800' },
   cancel: { backgroundColor: '#333', flex: 1 },

@@ -1,7 +1,7 @@
 // Offline place search (src/places.ts) and the sat-nav data loader (src/routeData.ts).
 //   npx tsx test/places.test.ts
 import { Places, fold } from '../src/places';
-import { RouteData } from '../src/routeData';
+import { RouteData, regionsFor } from '../src/routeData';
 
 const results: boolean[] = [];
 const check = (name: string, ok: boolean, info = '') => {
@@ -40,6 +40,26 @@ check('one letter: nothing yet', p.search('k', home).length === 0);
 const n = p.nearest([52.79, -7.335]);
 check('a dropped pin is named after the nearest town', n?.name === 'Ballyragget' && n.km < 1, JSON.stringify(n));
 check('nothing near: no name', p.nearest([54.5, -9.9]) === null);
+
+// Which countries' data a trip needs.
+{
+  // Squares with roads, roughly: Ireland, Britain, northern France, western Germany.
+  const sq = (la0: number, la1: number, lo0: number, lo1: number) => {
+    const out: string[] = [];
+    for (let a = la0; a <= la1; a++) for (let b = lo0; b <= lo1; b++) out.push(`${a},${b}`);
+    return out;
+  };
+  const all = [
+    { id: 'ie', version: 'a', base: '', cells: sq(51, 55, -11, -6) },
+    { id: 'gb', version: 'a', base: '', cells: [...sq(50, 52, -6, 1), ...sq(53, 55, -4, 0), ...sq(56, 58, -6, -2)] },
+    { id: 'fr', version: 'a', base: '', cells: sq(43, 50, -5, 7) },
+    { id: 'de', version: 'a', base: '', cells: sq(47, 54, 6, 14) },
+  ];
+  const ids = (pts: [number, number][]) => regionsFor(all, pts).map((r) => r.id).join();
+  check('regions: home only for a trip at home', ids([[52.65, -7.25], [53.35, -6.26]]) === 'ie');
+  check('regions: Kilkenny to Paris takes in Britain and France, not Germany', ids([[52.65, -7.25], [48.86, 2.35]]) === 'ie,gb,fr', ids([[52.65, -7.25], [48.86, 2.35]]));
+  check('regions: old road data (no boxes) = Ireland', regionsFor([{ id: 'ie', version: 'a', base: '' }], [[48.86, 2.35]]).map((r) => r.id).join() === 'ie');
+}
 
 // The loader: downloads once per version, then from the phone; old files removed.
 (async () => {

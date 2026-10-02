@@ -23,8 +23,8 @@ import { migrateEdits, OldEdit } from './src/editMigrate';
 import { Recap, driveGains } from './src/recap';
 import { RecapCard } from './src/RecapCard';
 import { Navigator, NavUpdate } from './src/nav';
-import { RoadGraph, PlannedRoute, RouteMode, sameRoute } from './src/router';
-import { RouteData, Region as NavRegion } from './src/routeData';
+import { RoadGraph, PlannedRoute, RouteMode, Avoid, sameRoute } from './src/router';
+import { RouteData, Region as NavRegion, regionsFor } from './src/routeData';
 import { Place, fold } from './src/places';
 import { SearchPanel, RouteChooser, NavBanner, NavFooter, SpeedLimit } from './src/navUi';
 import { TILE_HOST } from './src/tiles';
@@ -33,7 +33,7 @@ import { TILE_HOST } from './src/tiles';
 // scripts/pipeline). It's checked for a newer version at most this often.
 const ROAD_DATA_CHECK_MS = 6 * 60 * 60 * 1000;
 // Shown in Settings → Help. Keep in step with app.json.
-const APP_VERSION = '0.18.1';
+const APP_VERSION = '0.19.0';
 
 const formatBytes = (b: number) => (b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.max(0, Math.round(b / 1e3))} KB`);
 
@@ -47,6 +47,7 @@ function SettingsHeader(props: { title: string }) {
   return <Text style={settingStyles.header}>{props.title}</Text>;
 }
 function SettingsRow(props: {
+  key?: string;
   title: string;
   value?: string;
   onPress?: () => void;
@@ -466,6 +467,10 @@ function App() {
   const routeRequestRef = useRef(0); // ignores answers to older route requests
   const mutedRef = useRef(false);
   const routeDataRef = useRef<RouteData | null>(null);
+  // Avoid options (v0.19): defaults in Settings → Navigation, changeable per trip.
+  const [avoidDefaults, setAvoidDefaults] = useState<Avoid>({});
+  const [tripAvoid, setTripAvoid] = useState<Avoid>({});
+  const navAvoidRef = useRef<Avoid>({});
   const noteTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [log, setLog] = useState<string[]>([]);
 
@@ -763,6 +768,11 @@ function App() {
         setDevMenu((await store.getMeta('dev_menu')) === '1');
         mutedRef.current = (await store.getMeta('nav_muted')) === '1';
         setMuted(mutedRef.current);
+        try {
+          setAvoidDefaults(JSON.parse((await store.getMeta('nav_avoid')) || '{}'));
+        } catch {
+          // none saved
+        }
         const savedMap = await store.getMeta('map_type');
         if (savedMap && MAP_TYPES.includes(savedMap as MapChoice)) setMapTypeIndex(MAP_TYPES.indexOf(savedMap as MapChoice));
         if (hasIndex) {
@@ -1561,9 +1571,13 @@ function App() {
   }
   const routeData = routeDataRef.current;
 
-  // Every region the road data has (more than one = cross-border trips).
-  const navRegions = (): NavRegion[] =>
-    Object.entries(roadData.manifest?.regions ?? {}).map(([id, r]) => ({ id, version: r.version, base: `${TILE_HOST}${r.path}` }));
+  // The road-data regions a trip needs (more than one = a cross-border trip):
+  // the ones its points are in, and any between them.
+  const navRegions = (points: Coord[] = []): NavRegion[] =>
+    regionsFor(
+      Object.entries(roadData.manifest?.regions ?? {}).map(([id, r]) => ({ id, version: r.version, base: `${TILE_HOST}${r.path}`, bbox: (r as { bbox?: number[] }).bbox ?? null, cells: (r as { cells?: string[] }).cells ?? null })),
+      points,
+    );
 
   const say = (text: string) => {
     if (!mutedRef.current) NavKit.speak(text);
@@ -1591,16 +1605,26 @@ function App() {
 
   // The detailed roads within ~5 km of these points go into the route graph
   // (downloaded first if they aren't on the phone).
-  const addDetailAround = async (graph: RoadGraph, points: Coord[]) => {
+  const addDetailAround = async (graph: RoadGraph, points: Coord[], regions: NavRegion[]) => {
     const want = new Set<string>();
     for (const p of points) {
       for (let la = p[0] - 0.045; la <= p[0] + 0.0451; la += 0.025) {
         for (let lo = p[1] - 0.075; lo <= p[1] + 0.0751; lo += 0.025) want.add(tileIdForPoint(la, lo));
       }
     }
+    // Ireland's from the phone's road data; other countries' downloaded for the route.
     await roadData.ensure(want);
     const segs: RoadSegment[] = [];
     for (const seg of netRef.current.segs.values()) if (want.has(tileIdForPoint(seg.coords[0][0], seg.coords[0][1]))) segs.push(seg);
+    for (const r of regions) {
+      if (r.id === 'ie' || !r.bbox) continue;
+      const b = r.bbox;
+      const inside = [...want].filter((t) => {
+        const [, a, c] = t.split('_').map(Number);
+        return (a + 1) * 0.05 >= b[0] && a * 0.05 <= b[2] && (c + 1) * 0.05 >= b[1] && c * 0.05 <= b[3];
+      });
+      if (inside.length) segs.push(...(await routeData.foreignTiles(r, inside)));
+    }
     graph.addDetail(segs);
   };
 
@@ -1616,11 +1640,13 @@ function App() {
     to: Coord,
     modes: RouteMode[],
     req: number,
+    avoid: Avoid,
     onStage: (what: string) => void = () => undefined,
   ): Promise<{ routes: PlannedRoute[]; hasGraph: boolean } | null> => {
     onStage('Getting road data…');
-    const data = await routeData.load(navRegions());
-    await addDetailAround(data.graph, [from.at, to]);
+    const regions = navRegions([from.at, to]);
+    const data = await routeData.load(regions);
+    await addDetailAround(data.graph, [from.at, to], regions);
     if (req !== routeRequestRef.current) return null;
     onStage('Working out routes…');
     await tick();
@@ -1628,7 +1654,7 @@ function App() {
     const routes: PlannedRoute[] = [];
     for (const mode of modes) {
       const t0 = Date.now();
-      const r = data.graph.route({ lat: from.at[0], lon: from.at[1], heading: from.heading }, { lat: to[0], lon: to[1] }, mode, isDriven);
+      const r = data.graph.route({ lat: from.at[0], lon: from.at[1], heading: from.heading }, { lat: to[0], lon: to[1] }, mode, isDriven, avoid);
       addLog(`sat-nav: ${mode} route ${r ? `${km(r.distance)} km` : 'not found'} in ${Date.now() - t0} ms`);
       if (r && !routes.some((o) => sameRoute(o, r))) routes.push(r);
       await tick();
@@ -1643,7 +1669,9 @@ function App() {
     setSearchResults([]);
     setSearchNote('');
     setNavStage('search');
-    routeData.load(navRegions()).catch(() => undefined); // ready for the first letters
+    hereNow()
+      .then((h) => routeData.load(navRegions(h ? [h.at] : [])))
+      .catch(() => undefined); // ready for the first letters
   };
 
   // Towns and villages as you type (on the phone); Apple's search for
@@ -1660,7 +1688,8 @@ function App() {
     let local: Place[] = [];
     const herePromise = hereNow();
     (async () => {
-      const [here, data] = await Promise.all([herePromise, routeData.load(navRegions())]);
+      const here = await herePromise;
+      const data = await routeData.load(navRegions(here ? [here.at] : []));
       if (!live) return;
       local = data.places.search(q, here?.at ?? null, 6);
       setSearchResults((prev) => (prev.some((p) => p.source === 'online') ? prev : local));
@@ -1695,8 +1724,9 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchQuery, navStage]);
 
-  const chooseDestination = async (d: Dest) => {
+  const chooseDestination = async (d: Dest, avoid: Avoid = avoidDefaults) => {
     Keyboard.dismiss();
+    setTripAvoid(avoid);
     const req = ++routeRequestRef.current;
     setDest(d);
     setNavStage('choose');
@@ -1708,7 +1738,7 @@ function App() {
     try {
       const from = await hereNow();
       if (!from) throw new Error('No GPS position yet. Try again in a moment.');
-      const res = await planRoutes(from, d.at, ['fastest', 'new'], req, (what) => req === routeRequestRef.current && setRoutesLoading(what));
+      const res = await planRoutes(from, d.at, ['fastest', 'new'], req, avoid, (what) => req === routeRequestRef.current && setRoutesLoading(what));
       if (!res) return;
       if (res.routes.length === 0) {
         throw new Error(
@@ -1748,7 +1778,7 @@ function App() {
     NavKit.placeName(at)
       .then(async (name) => {
         if (name) return rename(name);
-        const near = (await routeData.load(navRegions())).places.nearest(at);
+        const near = (await routeData.load(navRegions([at]))).places.nearest(at);
         if (near) rename(near.km < 1 ? near.name : `Near ${near.name}`);
       })
       .catch(() => undefined);
@@ -1763,6 +1793,7 @@ function App() {
     navRef.current = nav;
     navDestRef.current = dest;
     navModeRef.current = route.mode;
+    navAvoidRef.current = route.avoid;
     navLastFixRef.current = null;
     rerouteAtRef.current = 0;
     setNavRoute(route);
@@ -1770,7 +1801,7 @@ function App() {
     setNavStage('driving');
     setPanel(null);
     setFollowing(true);
-    say(nav.start());
+    say(nav.start() + (route.uses.tollM > 0 ? ' This route has tolls.' : '') + (route.uses.ferryM > 0 ? ' This route takes a ferry.' : ''));
     addLog(`sat-nav to ${dest.name}: ${route.mode}, ${km(route.distance)} km`);
     if (!tracking) await startRecording('high');
     else if (liveAutoRef.current) await bg.confirmDrive(); // navigating = definitely driving: keep it
@@ -1800,7 +1831,7 @@ function App() {
     rerouteAtRef.current = Date.now();
     setRerouting(true);
     try {
-      const res = await planRoutes({ at: from, heading }, d.at, [navModeRef.current], routeRequestRef.current);
+      const res = await planRoutes({ at: from, heading }, d.at, [navModeRef.current], routeRequestRef.current, navAvoidRef.current);
       if (!navRef.current || navDestRef.current !== d || !res || res.routes.length === 0) return;
       navRef.current = new Navigator(res.routes[0], spokenName(d));
       setNavRoute(res.routes[0]);
@@ -1838,6 +1869,17 @@ function App() {
   };
   const navFeedRef = useRef(navFeed);
   navFeedRef.current = navFeed;
+
+  // Avoid options: the trip's (re-plans the routes) and the defaults (Settings).
+  const toggleTripAvoid = (k: keyof Avoid) => {
+    if (!dest) return;
+    chooseDestination(dest, { ...tripAvoid, [k]: !tripAvoid[k] }).catch(() => undefined);
+  };
+  const toggleAvoidDefault = (k: keyof Avoid) => {
+    const next = { ...avoidDefaults, [k]: !avoidDefaults[k] };
+    setAvoidDefaults(next);
+    store.setMeta('nav_avoid', JSON.stringify(next)).catch(() => undefined);
+  };
 
   const toggleMute = () => {
     const m = !mutedRef.current;
@@ -3258,6 +3300,26 @@ function App() {
               />
             </SettingsCard>
 
+            <SettingsHeader title="Navigation" />
+            <SettingsCard>
+              {(
+                [
+                  ['tolls', 'Avoid tolls'],
+                  ['motorways', 'Avoid motorways'],
+                  ['unpaved', 'Avoid unpaved roads'],
+                  ['ferries', 'Avoid ferries'],
+                ] as [keyof Avoid, string][]
+              ).map(([k, title], i) => (
+                <SettingsRow
+                  key={k}
+                  first={i === 0}
+                  title={title}
+                  right={<Switch value={!!avoidDefaults[k]} onValueChange={() => toggleAvoidDefault(k)} trackColor={{ true: '#2f6f3a', false: '#333' }} />}
+                />
+              ))}
+            </SettingsCard>
+            <Text style={settingStyles.foot}>Used only when there's another way. You can change them for one trip on the route screen.</Text>
+
             <SettingsHeader title="Help" />
             <SettingsCard>
               <SettingsRow first title="Send a problem report" onPress={sendProblemReport} />
@@ -3376,6 +3438,8 @@ function App() {
           onChoose={setChosenRoute}
           onGo={() => startNavigation().catch(() => undefined)}
           onCancel={cancelRoutes}
+          avoid={tripAvoid}
+          onAvoid={toggleTripAvoid}
         />
       ) : navStage === 'driving' ? (
         <NavFooter update={navUpdate} muted={muted} onMute={toggleMute} onEnd={endNavigation} newM={tracking ? driveNewMRef.current : 0} />

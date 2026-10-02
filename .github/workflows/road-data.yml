@@ -1,0 +1,101 @@
+name: Road data
+
+# Rebuilds the road data from OpenStreetMap (scripts/pipeline) and puts it
+# on tiles.tarmacked.com: every region on the 2nd of each month (Geofabrik's
+# extracts from the 1st), or by hand from the Actions tab (pick regions).
+# Needs three repository secrets (Settings → Secrets and variables →
+# Actions): R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.
+# Free on GitHub for a public repo.
+
+on:
+  schedule:
+    - cron: '23 3 2 * *'
+  workflow_dispatch:
+    inputs:
+      regions:
+        description: 'Regions to rebuild: all, or ids like ie,gb,fr (see scripts/pipeline/regions.js)'
+        default: 'ie'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: road-data
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      regions: ${{ steps.list.outputs.regions }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        run: echo "regions=$(node scripts/pipeline/regions.js matrix '${{ github.event.inputs.regions || 'all' }}')" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 4 # gentle on Geofabrik's servers
+      matrix:
+        region: ${{ fromJSON(needs.plan.outputs.regions) }}
+    env:
+      NODE_HEAP: 12288
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/pipeline
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Make disk space (big countries)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+      - name: Install osmium and rclone
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q osmium-tool rclone
+      - name: Build ${{ matrix.region }}
+        run: bash scripts/pipeline/run.sh ${{ matrix.region }}
+      - name: Upload ${{ matrix.region }} (data only; the manifest comes last)
+        run: bash scripts/pipeline/upload.sh --data-only
+      - uses: actions/upload-artifact@v4
+        with:
+          name: entry-${{ matrix.region }}
+          path: scripts/pipeline/out/entry-${{ matrix.region }}.json
+          retention-days: 7
+
+  publish:
+    needs: build
+    if: always() && needs.build.result != 'cancelled'
+    runs-on: ubuntu-latest
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/pipeline
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: sudo apt-get install -y -q rclone
+      # Only regions that built and uploaded have an entry: the rest stay as they are.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: entry-*
+          path: scripts/pipeline/out
+          merge-multiple: true
+      - name: Publish the manifest, delete old versions
+        run: |
+          ls scripts/pipeline/out/entry-*.json || { echo "Nothing built."; exit 1; }
+          bash scripts/pipeline/upload.sh --manifest-only

@@ -14,6 +14,8 @@ import * as os from 'os';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
 import { decodeTile } from '../src/tiles';
+import { runPipeline } from './fixture';
+declare const require: any;
 declare const process: any;
 declare const __dirname: string;
 
@@ -46,6 +48,8 @@ fs.mkdirSync(data);
 const lines: string[] = [];
 const expected = new Map<string, Seg>(); // pieces whose ID must come out the same
 let nodeId = 1;
+let ways = 0;
+const wayInfo = new Map<number, { ids: number[]; coords: [number, number][]; k: number }>();
 let viaWayA = 0, viaWayB = 0, viaNode = 0;
 byWay.forEach((parts, w) => {
   const n = parts.length;
@@ -59,12 +63,16 @@ byWay.forEach((parts, w) => {
   }
   // The last piece may continue into tiles we don't have; all others must match.
   for (let i = 0; i < n - 1; i++) expected.set(parts[i].id, parts[i]);
-  const props: any = { '@type': 'way', '@id': w, highway: 'unclassified' };
+  const k = ways++;
+  const props: any = { '@type': 'way', '@id': w, highway: k % 10 === 0 ? 'tertiary' : 'unclassified' };
+  if (k % 50 === 0) props.toll = 'yes';
+  if (k % 70 === 5) props.surface = 'gravel';
   if (parts[0].o === 1) props.oneway = 'yes';
   if (parts[0].o === -1) props.oneway = '-1';
   if (parts[0].n) props.name = parts[0].n;
   const ids = coords.map(() => nodeId++);
   props['@way_nodes'] = ids;
+  wayInfo.set(w, { ids, coords, k });
   if (!viaWayA) {
     viaWayA = w;
     viaNode = ids[ids.length - 1];
@@ -91,12 +99,23 @@ fs.writeFileSync(
 );
 fs.writeFileSync(path.join(data, 'restrictions.opl'), `r1 v1 Ttype=restriction,restriction=no_right_turn Mw${viaWayA}@from,n${viaNode}@via,w${viaWayB}@to\nr2 v1 Ttype=restriction,restriction=no_left_turn Mw1@from,w2@via,w3@to\n`);
 
+// Slow-down nodes: traffic lights in the middle of a main road.
+const mainWays = [...wayInfo.entries()].filter(([, w]) => w.k % 10 === 0 && w.ids.length > 4);
+const [lightsWay, lw] = mainWays[1];
+fs.writeFileSync(path.join(data, 'nodes.geojsonseq'), '\x1e' + JSON.stringify({ type: 'Feature', geometry: { type: 'Point', coordinates: [lw.coords[2][1], lw.coords[2][0]] }, properties: { '@type': 'node', '@id': lw.ids[2], highway: 'traffic_signals' } }) + '\n');
+// A car ferry from the end of one main road to the start of another, and a foot-only one.
+const [fa, fb] = [mainWays[2][1], mainWays[3][1]];
+const ferry = (id: number, extra: any) =>
+  '\x1e' + JSON.stringify({ type: 'Feature', geometry: { type: 'LineString', coordinates: [[fa.coords[fa.coords.length - 1][1], fa.coords[fa.coords.length - 1][0]], [fb.coords[0][1], fb.coords[0][0]]] }, properties: { '@type': 'way', '@id': id, route: 'ferry', duration: '0:20', '@way_nodes': [fa.ids[fa.ids.length - 1], fb.ids[0]], ...extra } });
+fs.writeFileSync(path.join(data, 'ferries.geojsonseq'), [ferry(888000001, { motor_vehicle: 'yes', name: 'Test Ferry' }), ferry(888000002, { foot: 'yes' })].join('\n') + '\n');
+
 const t0 = Date.now();
-const log = execFileSync('node', [path.join(__dirname, '../scripts/pipeline/build.js'), 'ie', '2026-10-03', data, out], { encoding: 'utf8' });
+const log = runPipeline(data, out, '2026-10-03');
 const dir = path.join(out, 'ie', '2026-10-03');
 
 // Read everything back the way the app will.
 const got = new Map<string, any>();
+const stats = JSON.parse(fs.readFileSync(path.join(dir, 'stats.json'), 'utf8'));
 let newBytes = 0, oldBytes = 0;
 for (const f of fs.readdirSync(dir)) {
   if (!f.startsWith('t_')) continue;
@@ -126,7 +145,6 @@ const west = [...got.values()].filter((s) => {
   return m[1] < -7.76 && m[1] > -7.99 && m[0] > 52.41 && m[0] < 52.79 && !(m[0] > 52.499 && m[0] < 52.521 && m[1] > -7.951 && m[1] < -7.899);
 });
 check('county from the boundary (holes respected)', tip.length > 100 && inHole.length === 0 && west.every((s) => s.c === 21), `${tip.length} pieces in Tipperary, ${inHole.length} wrongly in the hole, ${west.filter((s) => s.c !== 21).length} missed`);
-const stats = JSON.parse(fs.readFileSync(path.join(dir, 'stats.json'), 'utf8'));
 check('stats: Tipperary total and per road type add up', stats.totalMeters[21] > 0 && Math.abs(stats.byClass[21].reduce((a: number, b: number) => a + b, 0) - stats.totalMeters[21]) <= 13, `${(stats.totalMeters[21] / 1000).toFixed(0)} km`);
 const index = JSON.parse(fs.readFileSync(path.join(dir, 'index.json'), 'utf8'));
 check('index: every tile listed, county tiles listed', index.tiles.length === fs.readdirSync(dir).filter((f) => f.startsWith('t_')).length && index.counties['County Tipperary'].length > 0);
@@ -135,9 +153,104 @@ check('places: towns and villages kept, farms not', places.places.map((p: any) =
 const restr = JSON.parse(fs.readFileSync(path.join(dir, 'restrictions.json'), 'utf8'));
 check('turn restrictions: via-node ones located, via-way ones skipped', restr.r.length === 1 && restr.r[0][0] === viaWayA && restr.r[0][3] === viaWayB, JSON.stringify(restr.r));
 const graph = JSON.parse(fs.readFileSync(path.join(dir, 'graph.json'), 'utf8'));
-check('routing graph written (main roads only)', graph.v === 1 && Array.isArray(graph.nodes) && Array.isArray(graph.edges) && graph.edges.length === 0, `${graph.edges.length} links (this test's roads are all unclassified, so none)`);
-const manifest = JSON.parse(fs.readFileSync(path.join(out, 'manifest.json'), 'utf8'));
-check('manifest points at the new version', manifest.regions.ie.path === 'ie/2026-10-03/' && manifest.regions.ie.tiles === index.tiles.length);
+const mainCount = [...wayInfo.values()].filter((w) => w.k % 10 === 0).length;
+const graphWays = new Set(graph.edges.map((e: number[]) => e[2]));
+check('routing graph (v2): main roads only, plus car ferries', graph.v === 2 && graphWays.size >= mainCount - 3 && graphWays.size <= mainCount + 1 && [...graphWays].every((w) => w === 888000001 || wayInfo.get(w as number)!.k % 10 === 0) && graphWays.has(888000001) && !graphWays.has(888000002), `${graph.edges.length} links on ${graphWays.size} ways (${mainCount} main roads)`);
+const ferryEdge = graph.edges.find((e: number[]) => e[2] === 888000001);
+check('ferry: flagged, with its timetable speed', !!ferryEdge && (ferryEdge[3] & 32) !== 0 && graph.classes[ferryEdge[4]] === 'ferry' && ferryEdge[5] > 0, ferryEdge ? `speed ${ferryEdge[5]} km/h` : 'none');
+const tollWays = [...wayInfo.entries()].filter(([, w]) => w.k % 50 === 0).map(([id]) => id);
+check('toll roads flagged in the graph', graph.edges.filter((e: number[]) => tollWays.includes(e[2])).every((e: number[]) => (e[3] & 8) !== 0) && graph.edges.some((e: number[]) => (e[3] & 8) !== 0));
+const lights = graph.edges.filter((e: number[]) => e[2] === lightsWay);
+check('traffic lights add a delay to their road', lights.reduce((a: number, e: number[]) => a + e[10], 0) === 12, lights.map((e: number[]) => e[10]).join(','));
+const tollPieces = [...got.values()].filter((sg) => sg.t);
+const gravel = [...got.values()].filter((sg) => sg.u);
+check('tiles: toll and unpaved pieces flagged', tollPieces.length > 0 && tollPieces.every((sg) => tollWays.includes(Number(/way\/(\d+)/.exec(sg.id)![1]))) && gravel.length > 0, `${tollPieces.length} toll, ${gravel.length} unpaved pieces`);
+check("Ireland's stats: the Republic's 26 counties as before, Northern Ireland's listed after", stats.counties.length === 26 && stats.totalMeters.length === 26 && stats.areas.length === 32 && stats.areas[26] === 'County Antrim');
+const { publish } = require('../scripts/pipeline/publish.js');
+const entry = JSON.parse(fs.readFileSync(path.join(out, 'entry-ie.json'), 'utf8'));
+const pub = publish({ v: 1, regions: { ie: { version: '2026-10-02', path: 'ie/2026-10-02/' }, fr: { version: '2026-09-02', path: 'fr/2026-09-02/' } } }, [entry]);
+check(
+  'manifest: the new version in, other regions kept, old versions to delete listed',
+  pub.manifest.regions.ie.path === 'ie/2026-10-03/' && pub.manifest.regions.ie.tiles === index.tiles.length && pub.manifest.regions.ie.bbox?.length === 4 && pub.manifest.regions.fr.version === '2026-09-02' && pub.keep.join() === 'fr/2026-09-02/,ie/2026-10-02/,ie/2026-10-03/',
+  pub.keep.join(' ')
+);
+
+// Big countries are built in parts: the same data cut in two (west/east,
+// each part keeping every road that touches it, as osmium's "smart" cut
+// does) must come out the same.
+{
+  const split = path.join(tmp, 'split');
+  const cutLon = -7.6;
+  const partDirs = ['p00', 'p01'].map((p) => path.join(split, p));
+  partDirs.forEach((d) => fs.mkdirSync(d, { recursive: true }));
+  const inPart = (lons: number[], i: number) => (i === 0 ? lons.some((x) => x < cutLon + 0.002) : lons.some((x) => x >= cutLon - 0.002));
+  for (const f of ['roads.geojsonseq', 'ferries.geojsonseq', 'nodes.geojsonseq', 'places.geojsonseq']) {
+    const rows = fs.readFileSync(path.join(data, f), 'utf8').split('\n').filter(Boolean);
+    partDirs.forEach((d, i) =>
+      fs.writeFileSync(
+        path.join(d, f),
+        rows
+          .filter((r) => {
+            const g = JSON.parse(r.replace(/^\x1e/, '')).geometry;
+            const lons = g.type === 'Point' ? [g.coordinates[0]] : g.coordinates.map((c: number[]) => c[0]);
+            return inPart(lons, i);
+          })
+          .join('\n') + '\n'
+      )
+    );
+  }
+  partDirs.forEach((d) => fs.copyFileSync(path.join(data, 'restrictions.opl'), path.join(d, 'restrictions.opl')));
+  const areasFile = path.join(data, 'areas.json');
+  const built = path.join(split, 'built');
+  const P = (f: string) => path.join(__dirname, '../scripts/pipeline', f);
+  partDirs.forEach((d, i) =>
+    execFileSync('node', [P('build.js'), 'ie', d, path.join(built, `p0${i}`), areasFile, i === 0 ? `50,-12,56,${cutLon}` : `50,${cutLon},56,-5`, '10', 'IE'], { encoding: 'utf8' })
+  );
+  const out2 = path.join(split, 'out');
+  execFileSync('node', [P('merge.js'), 'ie', 'split', built, areasFile, out2], { encoding: 'utf8' });
+  const dir2 = path.join(out2, 'ie', 'split');
+  const tiles1 = fs.readdirSync(dir).filter((f) => f.startsWith('t_')).sort();
+  const tiles2 = fs.readdirSync(dir2).filter((f) => f.startsWith('t_')).sort();
+  const sameTiles = tiles1.length === tiles2.length && tiles1.every((t, i) => t === tiles2[i] && fs.readFileSync(path.join(dir, t), 'utf8') === fs.readFileSync(path.join(dir2, t), 'utf8'));
+  const st2 = JSON.parse(fs.readFileSync(path.join(dir2, 'stats.json'), 'utf8'));
+  const g2 = JSON.parse(fs.readFileSync(path.join(dir2, 'graph.json'), 'utf8'));
+  const sameStats = Math.abs(st2.areaMeters.reduce((a: number, b: number) => a + b, 0) + st2.outsideMeters - stats.areaMeters.reduce((a: number, b: number) => a + b, 0) - stats.outsideMeters) <= 2;
+  const p2 = JSON.parse(fs.readFileSync(path.join(dir2, 'places.json'), 'utf8'));
+  check(
+    'built in two parts = built in one (tiles, totals, graph, places)',
+    sameTiles && sameStats && g2.edges.length === graph.edges.length && g2.nodes.length === graph.nodes.length && p2.places.length === places.places.length,
+    `${tiles2.length}/${tiles1.length} tiles identical: ${sameTiles}; totals ${sameStats}; graph ${g2.edges.length}/${graph.edges.length} links`
+  );
+}
+
+// Another country: roads cut to its border, its own areas found.
+{
+  const cdata = path.join(tmp, 'country');
+  fs.mkdirSync(cdata, { recursive: true });
+  fs.copyFileSync(path.join(data, 'roads.geojsonseq'), path.join(cdata, 'roads.geojsonseq'));
+  const feat = (geometry: any, properties: any) => '\x1e' + JSON.stringify({ type: 'Feature', geometry, properties });
+  fs.writeFileSync(
+    path.join(cdata, 'admin.geojsonseq'),
+    [
+      feat({ type: 'Polygon', coordinates: [box(51, -11, 56, -7.6)] }, { boundary: 'administrative', admin_level: '2', 'ISO3166-1': 'LU', name: 'Testland' }),
+      feat({ type: 'Polygon', coordinates: [box(51, -11, 52.7, -7.6)] }, { boundary: 'administrative', admin_level: '6', name: 'South' }),
+      feat({ type: 'Polygon', coordinates: [box(52.7, -11, 56, -7.6)] }, { boundary: 'administrative', admin_level: '6', name: 'North' }),
+      feat({ type: 'Polygon', coordinates: [box(51, -7.6, 56, -5)] }, { boundary: 'administrative', admin_level: '6', name: 'Neighbour' }),
+      feat({ type: 'Polygon', coordinates: [box(51, -11, 56, -9)] }, { boundary: 'administrative', admin_level: '4', name: 'Province' }),
+    ].join('\n') + '\n'
+  );
+  const cout = path.join(cdata, 'out');
+  runPipeline(cdata, cout, 'v1', 'lu');
+  const cdir = path.join(cout, 'lu', 'v1');
+  const cst = JSON.parse(fs.readFileSync(path.join(cdir, 'stats.json'), 'utf8'));
+  const cpieces = fs.readdirSync(cdir).filter((f) => f.startsWith('t_')).flatMap((f) => decodeTile(JSON.parse(fs.readFileSync(path.join(cdir, f), 'utf8'))));
+  const east = cpieces.filter((sg) => sg.coords[Math.floor(sg.coords.length / 2)][1] > -7.59);
+  check(
+    "another country: roads over its border left out, its own areas (not the neighbour's)",
+    east.length === 0 && cpieces.length > 1000 && cst.areas.join() === 'North,South' && cst.nationalMeters > 0,
+    `${cpieces.length} pieces kept, ${east.length} over the border; areas ${cst.areas.join(', ')}`
+  );
+}
 check('tiles smaller than before', newBytes < oldBytes * 0.7, `${(newBytes / 1e6).toFixed(2)} MB vs ${(oldBytes / 1e6).toFixed(2)} MB for the same area (${Math.round((100 * newBytes) / oldBytes)}%), before Cloudflare's compression`);
 console.log(`      (built in ${Date.now() - t0} ms)\n${log.split('\n').filter((l) => /roads:|counties:|tiles:/.test(l)).map((l) => '      ' + l).join('\n')}`);
 console.log(results.every(Boolean) ? '\nALL PASS' : '\nSOME FAILED');

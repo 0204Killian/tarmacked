@@ -20,6 +20,18 @@ export const FIXTURE_OUT = path.join(FIXTURE_DIR, 'out', 'ie', 'fixture');
 
 type Seg = { id: string; coords: [number, number][]; o?: number; c?: number; n?: string };
 
+const P = (f: string) => path.join(__dirname, '../scripts/pipeline', f);
+/** The pipeline's steps as run.sh runs them, on exported data in one folder (one part). */
+export function runPipeline(data: string, out: string, version: string, region = 'ie') {
+  const run = (args: string[]) => execFileSync('node', ['--max-old-space-size=6144', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
+  const areas = path.join(data, 'areas.json');
+  run([P('areas.js'), region, path.join(data, 'admin.geojsonseq'), areas]);
+  const built = path.join(data, 'built');
+  fs.rmSync(built, { recursive: true, force: true });
+  run([P('build.js'), region, data, path.join(built, 'p00'), areas, '-', '10', region === 'ie' ? 'IE' : '']);
+  return run([P('merge.js'), region, version, built, areas, out]);
+}
+
 export function buildFixture(oldDir = '/home/claude/repo/tiles'): string {
   if (fs.existsSync(path.join(FIXTURE_OUT, 'graph.json'))) return FIXTURE_OUT;
   const old = new Map<string, Seg>();
@@ -74,10 +86,7 @@ export function buildFixture(oldDir = '/home/claude/repo/tiles'): string {
   fs.writeFileSync(path.join(data, 'roads.geojsonseq'), lines.join('\n') + '\n');
   fs.writeFileSync(path.join(data, 'admin.geojsonseq'), '');
   fs.writeFileSync(path.join(data, 'places.geojsonseq'), '');
-  execFileSync('node', ['--max-old-space-size=6144', path.join(__dirname, '../scripts/pipeline/build.js'), 'ie', 'fixture', data, path.join(FIXTURE_DIR, 'out')], {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'inherit'],
-  });
+  runPipeline(data, path.join(FIXTURE_DIR, 'out'), 'fixture');
   return FIXTURE_OUT;
 }
 

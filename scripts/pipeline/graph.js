@@ -1,25 +1,32 @@
-// The sat-nav's country-wide routing graph (graph.json): main roads only
-// (motorway down to tertiary, with their slip roads), so the phone can
-// route across the whole country from one small file. Near the start and
-// the end it adds the full detail from the normal road tiles; the two meet
-// at junctions, which have the same rounded position in both.
+// The sat-nav's routing graph (graph.json): main roads only (see main in
+// regions.js), plus car ferries, so the phone can route across a country
+// from one file. Near the start and the end it adds the full detail from the
+// normal road tiles; the two meet at junctions, which have the same rounded
+// position in both.
 //
-// Format (v1):
-//   { v: 1, region, version, classes, names: [...],
+// Built in two steps: each part of a region (build.js) writes a partial
+// graph keyed by OSM node IDs; merge.js joins the parts (a way crossing a
+// part's edge is in both, and counted once) and numbers the nodes.
+//
+// Final format (v2):
+//   { v: 2, region, version, classes, names: [...],
 //     nodes: [lat0, lon0, dlat, dlon, ...],      1e-5 degree integers, delta-coded
-//     edges: [[a, b, way, flags, class, speed, length, c0, c1, name, dlat, dlon, ...], ...] }
+//     edges: [[a, b, way, flags, class, speed, length, c0, c1, name, delay, dlat, dlon, ...], ...] }
 // An edge runs from node a to node b along OSM way `way` (in drawn order),
 // covering that way's road pieces c0..c1 (the ids the app marks as driven:
-// way/<way>#<c>). flags: 1 = one-way a→b, 2 = one-way b→a, 4 = roundabout.
-// length in metres; speed = tagged limit in km/h or 0; name index or -1.
-// The trailing numbers are the in-between points (simplified), as
-// differences starting from node a.
+// way/<way>#<c>). flags: 1 = one-way a→b, 2 = one-way b→a, 4 = roundabout,
+// 8 = toll, 16 = unpaved, 32 = car ferry. class indexes `classes`; speed =
+// the limit in km/h, 0 if unknown (a ferry's own speed); length in metres;
+// name index or -1; delay = seconds lost at traffic lights, stop and yield
+// signs, level crossings and toll booths along it. The trailing numbers are
+// the in-between points (simplified), as differences starting from node a.
+// (v1, from v0.18, is the same without `delay`.)
 
 const L = require('./lib');
 
-// Road types in the graph: motorway .. tertiary_link (lib.js order).
-const MAIN_CLASSES = 10;
 const SIMPLIFY_M = 3;
+const FERRY = L.ROAD_CLASSES.length; // class index of ferries in graph.json
+const GRAPH_CLASSES = [...L.ROAD_CLASSES, 'ferry'];
 
 // Douglas-Peucker on [lat, lon] points (small area, flat-earth metres).
 function simplify(pts, tol) {
@@ -71,13 +78,64 @@ function chunkOfSegments(coords) {
 }
 
 /**
- * Collects ways while build.js reads the roads, then writes the graph.
- * Every drivable way is counted (so junctions with small roads become
- * graph nodes, where the detailed roads join); main roads are kept.
+ * How many way positions use each OSM node: an open-addressing hash on
+ * typed arrays, so big parts don't hit the limits of a JS Map.
+ */
+class NodeCounter {
+  constructor(capacity = 1 << 20) {
+    this.cap = capacity;
+    this.keys = new Float64Array(capacity);
+    this.counts = new Uint8Array(capacity);
+    this.size = 0;
+  }
+  slot(id) {
+    // Node ids are positive integers below 2^53: mix both 32-bit halves.
+    const lo = id % 4294967296;
+    const hi = Math.floor(id / 4294967296);
+    let x = Math.imul(lo ^ (lo >>> 16), 0x45d9f3b) ^ Math.imul(hi + 0x7f4a7c15, 0x85ebca77);
+    x = Math.imul(x ^ (x >>> 13), 0xc2b2ae35);
+    let h = (x ^ (x >>> 16)) & (this.cap - 1);
+    while (this.counts[h] !== 0 && this.keys[h] !== id) h = h + 1 === this.cap ? 0 : h + 1;
+    return h;
+  }
+  add(id, n) {
+    if (this.size * 10 > this.cap * 6) this.grow();
+    const h = this.slot(id);
+    if (this.counts[h] === 0) {
+      this.keys[h] = id;
+      this.size++;
+    }
+    this.counts[h] = Math.min(255, this.counts[h] + n);
+  }
+  get(id) {
+    return this.counts[this.slot(id)];
+  }
+  grow() {
+    const oldK = this.keys, oldC = this.counts;
+    this.cap *= 2;
+    this.keys = new Float64Array(this.cap);
+    this.counts = new Uint8Array(this.cap);
+    this.size = 0;
+    for (let i = 0; i < oldK.length; i++) {
+      if (oldC[i] === 0) continue;
+      const h = this.slot(oldK[i]);
+      this.keys[h] = oldK[i];
+      this.counts[h] = oldC[i];
+      this.size++;
+    }
+  }
+}
+
+/**
+ * Collects ways while build.js reads a part, then writes its partial graph.
+ * Every drivable way is counted (so junctions with small roads become graph
+ * nodes, where the detailed roads join); main roads and ferries are kept.
  */
 class GraphBuilder {
-  constructor() {
-    this.nodeUse = new Map(); // OSM node id -> how many way positions use it
+  constructor(mainClasses = 10, nodeDelay = () => 0) {
+    this.mainClasses = mainClasses;
+    this.nodeDelay = nodeDelay; // OSM node id -> { s: seconds, toll: bool } | null
+    this.nodeUse = new NodeCounter();
     this.main = []; // { way, nodes, coords, flags, h, sp, n }
   }
 
@@ -85,51 +143,44 @@ class GraphBuilder {
     if (!Array.isArray(nodeIds) || nodeIds.length !== coords.length || coords.length < 2) return;
     for (let i = 0; i < nodeIds.length; i++) {
       // Way ends always count twice, so they're always nodes.
-      const add = i === 0 || i === nodeIds.length - 1 ? 2 : 1;
-      this.nodeUse.set(nodeIds[i], (this.nodeUse.get(nodeIds[i]) || 0) + add);
+      this.nodeUse.add(nodeIds[i], i === 0 || i === nodeIds.length - 1 ? 2 : 1);
     }
-    if (props.h < 0 || props.h >= MAIN_CLASSES) return;
-    const flags = (props.o === 1 ? 1 : 0) | (props.o === -1 ? 2 : 0) | (props.r ? 4 : 0);
-    this.main.push({ way: wayId, nodes: nodeIds, coords, flags, h: props.h, sp: props.sp || 0, n: props.n || null });
+    const ferry = props.h === FERRY;
+    if (!ferry && (props.h < 0 || props.h >= this.mainClasses)) return;
+    const flags = (props.o === 1 ? 1 : 0) | (props.o === -1 ? 2 : 0) | (props.r ? 4 : 0) | (props.t ? 8 : 0) | (props.u ? 16 : 0) | (ferry ? 32 : 0);
+    this.main.push({ way: wayId, nodes: nodeIds, coords, flags, h: props.h, sp: props.sp || 0, n: props.n || null, ferryTags: ferry ? props.ferryTags : undefined });
   }
 
-  build(region, version) {
-    const nodeIndex = new Map(); // OSM node id -> graph node
-    const nodePos = []; // [lat, lon]
-    const nodeOf = (id, c) => {
-      let k = nodeIndex.get(id);
-      if (k === undefined) {
-        k = nodePos.length;
-        nodeIndex.set(id, k);
-        nodePos.push(c);
-      }
-      return k;
-    };
-    const names = [];
-    const nameIdx = new Map();
+  /** The part's graph: nodes by OSM id, edges between OSM node ids. */
+  buildPart() {
+    const nodes = new Map(); // OSM id -> [lat, lon]
     const edges = [];
     let meters = 0;
     for (const w of this.main) {
       const segChunk = chunkOfSegments(w.coords);
-      let ni = -1;
-      if (w.n) {
-        if (!nameIdx.has(w.n)) {
-          nameIdx.set(w.n, names.length);
-          names.push(w.n);
-        }
-        ni = nameIdx.get(w.n);
-      }
       let start = 0;
       for (let i = 1; i < w.coords.length; i++) {
         const last = i === w.coords.length - 1;
-        if (!last && (this.nodeUse.get(w.nodes[i]) || 0) < 2) continue;
+        if (!last && this.nodeUse.get(w.nodes[i]) < 2) continue;
         const pts = w.coords.slice(start, i + 1);
         let len = 0;
         for (let k = 1; k < pts.length; k++) len += L.haversine(pts[k - 1], pts[k]);
         if (len > 0) {
-          const a = nodeOf(w.nodes[start], w.coords[start]);
-          const b = nodeOf(w.nodes[i], w.coords[i]);
-          const row = [a, b, w.way, w.flags, w.h, w.sp, Math.max(1, Math.round(len)), segChunk[start], segChunk[i - 1], ni];
+          nodes.set(w.nodes[start], w.coords[start]);
+          nodes.set(w.nodes[i], w.coords[i]);
+          // Delays at nodes along it (the end node counts, the start doesn't,
+          // so a junction's lights are paid once, on the way in).
+          let delay = 0;
+          let flags = w.flags;
+          for (let k = start + 1; k <= i; k++) {
+            const d = this.nodeDelay(w.nodes[k]);
+            if (d) {
+              delay += d.s;
+              if (d.toll) flags |= 8;
+            }
+          }
+          const sp = w.flags & 32 ? L.ferrySpeed(w.ferryTags || {}, len) : w.sp;
+          const row = [w.nodes[start], w.nodes[i], w.way, flags, w.h, sp, Math.max(1, Math.round(len)), segChunk[start], segChunk[i - 1], w.n ?? '', delay];
           const mid = simplify(pts, SIMPLIFY_M).slice(1, -1);
           let plat = Math.round(pts[0][0] * L.COORD_SCALE);
           let plon = Math.round(pts[0][1] * L.COORD_SCALE);
@@ -146,18 +197,61 @@ class GraphBuilder {
         start = i;
       }
     }
-    const nodes = [];
-    let plat = 0;
-    let plon = 0;
-    nodePos.forEach(([la, lo], i) => {
-      const x = Math.round(la * L.COORD_SCALE);
-      const y = Math.round(lo * L.COORD_SCALE);
-      nodes.push(i === 0 ? x : x - plat, i === 0 ? y : y - plon);
-      plat = x;
-      plon = y;
-    });
-    return { graph: { v: 1, region, version, classes: L.ROAD_CLASSES.slice(0, MAIN_CLASSES), names, nodes, edges }, meters };
+    return { nodes: Array.from(nodes, ([id, [la, lo]]) => [id, la, lo]), edges, meters };
   }
 }
 
-module.exports = { GraphBuilder, simplify, chunkOfSegments, MAIN_CLASSES };
+/**
+ * Joins parts' graphs into graph.json (v2): an edge that's in two parts
+ * (its way crosses between them) is kept once; nodes are numbered.
+ */
+function mergeGraphs(parts, region, version) {
+  const nodeIndex = new Map(); // OSM id -> index
+  const nodePos = [];
+  const names = [];
+  const nameIdx = new Map();
+  const seen = new Set();
+  const edges = [];
+  let meters = 0;
+  for (const part of parts) {
+    const pos = new Map(part.nodes.map(([id, la, lo]) => [id, [la, lo]]));
+    const idx = (id) => {
+      let k = nodeIndex.get(id);
+      if (k === undefined) {
+        k = nodePos.length;
+        nodeIndex.set(id, k);
+        nodePos.push(pos.get(id));
+      }
+      return k;
+    };
+    for (const row of part.edges) {
+      const [aId, bId, way, flags, cls, sp, len, c0, c1, name, delay] = row;
+      const key = `${way}:${aId}:${bId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      let ni = -1;
+      if (name) {
+        if (!nameIdx.has(name)) {
+          nameIdx.set(name, names.length);
+          names.push(name);
+        }
+        ni = nameIdx.get(name);
+      }
+      edges.push([idx(aId), idx(bId), way, flags, cls, sp, len, c0, c1, ni, delay, ...row.slice(11)]);
+      meters += len;
+    }
+  }
+  const nodes = [];
+  let plat = 0;
+  let plon = 0;
+  nodePos.forEach(([la, lo], i) => {
+    const x = Math.round(la * L.COORD_SCALE);
+    const y = Math.round(lo * L.COORD_SCALE);
+    nodes.push(i === 0 ? x : x - plat, i === 0 ? y : y - plon);
+    plat = x;
+    plon = y;
+  });
+  return { graph: { v: 2, region, version, classes: GRAPH_CLASSES, names, nodes, edges }, meters };
+}
+
+module.exports = { GraphBuilder, NodeCounter, mergeGraphs, simplify, chunkOfSegments, FERRY, GRAPH_CLASSES };

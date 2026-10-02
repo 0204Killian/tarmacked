@@ -27,7 +27,11 @@ export type GraphFile = { v: number; region: string; version: string; classes: s
 export type RestrictionsFile = { kinds: string[]; r: [number, number, number, number, number][] };
 
 export type RouteMode = 'fastest' | 'new';
-export type TurnKind = 'straight' | 'slight-left' | 'slight-right' | 'left' | 'right' | 'sharp-left' | 'sharp-right' | 'u-turn' | 'roundabout' | 'merge' | 'exit' | 'arrive' | 'depart';
+/** Things to keep off, unless there's no other way (v0.19). */
+export type Avoid = { tolls?: boolean; motorways?: boolean; unpaved?: boolean; ferries?: boolean };
+/** Metres of a route on each kind of road you might want to avoid. */
+export type RouteUses = { tollM: number; motorwayM: number; unpavedM: number; ferryM: number };
+export type TurnKind = 'straight' | 'slight-left' | 'slight-right' | 'left' | 'right' | 'sharp-left' | 'sharp-right' | 'u-turn' | 'roundabout' | 'merge' | 'exit' | 'arrive' | 'depart' | 'ferry';
 export type Step = RouteStep & { kind: TurnKind };
 
 export type PlannedRoute = NavRoute & {
@@ -36,20 +40,33 @@ export type PlannedRoute = NavRoute & {
   speeds: number[]; // speed limit (km/h, 0 = not known) of each piece coords[i]→coords[i+1]
   newM: number; // metres on roads you've never driven
   roadNames: string[]; // main roads used, in order (for the summary)
+  uses: RouteUses;
+  avoid: Avoid; // what it was asked to avoid
 };
 
 // --- tuning ---
 const SCALE = 1e5;
 const SNAP_M = 2000; // how far from a road the start / end may be (a house up a lane, a field)
 const SNAP_TRIES = 3; // nearest roads tried at each end, in case the nearest is cut off (a private yard)
-const KMH: Record<string, number> = {
-  motorway: 110, motorway_link: 60, trunk: 90, trunk_link: 50, primary: 80, primary_link: 45,
-  secondary: 70, secondary_link: 40, tertiary: 60, tertiary_link: 35, unclassified: 45,
-  residential: 30, living_street: 15,
+// Typical speed limits where a road has none tagged (km/h), and what share
+// of the limit traffic actually averages on each kind of road (bends,
+// villages, overtaking...). Tuned against real journey times (v0.19).
+const LIMIT_KMH: Record<string, number> = {
+  motorway: 120, motorway_link: 80, trunk: 100, trunk_link: 60, primary: 100, primary_link: 60,
+  secondary: 80, secondary_link: 50, tertiary: 80, tertiary_link: 50, unclassified: 80,
+  residential: 50, living_street: 20,
 };
-const DEFAULT_KMH = 40;
-const MAX_KMH = 120; // for the A* estimate
+const SHARE: Record<string, number> = {
+  motorway: 0.92, motorway_link: 0.7, trunk: 0.88, trunk_link: 0.7, primary: 0.82, primary_link: 0.7,
+  secondary: 0.74, secondary_link: 0.65, tertiary: 0.68, tertiary_link: 0.6, unclassified: 0.52,
+  residential: 0.6, living_street: 0.5,
+};
+const TOWN_SHARE = 0.72; // on a 50/60 km/h stretch of a bigger road (through a town)
+const UNPAVED_KMH = 30;
+const MAX_KMH = 130; // for the A* estimate (no road averages more)
 const ROUNDABOUT_KMH = 25;
+const FERRY_BOARDING_S = 900; // getting on and off a ferry
+const AVOID_FACTOR = 20; // avoided roads count as this many times slower
 const NEW_ROAD_DISCOUNT = 0.45; // 'new' mode: never-driven road counts as 55% of its time
 const BEARING_M = 15; // a road's direction is measured over this far from a junction
 
@@ -157,6 +174,7 @@ export class RoadGraph {
   private eLen: number[] = [];
   private eC0: number[] = [];
   private eC1: number[] = [];
+  private eDelay: number[] = []; // seconds at lights, signs, crossings along it
   private eName: number[] = [];
   private eGeo: number[] = []; // start of the edge's points in `pool`
   private eGeoN: number[] = []; // how many points
@@ -203,7 +221,7 @@ export class RoadGraph {
   }
 
   // pts: integer [la, lo, la, lo, ...] including both ends.
-  private addEdge(pts: number[], way: number, flags: number, cls: number, speed: number, len: number, c0: number, c1: number, name: number) {
+  private addEdge(pts: number[], way: number, flags: number, cls: number, speed: number, len: number, c0: number, c1: number, name: number, delay = 0) {
     const n = pts.length / 2;
     const a = this.node(pts[0], pts[1]);
     const b = this.node(pts[pts.length - 2], pts[pts.length - 1]);
@@ -217,6 +235,7 @@ export class RoadGraph {
     this.eLen.push(len);
     this.eC0.push(c0);
     this.eC1.push(c1);
+    this.eDelay.push(delay);
     this.eName.push(name);
     this.eGeo.push(this.pool.length / 2);
     this.eGeoN.push(n);
@@ -243,7 +262,7 @@ export class RoadGraph {
 
   /** Adds a region's main-roads graph (graph.json). */
   addGraph(g: GraphFile) {
-    if (!g || g.v !== 1 || !Array.isArray(g.nodes) || !Array.isArray(g.edges)) return;
+    if (!g || (g.v !== 1 && g.v !== 2) || !Array.isArray(g.nodes) || !Array.isArray(g.edges)) return;
     if (this.regions.includes(g.region)) return;
     this.regions.push(g.region);
     const nLa: number[] = [];
@@ -256,18 +275,22 @@ export class RoadGraph {
       nLo.push(lo);
     }
     // Road types: the file's own list, mapped onto ours.
+    // (Ferries have no road type: they're flagged instead.)
     const clsMap = (g.classes ?? []).map((c) => ROAD_CLASSES.indexOf(c));
+    // v2 adds the delay at lights and signs before the points.
+    const first = g.v === 2 ? 11 : 10;
     for (const row of g.edges) {
       const [a, b, way, flags, cls, speed, len, c0, c1, name] = row;
+      const delay = g.v === 2 ? row[10] || 0 : 0;
       const pts = [nLa[a], nLo[a]];
       let pla = nLa[a], plo = nLo[a];
-      for (let i = 10; i + 1 < row.length; i += 2) {
+      for (let i = first; i + 1 < row.length; i += 2) {
         pla += row[i];
         plo += row[i + 1];
         pts.push(pla, plo);
       }
       pts.push(nLa[b], nLo[b]);
-      this.addEdge(pts, way, flags, clsMap[cls] ?? cls, speed, len, c0, c1, this.nameId(name >= 0 ? g.names[name] : null));
+      this.addEdge(pts, way, flags, clsMap[cls] ?? -1, speed, len, c0, c1, this.nameId(name >= 0 ? g.names[name] : null), delay);
       this.mainWays.add(way);
     }
   }
@@ -314,7 +337,7 @@ export class RoadGraph {
       }
     }
     for (const { s, way, idx, pts } of fresh) {
-      const flags = (s.o === 1 ? 1 : 0) | (s.o === -1 ? 2 : 0) | (s.r ? 4 : 0);
+      const flags = (s.o === 1 ? 1 : 0) | (s.o === -1 ? 2 : 0) | (s.r ? 4 : 0) | (s.t ? 8 : 0) | (s.u ? 16 : 0);
       const name = this.nameId(s.n);
       const cls = s.h ?? -1;
       let start = 0;
@@ -389,13 +412,38 @@ export class RoadGraph {
     return atEnd ? bearingInt(far[0], far[1], la0, lo0) : bearingInt(la0, lo0, far[0], far[1]);
   }
 
+  // Average speed on an edge (m/s): its limit (tagged, or typical for the
+  // road type) times what traffic manages on that kind of road.
   private speedMs(e: number): number {
+    const flags = this.eFlags[e];
+    if (flags & 32) return Math.max(5, this.eSpeed[e] || 20) / 3.6; // ferry: its own speed
     const cls = ROAD_CLASSES[this.eClass[e]] ?? '';
-    let kmh = KMH[cls] ?? DEFAULT_KMH;
     const sp = this.eSpeed[e];
-    if (sp > 0) kmh = Math.min(sp * 0.92, kmh * 1.25);
-    if (this.eFlags[e] & 4) kmh = Math.min(kmh, ROUNDABOUT_KMH);
+    const limit = sp > 0 ? sp : LIMIT_KMH[cls] ?? 50;
+    let share = SHARE[cls] ?? 0.6;
+    if (limit <= 60 && cls !== 'residential' && cls !== 'living_street') share = Math.min(share, TOWN_SHARE);
+    let kmh = limit * share;
+    if (flags & 16) kmh = Math.min(kmh, UNPAVED_KMH);
+    if (flags & 4) kmh = Math.min(kmh, ROUNDABOUT_KMH);
     return Math.max(5, kmh) / 3.6;
+  }
+
+  /** Seconds to drive an edge's length (or part of it), with its delays. */
+  private seconds(e: number, metres: number): number {
+    const len = this.eLen[e] || 1;
+    return metres / this.speedMs(e) + this.eDelay[e] * Math.min(1, metres / len);
+  }
+
+  private isAvoided(e: number, avoid: Avoid): boolean {
+    const f = this.eFlags[e];
+    if (avoid.tolls && f & 8) return true;
+    if (avoid.unpaved && f & 16) return true;
+    if (avoid.ferries && f & 32) return true;
+    if (avoid.motorways) {
+      const c = ROAD_CLASSES[this.eClass[e]];
+      if (c === 'motorway' || c === 'motorway_link') return true;
+    }
+    return false;
   }
 
   private allowed(fromWay: number, node: number, toWay: number): boolean {
@@ -529,6 +577,7 @@ export class RoadGraph {
     to: { lat: number; lon: number },
     mode: RouteMode,
     isDriven: (way: number, piece: number) => boolean = () => false,
+    avoid: Avoid = {},
   ): PlannedRoute | null {
     const starts = this.nearest(from.lat, from.lon, from.heading ?? null, SNAP_M, SNAP_TRIES);
     const ends = this.nearest(to.lat, to.lon, null, SNAP_M, SNAP_TRIES);
@@ -537,7 +586,7 @@ export class RoadGraph {
     const pairs: [number, number][] = [[0, 0], [1, 0], [0, 1], [2, 0], [0, 2], [1, 1]];
     for (const [i, j] of pairs) {
       if (!starts[i] || !ends[j]) continue;
-      const r = this.routeBetween(starts[i], ends[j], from, to, mode, isDriven);
+      const r = this.routeBetween(starts[i], ends[j], from, to, mode, isDriven, avoid);
       if (r) return r;
     }
     return null;
@@ -550,6 +599,7 @@ export class RoadGraph {
     to: { lat: number; lon: number },
     mode: RouteMode,
     isDriven: (way: number, piece: number) => boolean,
+    avoid: Avoid,
   ): PlannedRoute | null {
     const newFrac = new Map<number, number>();
     const fracNew = (e: number) => {
@@ -563,9 +613,13 @@ export class RoadGraph {
       }
       return f;
     };
+    const anyAvoid = !!(avoid.tolls || avoid.motorways || avoid.unpaved || avoid.ferries);
     const cost = (e: number, metres: number) => {
-      const sec = metres / this.speedMs(e);
-      return mode === 'new' ? sec * (1 - NEW_ROAD_DISCOUNT * fracNew(e)) : sec;
+      let sec = this.seconds(e, metres);
+      if (this.eFlags[e] & 32) sec += FERRY_BOARDING_S;
+      if (mode === 'new') sec *= 1 - NEW_ROAD_DISCOUNT * fracNew(e);
+      if (anyAvoid && this.isAvoided(e, avoid)) sec *= AVOID_FACTOR;
+      return sec;
     };
     const hFactor = mode === 'new' ? 1 - NEW_ROAD_DISCOUNT : 1;
     const tLat = t.point[0] / SCALE, tLon = t.point[1] / SCALE;
@@ -671,7 +725,7 @@ export class RoadGraph {
       for (let a = bestArc; a !== START && a >= 0; a = prev[a]) path.push(a);
       path.reverse();
     }
-    return this.describe(s, t, path, bestDirect, mode, from, to, fracNew);
+    return this.describe(s, t, path, bestDirect, mode, from, to, fracNew, avoid);
   }
 
   // --- turning a path into a route (line, steps, times) ---
@@ -685,6 +739,7 @@ export class RoadGraph {
     from: { lat: number; lon: number },
     to: { lat: number; lon: number },
     fracNew: (e: number) => number,
+    avoid: Avoid,
   ): PlannedRoute {
     // Legs: [edge, points] in travel order. First leg: the start edge from
     // the snap point to its far end (the first path arc's direction);
@@ -711,6 +766,7 @@ export class RoadGraph {
     let duration = 0;
     let newM = 0;
     let distance = 0;
+    const uses: RouteUses = { tollM: 0, motorwayM: 0, unpavedM: 0, ferryM: 0 };
     const push = (p: [number, number]) => {
       const c: Coord = [p[0] / SCALE, p[1] / SCALE];
       const last = coords[coords.length - 1];
@@ -725,9 +781,16 @@ export class RoadGraph {
     }
     for (const leg of legs) {
       legStart.push(Math.max(0, coords.length - 1));
-      for (const p of leg.pts) if (push(p) && coords.length > 1) speeds.push(this.eSpeed[leg.e]);
-      duration += leg.len / this.speedMs(leg.e);
+      const ferry = !!(this.eFlags[leg.e] & 32);
+      for (const p of leg.pts) if (push(p) && coords.length > 1) speeds.push(ferry ? 0 : this.eSpeed[leg.e]);
+      duration += this.seconds(leg.e, leg.len) + (ferry ? FERRY_BOARDING_S : 0);
       distance += leg.len;
+      const f = this.eFlags[leg.e];
+      const c = ROAD_CLASSES[this.eClass[leg.e]];
+      if (f & 8) uses.tollM += leg.len;
+      if (f & 16) uses.unpavedM += leg.len;
+      if (ferry) uses.ferryM += leg.len;
+      if (c === 'motorway' || c === 'motorway_link') uses.motorwayM += leg.len;
       newM += leg.len * fracNew(leg.e);
     }
     // The end of the line: where you asked to go, if it's off the road a bit.
@@ -769,6 +832,17 @@ export class RoadGraph {
       const nameA = nameOf(a), nameB = nameOf(b);
       const roadB = spokenRoad(nameB);
       const onto = roadB ? ` onto ${roadB}` : '';
+      const inFerry = !!(this.eFlags[a.e] & 32), outFerry = !!(this.eFlags[b.e] & 32);
+      if (!inFerry && outFerry) {
+        maneuvers.push({ idx, instruction: `Take the ferry${nameB ? ` (${nameB})` : ''}`, kind: 'ferry' });
+        notePassing(nameB);
+        continue;
+      }
+      if (inFerry && !outFerry) {
+        maneuvers.push({ idx, instruction: roadB ? `Leave the ferry onto ${roadB}` : 'Leave the ferry', kind: 'straight' });
+        notePassing(nameB);
+        continue;
+      }
       if (!inRb && outRb) {
         roundaboutSince.leg = li;
         continue;
@@ -842,7 +916,8 @@ export class RoadGraph {
     }
     maneuvers.sort((x, y) => x.idx - y.idx);
 
-    const startName = spokenRoad(nameOf(legs[0]));
+    const startLeg = legs.find((l) => l.len > 5) ?? legs[0];
+    const startName = spokenRoad(nameOf(startLeg));
     const steps: Step[] = [];
     const stepAt = (idx: number, instruction: string, kind: TurnKind, notice: string): Step => ({ instruction, notice, distance: 0, coords: coords.slice(idx), kind });
     steps.push(stepAt(0, startName ? `Head along ${startName}` : 'Head off', 'depart', ''));
@@ -866,6 +941,8 @@ export class RoadGraph {
       speeds,
       newM,
       roadNames,
+      uses,
+      avoid,
     };
   }
 }

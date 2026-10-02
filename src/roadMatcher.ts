@@ -16,6 +16,9 @@ export type RoadSegment = {
   h?: number;
   sp?: number;
   r?: 1;
+  // v0.19 road data: toll road, unpaved surface.
+  t?: 1;
+  u?: 1;
 };
 
 export const SNAP_THRESHOLD_METERS = 25;

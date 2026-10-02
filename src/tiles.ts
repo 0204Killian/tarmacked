@@ -29,7 +29,8 @@ const SCALE = 100000;
 /**
  * Road pieces from a tile file. Reads the compact v2 format:
  *   { v: 2, names: [...], s: [[way, n, flags, county, name, class, speed, lat0, lon0, dlat, dlon, ...]] }
- * (flags: 1 one-way forward, 2 one-way reverse, 4 roundabout), and the old
+ * (flags: 1 one-way forward, 2 one-way reverse, 4 roundabout, 8 toll, 16
+ * unpaved), and the old
  * { segments: [...] } format too.
  */
 export function decodeTile(data: any): RoadSegment[] {
@@ -53,6 +54,8 @@ export function decodeTile(data: any): RoadSegment[] {
     if (flags & 1) seg.o = 1;
     else if (flags & 2) seg.o = -1;
     if (flags & 4) seg.r = 1;
+    if (flags & 8) seg.t = 1; // toll (v0.19 data)
+    if (flags & 16) seg.u = 1; // unpaved (v0.19 data)
     if (county >= 0) seg.c = county;
     if (name >= 0 && names[name]) seg.n = names[name];
     if (cls >= 0) seg.h = cls;

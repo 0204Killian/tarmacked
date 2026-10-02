@@ -69,7 +69,7 @@ const nodesLL: Coord[] = [];
   }
 }
 const lerp = (a: Coord, b: Coord, f: number) => ({ lat: a[0] + (b[0] - a[0]) * f, lon: a[1] + (b[1] - a[1]) * f });
-for (const e of anyEdges.filter((x) => x.length === 10).slice(0, 2000).filter((_, i) => i % 200 === 0)) { // straight ones only, so the in-between point is on the road
+for (const e of anyEdges.filter((x) => x.length === 11).slice(0, 2000).filter((_, i) => i % 200 === 0)) { // straight ones only, so the in-between point is on the road
   const A = nodesLL[e[0]], B = nodesLL[e[1]];
   const p30 = lerp(A, B, 0.3), p70 = lerp(A, B, 0.7);
   const fwd = full.route(p30, p70, 'fastest');
@@ -210,6 +210,50 @@ if (kd) {
     if (tried >= 2000) break;
   }
   check("graph links name the same road pieces as the tiles", tried > 500 && ok === tried, `${ok}/${tried}`);
+}
+
+// 9a. Avoid options (v0.19), on a made-up map: A→B by a toll motorway or a
+// slower regional road; B→D only by ferry; B→E only on a gravel road.
+{
+  const ll = (la: number, lo: number) => [Math.round(la * 1e5), Math.round(lo * 1e5)];
+  const P = { A: ll(53.0, -7.0), B: ll(53.0, -6.8), C: ll(53.06, -6.9), D: ll(53.0, -6.6), E: ll(53.1, -6.8) };
+  const order = ['A', 'B', 'C', 'D', 'E'] as const;
+  const nodes: number[] = [];
+  order.forEach((k, i) => nodes.push(i === 0 ? P[k][0] : P[k][0] - P[order[i - 1]][0], i === 0 ? P[k][1] : P[k][1] - P[order[i - 1]][1]));
+  const n = (k: (typeof order)[number]) => order.indexOf(k);
+  const len = (x: (typeof order)[number], y: (typeof order)[number]) => Math.round(haversine([P[x][0] / 1e5, P[x][1] / 1e5], [P[y][0] / 1e5, P[y][1] / 1e5]));
+  const classes = ['motorway', 'motorway_link', 'trunk', 'trunk_link', 'primary', 'primary_link', 'secondary', 'secondary_link', 'tertiary', 'tertiary_link', 'unclassified', 'residential', 'living_street', 'ferry'];
+  const g: GraphFile = {
+    v: 2, region: 'test', version: 't', classes, names: ['M99', 'R999', 'Island Ferry', 'Bog Road'],
+    nodes,
+    edges: [
+      [n('A'), n('B'), 1, 8, 0, 120, len('A', 'B'), 0, 0, 0, 0], // toll motorway
+      [n('A'), n('C'), 2, 0, 6, 80, len('A', 'C'), 0, 0, 1, 0], // regional road
+      [n('C'), n('B'), 3, 0, 6, 80, len('C', 'B'), 0, 0, 1, 0],
+      [n('B'), n('D'), 4, 32, 13, 20, len('B', 'D'), 0, 0, 2, 0], // car ferry
+      [n('B'), n('E'), 5, 16, 10, 80, len('B', 'E'), 0, 0, 3, 0], // gravel
+    ],
+  };
+  const gr = new RoadGraph();
+  gr.addGraph(g);
+  const at = (k: (typeof order)[number]) => ({ lat: P[k][0] / 1e5, lon: P[k][1] / 1e5 });
+  const plain = gr.route(at('A'), at('B'), 'fastest')!;
+  const noToll = gr.route(at('A'), at('B'), 'fastest', undefined, { tolls: true })!;
+  const noMw = gr.route(at('A'), at('B'), 'fastest', undefined, { motorways: true })!;
+  check(
+    'avoid tolls / motorways: the way round, when there is one',
+    plain.uses.tollM > 0 && plain.uses.motorwayM > 0 && noToll.uses.tollM === 0 && noMw.uses.motorwayM === 0 && noToll.duration > plain.duration,
+    `with tolls ${km(plain.distance)} ${mins(plain.duration)}; avoiding ${km(noToll.distance)} ${mins(noToll.duration)}`,
+  );
+  const ferry = gr.route(at('A'), at('D'), 'fastest', undefined, { ferries: true, tolls: true })!;
+  const gravel = gr.route(at('A'), at('E'), 'fastest', undefined, { unpaved: true })!;
+  check(
+    'avoid ferries / unpaved: still a route when there is no other way, and it says so',
+    !!ferry && ferry.uses.ferryM > 0 && ferry.uses.tollM === 0 && ferry.steps.some((st) => st.kind === 'ferry' && /ferry/i.test(st.instruction)) && !!gravel && gravel.uses.unpavedM > 0,
+    ferry ? ferry.steps.map((st) => st.instruction).join(' · ') : 'none',
+  );
+  const fast = gr.route(at('A'), at('D'), 'fastest')!;
+  check('a ferry costs its crossing and boarding time', fast.duration > len('B', 'D') / (20 / 3.6) + 600, mins(fast.duration));
 }
 
 // 9b. Starting off the road (a house up a lane, 400 m from the nearest
