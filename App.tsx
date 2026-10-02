@@ -33,7 +33,7 @@ import { TILE_HOST } from './src/tiles';
 // scripts/pipeline). It's checked for a newer version at most this often.
 const ROAD_DATA_CHECK_MS = 6 * 60 * 60 * 1000;
 // Shown in Settings → Help. Keep in step with app.json.
-const APP_VERSION = '0.18.0';
+const APP_VERSION = '0.18.1';
 
 const formatBytes = (b: number) => (b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.max(0, Math.round(b / 1e3))} KB`);
 

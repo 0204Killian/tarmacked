@@ -212,7 +212,21 @@ if (kd) {
   check("graph links name the same road pieces as the tiles", tried > 500 && ok === tried, `${ok}/${tried}`);
 }
 
+// 9b. Starting off the road (a house up a lane, 400 m from the nearest
+// road): the nearest road is used, and the line starts where you are.
+{
+  // A spot in the fields 300 m+ from any road, north of Kilkenny.
+  let home = { lat: 0, lon: 0 };
+  let sn = null as ReturnType<RoadGraph['snap']>;
+  for (let i = 0; i < 400 && !(sn && sn.off > 300); i++) {
+    home = { lat: 52.75 + (i % 20) * 0.004, lon: -7.35 + Math.floor(i / 20) * 0.006 };
+    sn = full.snap(home.lat, home.lon);
+  }
+  const r = full.route(home, DUBLIN, 'fastest');
+  check('start off the road: uses the nearest road, line starts at you', !!sn && !!r && r.coords[0][0] === home.lat && r.coords[0][1] === home.lon && r.speeds.length === r.coords.length - 1, sn ? `nearest road ${Math.round(sn.off)} m away; ${r ? km(r.distance) : 'no route'}` : 'no road');
+}
+
 // 9. Nothing near: no route rather than a wrong one.
-check('a point far from any road gives no route', full.route({ lat: 53.5, lon: -10.5 }, DUBLIN, 'fastest') === null);
+check('a point far from any road (out at sea) gives no route', full.route({ lat: 53.5, lon: -10.5 }, DUBLIN, 'fastest') === null);
 
 console.log(results.every(Boolean) ? '\nALL PASS' : '\nSOME FAILED');

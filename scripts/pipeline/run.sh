@@ -13,6 +13,16 @@ cd "$(dirname "$0")"
 
 REGION="${1:-ie}"
 VERSION="${2:-$(date +%Y-%m-%d)}"
+# A version name is never reused: phones and Cloudflare keep a version's
+# files forever, so the same name twice would mix two builds. If today's
+# date is already live, the next free one is used (2026-10-02b, c...).
+LIVE="$(curl -s https://tiles.tarmacked.com/manifest.json | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).regions['$REGION'].version)}catch{console.log('')}})" || true)"
+if [ -z "${2:-}" ] && [ -n "$LIVE" ] && [[ "$LIVE" == "$VERSION"* ]]; then
+  SUFFIX="${LIVE#"$VERSION"}" # '' or a letter
+  if [ -z "$SUFFIX" ]; then VERSION="${VERSION}b"; else VERSION="$VERSION$(printf "\\$(printf '%03o' $(( $(printf '%d' "'$SUFFIX") + 1 )))")"; fi
+fi
+if [ "$VERSION" = "$LIVE" ]; then echo "Version $VERSION is already live. Pick a new name, e.g. bash run.sh $REGION ${VERSION}b"; exit 1; fi
+echo "Building $REGION version $VERSION (live now: ${LIVE:-none})"
 case "$REGION" in
   ie) URL="https://download.geofabrik.de/europe/ireland-and-northern-ireland-latest.osm.pbf" ;;
   *) echo "Unknown region $REGION"; exit 1 ;;

@@ -40,7 +40,8 @@ export type PlannedRoute = NavRoute & {
 
 // --- tuning ---
 const SCALE = 1e5;
-const SNAP_M = 80; // how far from a road the start / end may be
+const SNAP_M = 2000; // how far from a road the start / end may be (a house up a lane, a field)
+const SNAP_TRIES = 3; // nearest roads tried at each end, in case the nearest is cut off (a private yard)
 const KMH: Record<string, number> = {
   motorway: 110, motorway_link: 60, trunk: 90, trunk_link: 50, primary: 80, primary_link: 45,
   secondary: 70, secondary_link: 40, tertiary: 60, tertiary_link: 35, unclassified: 45,
@@ -421,20 +422,28 @@ export class RoadGraph {
 
   /** Nearest road to a point (optionally going roughly `heading`). */
   snap(lat: number, lon: number, heading: number | null = null, maxM = SNAP_M): Snap | null {
+    return this.nearest(lat, lon, heading, maxM, 1)[0] ?? null;
+  }
+
+  /** The nearest few roads to a point, best first (one place on each). */
+  nearest(lat: number, lon: number, heading: number | null, maxM: number, limit: number): Snap[] {
     const la = Math.round(lat * SCALE), lo = Math.round(lon * SCALE);
     const cx = Math.floor(la / 1000), cy = Math.floor(lo / 1000);
     const kx = Math.cos(lat * toRad) * 1.11320; // metres per integer unit, lon
     const ky = 1.1132;
-    let best: Snap | null = null;
-    let bestScore = Infinity;
+    const found: { s: Snap; score: number }[] = [];
     const seen = new Set<number>();
-    for (let x = cx - 1; x <= cx + 1; x++) {
-      for (let y = cy - 1; y <= cy + 1; y++) {
+    // Grid cells are 0.01 degrees: ~1.1 km north-south, ~0.67 km east-west here.
+    const rx = Math.max(1, Math.ceil(maxM / 1100)), ry = Math.max(1, Math.ceil(maxM / (1000 * kx)));
+    for (let x = cx - rx; x <= cx + rx; x++) {
+      for (let y = cy - ry; y <= cy + ry; y++) {
         for (const e of this.grid.get(x * 100000 + y) ?? []) {
           if (seen.has(e)) continue;
           seen.add(e);
           const n = this.eGeoN[e];
           let along = 0;
+          let best: Snap | null = null;
+          let bestScore = Infinity;
           for (let i = 0; i < n - 1; i++) {
             const [aLa, aLo] = this.point(e, i);
             const [bLa, bLo] = this.point(e, i + 1);
@@ -463,21 +472,26 @@ export class RoadGraph {
             }
             along += segLen;
           }
+          if (best) {
+            // Scale "along" (measured flat) to the edge's stored length.
+            if (along > 0) best.along = (best.along / along) * this.eLen[e];
+            found.push({ s: best, score: bestScore });
+          }
         }
       }
     }
-    if (best) {
-      // Scale "along" (measured flat) to the edge's stored length.
-      const n = this.eGeoN[best.edge];
-      let flat = 0;
-      for (let i = 0; i < n - 1; i++) {
-        const [aLa, aLo] = this.point(best.edge, i);
-        const [bLa, bLo] = this.point(best.edge, i + 1);
-        flat += Math.hypot((bLo - aLo) * kx, (bLa - aLa) * ky);
-      }
-      if (flat > 0) best.along = (best.along / flat) * this.eLen[best.edge];
+    found.sort((a, b) => a.score - b.score);
+    // One per road: the same way's next piece is no real alternative.
+    const out: Snap[] = [];
+    const ways = new Set<number>();
+    for (const f of found) {
+      const w = this.eWay[f.s.edge];
+      if (ways.has(w)) continue;
+      ways.add(w);
+      out.push(f.s);
+      if (out.length >= limit) break;
     }
-    return best;
+    return out;
   }
 
   // Points of an edge between two distances along it (in drawn order).
@@ -516,9 +530,27 @@ export class RoadGraph {
     mode: RouteMode,
     isDriven: (way: number, piece: number) => boolean = () => false,
   ): PlannedRoute | null {
-    const s = this.snap(from.lat, from.lon, from.heading ?? null);
-    const t = this.snap(to.lat, to.lon, null, 500);
-    if (!s || !t) return null;
+    const starts = this.nearest(from.lat, from.lon, from.heading ?? null, SNAP_M, SNAP_TRIES);
+    const ends = this.nearest(to.lat, to.lon, null, SNAP_M, SNAP_TRIES);
+    // The nearest road at each end first; if that one leads nowhere (a
+    // private yard, a road cut off in the data), the next nearest.
+    const pairs: [number, number][] = [[0, 0], [1, 0], [0, 1], [2, 0], [0, 2], [1, 1]];
+    for (const [i, j] of pairs) {
+      if (!starts[i] || !ends[j]) continue;
+      const r = this.routeBetween(starts[i], ends[j], from, to, mode, isDriven);
+      if (r) return r;
+    }
+    return null;
+  }
+
+  private routeBetween(
+    s: Snap,
+    t: Snap,
+    from: { lat: number; lon: number; heading?: number | null },
+    to: { lat: number; lon: number },
+    mode: RouteMode,
+    isDriven: (way: number, piece: number) => boolean,
+  ): PlannedRoute | null {
     const newFrac = new Map<number, number>();
     const fracNew = (e: number) => {
       let f = newFrac.get(e);
@@ -686,6 +718,11 @@ export class RoadGraph {
       coords.push(c);
       return true;
     };
+    // Starting off the road (a house up a lane): the line begins where you
+    // are, so following it doesn't count as being off the route.
+    if (haversine([from.lat, from.lon], [s.point[0] / SCALE, s.point[1] / SCALE]) > 15) {
+      coords.push([from.lat, from.lon]);
+    }
     for (const leg of legs) {
       legStart.push(Math.max(0, coords.length - 1));
       for (const p of leg.pts) if (push(p) && coords.length > 1) speeds.push(this.eSpeed[leg.e]);
