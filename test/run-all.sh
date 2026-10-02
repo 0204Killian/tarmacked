@@ -11,3 +11,6 @@ tsc --target es2020 --module commonjs --strict --skipLibCheck --outDir "$OUT" sr
 node --no-warnings test/storage.test.js "$OUT" | grep -E "^FAIL|ALL PASS|SOME FAILED"
 tsc --target es2020 --module commonjs --strict --outDir "$OUT" test/nav.test.ts
 node "$OUT/test/nav.test.js" | grep -E "^FAIL|ALL PASS|SOME FAILED"
+npx tsx test/roadData.test.ts | grep -E "^FAIL|ALL PASS|SOME FAILED"
+npx tsx test/recap.test.ts | grep -E "^FAIL|ALL PASS|SOME FAILED"
+npx tsx test/pipeline.test.ts | grep -E "^FAIL|ALL PASS|SOME FAILED"

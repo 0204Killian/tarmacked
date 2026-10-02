@@ -9,9 +9,10 @@ declare module 'react' {
   export function useCallback<T extends (...a: any[]) => any>(f: T, deps: any[]): T;
 }
 declare module 'react-native' {
-  export const StyleSheet: { create<T>(s: T): T };
+  export const StyleSheet: { create<T>(s: T): T; hairlineWidth: number };
   export const Text: any, View: any, Pressable: any, ScrollView: any, ActivityIndicator: any, Image: any, Switch: any, TextInput: any;
   export const Keyboard: { dismiss(): void };
+  export const Platform: { OS: 'ios' | 'android'; Version: string | number };
   export const AppState: { currentState: string; addEventListener(t: 'change', cb: (s: 'active' | 'background' | 'inactive') => void): { remove(): void } };
   export const Linking: { openSettings(): Promise<void>; openURL(u: string): Promise<void>; getInitialURL(): Promise<string | null>; addEventListener(t: 'url', cb: (e: { url: string }) => void): { remove(): void } };
   export const Animated: any;
@@ -107,4 +108,12 @@ declare function require(p: string): any;
 declare module 'expo-keep-awake' {
   export function activateKeepAwakeAsync(tag?: string): Promise<void>;
   export function deactivateKeepAwake(tag?: string): Promise<void>;
+}
+declare module 'react-native-svg' {
+  const Svg: any;
+  export default Svg;
+  export const Path: any, Rect: any;
+}
+declare module 'react-native-view-shot' {
+  export function captureRef(ref: any, o?: { format?: 'png' | 'jpg'; quality?: number; result?: 'tmpfile' | 'base64' }): Promise<string>;
 }

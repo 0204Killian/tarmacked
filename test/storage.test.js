@@ -133,5 +133,47 @@ function check(name, ok, info = '') { results.push(ok); console.log(`${ok ? 'PAS
   const hasB = raw.prepare("SELECT COUNT(*) n FROM driven WHERE id = 'b'").get().n;
   check('bulk: a failing row rolls back the whole write', threw && hasB === 0);
 
+  // v0.17 tile cache: an install from 0.16 with cached tiles (no version).
+  raw = new DatabaseSync(':memory:');
+  raw.exec(`
+    CREATE TABLE tiles (tile_id TEXT PRIMARY KEY NOT NULL, segments TEXT NOT NULL, pinned INTEGER NOT NULL DEFAULT 0, last_used_at INTEGER NOT NULL);
+    INSERT INTO tiles VALUES ('t_1_1', '[{"id":"way/1#0","coords":[[1,1],[1,1.001]]}]', 1, 1);
+    INSERT INTO tiles VALUES ('t_1_2', '[{"id":"way/2#0","coords":[[1,2],[1,2.001]]}]', 0, 1);
+  `);
+  delete require.cache[require.resolve(path.join(OUT, 'src/storage.js'))];
+  const t = require(path.join(OUT, 'src/storage.js'));
+  const legacy = await t.getAllTiles();
+  check('0.16 tiles kept through the upgrade, marked as no version', legacy.length === 2 && legacy.every((x) => x.version === null) && legacy[0].segments[0].id.startsWith('way/'));
+  const loaded = await t.loadAll();
+  check('loading the app no longer reads every tile', !('tiles' in loaded));
+  await t.putTiles([{ tileId: 't_1_2', segments: [{ id: 'way/3#0', coords: [[1, 2], [1, 2.002]] }] }, { tileId: 't_5_5', segments: [] }], false, '2026-10-03');
+  const got = await t.getTiles(['t_1_2', 't_5_5', 't_9_9']);
+  check('tiles by ID, with their version', got.length === 2 && got.find((x) => x.tileId === 't_1_2').version === '2026-10-03' && got.find((x) => x.tileId === 't_1_2').segments[0].id === 'way/3#0');
+  const lots = Array.from({ length: 1200 }, (_, i) => `t_x_${i}`);
+  check('asking for over 999 tiles at once works', (await t.getTiles(lots)).length === 0);
+  await t.putTiles([{ tileId: 't_1_2', segments: [] }], true, '2026-10-03');
+  const info = await t.tileCacheInfo();
+  check('storage figure: tiles, bytes, home county', info.tiles === 3 && info.bytes > 0 && info.pinned === 2, JSON.stringify(info));
+  const freed = await t.clearUnpinnedTiles();
+  check('free up storage keeps the home county', freed === 1 && (await t.getTiles(['t_1_1', 't_1_2', 't_5_5'])).length === 2);
+
+  // Delete all my data: personal data gone, settings and road data kept.
+  await t.setMeta('home_county', 'County Kilkenny');
+  await t.setMeta('forgotten_trails', '[[1]]');
+  await t.setMeta('edit_migration', '[{}]');
+  await t.appendLog('drive 1 matched');
+  const id = await t.startDrive(5000);
+  await t.addPoints(id, [{ latitude: 52.1, longitude: -7.1, timestamp: 5000 }]);
+  await t.addDriven([{ id: 'way/1#0', shape: null, county: 1 }]);
+  await t.setExcluded('way/9#0', true, 1, 100);
+  await t.deleteAllData();
+  const left = ['drives', 'points', 'driven', 'excluded_roads', 'log'].map((tb) => raw.prepare(`SELECT COUNT(*) n FROM ${tb}`).get().n);
+  check(
+    'delete all my data: drives, points, roads, edits and log gone; settings and road data stay',
+    left.every((n) => n === 0) && (await t.getMeta('forgotten_trails')) === null && (await t.getMeta('edit_migration')) === null &&
+      (await t.getMeta('home_county')) === 'County Kilkenny' && (await t.tileCacheInfo()).tiles === 2,
+    left.join()
+  );
+
   console.log(results.every(Boolean) ? '\nALL PASS' : '\nSOME FAILED');
 })();

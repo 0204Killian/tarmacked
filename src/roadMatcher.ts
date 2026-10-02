@@ -11,6 +11,11 @@ export type RoadSegment = {
   // Road name / number from OSM (e.g. "N77 Kilkenny Road"). Absent on
   // unnamed roads and in tiles made before v0.14.
   n?: string;
+  // v0.17 road data: road type (index into ROAD_CLASSES in src/tiles.ts),
+  // speed limit in km/h if tagged, roundabout.
+  h?: number;
+  sp?: number;
+  r?: 1;
 };
 
 export const SNAP_THRESHOLD_METERS = 25;

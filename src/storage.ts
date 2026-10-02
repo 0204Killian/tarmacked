@@ -24,6 +24,7 @@ import type { RoadSegment } from './roadMatcher';
 export type StoredPoint = { latitude: number; longitude: number; timestamp: number; accuracy?: number | null; speed?: number | null };
 export type Shape = [number, number][];
 export type TileEntry = { tileId: string; segments: RoadSegment[] };
+export type CachedTile = TileEntry & { version: string | null };
 
 // Tiles not used for this long get cleared (unless pinned, e.g. home county).
 const TILE_MAX_IDLE_MS = 120 * 24 * 60 * 60 * 1000; // ~4 months
@@ -88,6 +89,10 @@ async function openDb() {
   // v0.15.2: times each drive went over a chunk (up and back down = 2).
   const rcols = await db.getAllAsync<{ name: string }>('PRAGMA table_info(drive_roads)');
   if (!rcols.some((c) => c.name === 'n')) await db.execAsync('ALTER TABLE drive_roads ADD COLUMN n INTEGER NOT NULL DEFAULT 1');
+  // v0.17: which version of the road data each cached tile came from
+  // (tiles from before have none, and are re-downloaded when online).
+  const tcols = await db.getAllAsync<{ name: string }>('PRAGMA table_info(tiles)');
+  if (!tcols.some((c) => c.name === 'version')) await db.execAsync('ALTER TABLE tiles ADD COLUMN version TEXT');
   return db;
 }
 
@@ -265,7 +270,6 @@ export type LoadedState = {
   driven: { id: string; shape: Shape | null; county: number | null }[];
   excluded: { id: string; county: number | null; lengthM: number | null }[];
   unmatched: StoredPoint[];
-  tiles: TileEntry[];
   driveCount: number;
   pointCount: number;
 };
@@ -282,7 +286,6 @@ export async function loadAll(): Promise<LoadedState> {
   const unmatched = await db.getAllAsync<{ lat: number; lon: number; t: number }>(
     'SELECT lat, lon, t FROM unmatched ORDER BY t'
   );
-  const tiles = await db.getAllAsync<{ tile_id: string; segments: string }>('SELECT tile_id, segments FROM tiles');
   const counts = await db.getFirstAsync<{ drives: number; points: number }>(
     'SELECT (SELECT COUNT(*) FROM drives) AS drives, (SELECT COUNT(*) FROM points) AS points'
   );
@@ -292,7 +295,6 @@ export async function loadAll(): Promise<LoadedState> {
     driven: driven.map((r) => ({ id: r.id, shape: r.shape ? (JSON.parse(r.shape) as Shape) : null, county: r.county })),
     excluded: excluded.map((r) => ({ id: r.id, county: r.county, lengthM: r.length_m })),
     unmatched: unmatched.map((r) => ({ latitude: r.lat, longitude: r.lon, timestamp: r.t })),
-    tiles: tiles.map((r) => ({ tileId: r.tile_id, segments: JSON.parse(r.segments) as RoadSegment[] })),
     driveCount: counts?.drives ?? 0,
     pointCount: counts?.points ?? 0,
   };
@@ -840,17 +842,58 @@ export async function restoreRemoved(): Promise<number> {
 
 // --- tile cache (disposable) ---
 
-export async function putTiles(entries: TileEntry[], pinned: boolean) {
+export async function putTiles(entries: TileEntry[], pinned: boolean, version: string | null = null) {
   if (entries.length === 0) return;
   const now = Date.now();
   await write(async (db) => {
     await bulk(
       db,
-      'INSERT INTO tiles (tile_id, segments, pinned, last_used_at) VALUES (?, ?, ?, ?) ' +
-        'ON CONFLICT(tile_id) DO UPDATE SET segments = excluded.segments, pinned = MAX(tiles.pinned, excluded.pinned), last_used_at = excluded.last_used_at',
-      entries.map((e) => [e.tileId, JSON.stringify(e.segments), pinned ? 1 : 0, now])
+      'INSERT INTO tiles (tile_id, segments, pinned, last_used_at, version) VALUES (?, ?, ?, ?, ?) ' +
+        'ON CONFLICT(tile_id) DO UPDATE SET segments = excluded.segments, pinned = MAX(tiles.pinned, excluded.pinned), ' +
+        'last_used_at = excluded.last_used_at, version = excluded.version',
+      entries.map((e) => [e.tileId, JSON.stringify(e.segments), pinned ? 1 : 0, now, version])
     );
   });
+}
+
+// Cached tiles by ID (any version; the caller checks).
+export async function getTiles(ids: string[]): Promise<CachedTile[]> {
+  if (ids.length === 0) return [];
+  const db = await getDb();
+  const out: CachedTile[] = [];
+  for (let i = 0; i < ids.length; i += 500) {
+    const part = ids.slice(i, i + 500);
+    const rows = await db.getAllAsync<{ tile_id: string; segments: string; version: string | null }>(
+      `SELECT tile_id, segments, version FROM tiles WHERE tile_id IN (${part.map(() => '?').join(',')})`,
+      part
+    );
+    for (const r of rows) out.push({ tileId: r.tile_id, segments: JSON.parse(r.segments), version: r.version });
+  }
+  return out;
+}
+
+// Every cached tile. Only used when there's no road-data index yet (first
+// launch of 0.17 with no signal), and to find old road shapes before a
+// new version of the road data replaces them.
+export async function getAllTiles(): Promise<CachedTile[]> {
+  const db = await getDb();
+  const rows = await db.getAllAsync<{ tile_id: string; segments: string; version: string | null }>('SELECT tile_id, segments, version FROM tiles');
+  return rows.map((r) => ({ tileId: r.tile_id, segments: JSON.parse(r.segments), version: r.version }));
+}
+
+// How much road data is stored on the phone.
+export async function tileCacheInfo(): Promise<{ tiles: number; bytes: number; pinned: number }> {
+  const db = await getDb();
+  const r = await db.getFirstAsync<{ n: number; b: number | null; p: number | null }>(
+    'SELECT COUNT(*) AS n, SUM(LENGTH(segments)) AS b, SUM(pinned) AS p FROM tiles'
+  );
+  return { tiles: r?.n ?? 0, bytes: r?.b ?? 0, pinned: r?.p ?? 0 };
+}
+
+// "Free up storage": everything except the home county.
+export async function clearUnpinnedTiles(): Promise<number> {
+  const res = await write((db) => db.runAsync('DELETE FROM tiles WHERE pinned = 0'));
+  return res.changes;
 }
 
 // Marks tiles as recently used (you've been near them), so they aren't
@@ -889,6 +932,19 @@ export async function resetProgress() {
     await db.runAsync('DELETE FROM drive_roads');
     await db.execAsync('CREATE TABLE IF NOT EXISTS pinned_roads (id TEXT PRIMARY KEY NOT NULL)');
     await db.runAsync('DELETE FROM pinned_roads');
+  });
+}
+
+// "Delete all my data": everything personal on the phone — drives, roads,
+// edits, the log and leftovers. Settings (home county, GPS mode, map style)
+// and the downloaded road data stay.
+export async function deleteAllData() {
+  await resetProgress();
+  await write(async (db) => {
+    await db.runAsync('DELETE FROM log');
+    await db.runAsync(
+      "DELETE FROM meta WHERE key IN ('match_queue', 'forgotten_trails', 'recheck_pending', 'edit_migration', 'last_response')"
+    );
   });
 }
 
