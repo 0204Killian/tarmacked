@@ -134,6 +134,8 @@ const places = JSON.parse(fs.readFileSync(path.join(dir, 'places.json'), 'utf8')
 check('places: towns and villages kept, farms not', places.places.map((p: any) => p[0]).join() === 'Cashel,Urlingford');
 const restr = JSON.parse(fs.readFileSync(path.join(dir, 'restrictions.json'), 'utf8'));
 check('turn restrictions: via-node ones located, via-way ones skipped', restr.r.length === 1 && restr.r[0][0] === viaWayA && restr.r[0][3] === viaWayB, JSON.stringify(restr.r));
+const graph = JSON.parse(fs.readFileSync(path.join(dir, 'graph.json'), 'utf8'));
+check('routing graph written (main roads only)', graph.v === 1 && Array.isArray(graph.nodes) && Array.isArray(graph.edges) && graph.edges.length === 0, `${graph.edges.length} links (this test's roads are all unclassified, so none)`);
 const manifest = JSON.parse(fs.readFileSync(path.join(out, 'manifest.json'), 'utf8'));
 check('manifest points at the new version', manifest.regions.ie.path === 'ie/2026-10-03/' && manifest.regions.ie.tiles === index.tiles.length);
 check('tiles smaller than before', newBytes < oldBytes * 0.7, `${(newBytes / 1e6).toFixed(2)} MB vs ${(oldBytes / 1e6).toFixed(2)} MB for the same area (${Math.round((100 * newBytes) / oldBytes)}%), before Cloudflare's compression`);

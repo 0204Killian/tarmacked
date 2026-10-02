@@ -1,32 +1,39 @@
 import { Component, ReactNode, useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { StyleSheet, Text, View, Pressable, ScrollView, ActivityIndicator, AppState, Linking, Animated, Easing, Image, Switch, Platform, Alert, ActionSheetIOS } from 'react-native';
-import MapView, { Polyline, UrlTile, PROVIDER_DEFAULT, MapPressEvent, MapType, Region } from 'react-native-maps';
+import { StyleSheet, Text, View, Pressable, ScrollView, ActivityIndicator, AppState, Linking, Animated, Easing, Image, Switch, Platform, Alert, ActionSheetIOS, Keyboard } from 'react-native';
+import MapView, { Polyline, UrlTile, Marker, PROVIDER_DEFAULT, MapPressEvent, MapType, Region } from 'react-native-maps';
 import * as Location from 'expo-location';
 import * as Battery from 'expo-battery';
 import * as Notifications from 'expo-notifications';
 import * as SplashScreen from 'expo-splash-screen';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
-import { File, Paths } from 'expo-file-system';
+import { File, Directory, Paths } from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import * as DocumentPicker from 'expo-document-picker';
 import * as store from './src/storage';
 import * as bg from './src/background';
 import * as Motion from './modules/motion-activity';
+import * as NavKit from './modules/nav-kit';
 import { RoadNetwork, RoadSegment, parseChunkId, baseChunkId } from './src/roadMatcher';
 import { DriveMatcher, Point, PieceIndex, isPatchy } from './src/coverage';
 import { recheckDrives, driveDistanceMeters } from './src/recheck';
 import { HEAT_STEPS, heatStep, stepColor, rankRoads, RoadRank } from './src/heat';
-import { Coord, lineLengthMeters, distanceMeters, tileIdForPoint, neighbourTileIds, simplifyLine } from './src/geo';
+import { Coord, lineLengthMeters, distanceMeters, headingBetween, haversine, tileIdForPoint, neighbourTileIds, simplifyLine } from './src/geo';
 import { RoadData, fetchJson } from './src/roadData';
 import { migrateEdits, OldEdit } from './src/editMigrate';
 import { Recap, driveGains } from './src/recap';
 import { RecapCard } from './src/RecapCard';
+import { Navigator, NavUpdate } from './src/nav';
+import { RoadGraph, PlannedRoute, RouteMode, sameRoute } from './src/router';
+import { RouteData, Region as NavRegion } from './src/routeData';
+import { Place, fold } from './src/places';
+import { SearchPanel, RouteChooser, NavBanner, NavFooter, SpeedLimit } from './src/navUi';
+import { TILE_HOST } from './src/tiles';
 
 // Road data comes from tiles.tarmacked.com (see src/tiles.ts and
 // scripts/pipeline). It's checked for a newer version at most this often.
 const ROAD_DATA_CHECK_MS = 6 * 60 * 60 * 1000;
 // Shown in Settings → Help. Keep in step with app.json.
-const APP_VERSION = '0.17.2';
+const APP_VERSION = '0.18.0';
 
 const formatBytes = (b: number) => (b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.max(0, Math.round(b / 1e3))} KB`);
 
@@ -164,6 +171,7 @@ function formatDuration(ms: number) {
   return min < 60 ? `${min} min` : `${Math.floor(min / 60)}h ${pad2(min % 60)}m`;
 }
 const km = (m: number, dp = 1) => (m / 1000).toFixed(dp);
+const haversineM = (a: { lat: number; lon: number }, b: { lat: number; lon: number }) => haversine([a.lat, a.lon], [b.lat, b.lon]);
 const toLatLng = (c: Coord[]) => c.map(([latitude, longitude]) => ({ latitude, longitude }));
 
 // Joins driven chunks of the same road into continuous lines, so the map
@@ -432,6 +440,32 @@ function App() {
   const [backupBusy, setBackupBusy] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [note, setNoteText] = useState('');
+
+  // Sat-nav (v0.18): our own routes (src/router.ts).
+  type NavStage = 'off' | 'search' | 'choose' | 'driving';
+  type Dest = { name: string; at: Coord };
+  const [navStage, setNavStage] = useState<NavStage>('off');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<Place[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [searchNote, setSearchNote] = useState('');
+  const [dest, setDest] = useState<Dest | null>(null);
+  const [routeOptions, setRouteOptions] = useState<PlannedRoute[]>([]);
+  const [chosenRoute, setChosenRoute] = useState(0);
+  const [routesLoading, setRoutesLoading] = useState('');
+  const [routeError, setRouteError] = useState('');
+  const [navRoute, setNavRoute] = useState<PlannedRoute | null>(null);
+  const [navUpdate, setNavUpdate] = useState<NavUpdate | null>(null);
+  const [rerouting, setRerouting] = useState(false);
+  const [muted, setMuted] = useState(false);
+  const navRef = useRef<Navigator | null>(null);
+  const navDestRef = useRef<Dest | null>(null);
+  const navModeRef = useRef<RouteMode>('fastest');
+  const navLastFixRef = useRef<Point | null>(null);
+  const rerouteAtRef = useRef(0);
+  const routeRequestRef = useRef(0); // ignores answers to older route requests
+  const mutedRef = useRef(false);
+  const routeDataRef = useRef<RouteData | null>(null);
   const noteTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [log, setLog] = useState<string[]>([]);
 
@@ -727,6 +761,8 @@ function App() {
         const savedMode = (await store.getMeta('accuracy_mode')) as AccuracyMode | null;
         if (savedMode && ACCURACY_MODES.some((m) => m.key === savedMode)) setAccuracyMode(savedMode);
         setDevMenu((await store.getMeta('dev_menu')) === '1');
+        mutedRef.current = (await store.getMeta('nav_muted')) === '1';
+        setMuted(mutedRef.current);
         const savedMap = await store.getMeta('map_type');
         if (savedMap && MAP_TYPES.includes(savedMap as MapChoice)) setMapTypeIndex(MAP_TYPES.indexOf(savedMap as MapChoice));
         if (hasIndex) {
@@ -1133,6 +1169,7 @@ function App() {
 
   const processPoints = (newPoints: Point[]) => {
     if (newPoints.length === 0) return;
+    if (navRef.current) navFeedRef.current(newPoints);
     // Fetch road data around you before you need it.
     const wanted = new Set<string>();
     for (const p of newPoints) neighbourTileIds(p.latitude, p.longitude).forEach((t) => wanted.add(t));
@@ -1484,6 +1521,351 @@ function App() {
     const { latitude, longitude } = e.nativeEvent.coordinate;
     bg.onPoints([{ latitude, longitude, timestamp: Date.now() }]).catch(() => undefined);
   };
+
+  // ---------- Sat-nav (v0.18) ----------
+  // Routes are our own (src/router.ts): the main roads from graph.json plus
+  // the detailed road tiles near the start and the end. Following a route,
+  // prompts and going off route are src/nav.ts. Positions come from the
+  // recording drive, so navigating always records (in High, so prompts are
+  // on time).
+
+  const navDir = () => {
+    const d = new Directory(Paths.document, 'nav');
+    if (!d.exists) d.create({ intermediates: true, idempotent: true });
+    return d;
+  };
+  if (!routeDataRef.current) {
+    routeDataRef.current = new RouteData({
+      fetchText: async (url) => {
+        try {
+          const res = await fetch(url);
+          if (res.status === 404) return { ok: false, missing: true };
+          if (!res.ok) return { ok: false, missing: false };
+          return { ok: true, text: await res.text() };
+        } catch {
+          return { ok: false, missing: false };
+        }
+      },
+      readFile: async (name) => {
+        const f = new File(navDir(), name);
+        return f.exists ? await f.text() : null;
+      },
+      writeFile: async (name, text) => {
+        new File(navDir(), name).write(text);
+      },
+      deleteFiles: async (keep) => {
+        for (const item of navDir().list()) if (item instanceof File && !keep.includes(item.name)) item.delete();
+      },
+      log: (line) => addLog(line),
+    });
+  }
+  const routeData = routeDataRef.current;
+
+  // Every region the road data has (more than one = cross-border trips).
+  const navRegions = (): NavRegion[] =>
+    Object.entries(roadData.manifest?.regions ?? {}).map(([id, r]) => ({ id, version: r.version, base: `${TILE_HOST}${r.path}` }));
+
+  const say = (text: string) => {
+    if (!mutedRef.current) NavKit.speak(text);
+  };
+
+  // Where you are, and which way you're going if that's known.
+  const hereNow = async (): Promise<{ at: Coord; heading: number | null } | null> => {
+    const p = lastLivePointRef.current;
+    if (p && Date.now() - p.timestamp < 60_000) {
+      const prev = navLastFixRef.current;
+      const heading = prev && prev !== p && distanceMeters(prev, p) > 8 ? headingBetween(prev, p) : null;
+      return { at: [p.latitude, p.longitude], heading };
+    }
+    try {
+      const pos =
+        (await Location.getLastKnownPositionAsync({ maxAge: 60_000 })) ??
+        (await withTimeout(Location.getCurrentPositionAsync({}), 8000, 'get current position'));
+      const h = pos.coords.heading;
+      const moving = (pos.coords.speed ?? 0) > 2;
+      return { at: [pos.coords.latitude, pos.coords.longitude], heading: h != null && h >= 0 && moving ? h : null };
+    } catch {
+      return null;
+    }
+  };
+
+  // The detailed roads within ~5 km of these points go into the route graph
+  // (downloaded first if they aren't on the phone).
+  const addDetailAround = async (graph: RoadGraph, points: Coord[]) => {
+    const want = new Set<string>();
+    for (const p of points) {
+      for (let la = p[0] - 0.045; la <= p[0] + 0.0451; la += 0.025) {
+        for (let lo = p[1] - 0.075; lo <= p[1] + 0.0751; lo += 0.025) want.add(tileIdForPoint(la, lo));
+      }
+    }
+    await roadData.ensure(want);
+    const segs: RoadSegment[] = [];
+    for (const seg of netRef.current.segs.values()) if (want.has(tileIdForPoint(seg.coords[0][0], seg.coords[0][1]))) segs.push(seg);
+    graph.addDetail(segs);
+  };
+
+  // Road pieces you've driven, for the "new roads" route and its new-road total.
+  const drivenChecker = () => {
+    const base = new Set<string>();
+    for (const id of drivenRef.current) base.add(baseChunkId(id));
+    return (way: number, piece: number) => base.has(`way/${way}#${piece}`);
+  };
+
+  const planRoutes = async (
+    from: { at: Coord; heading: number | null },
+    to: Coord,
+    modes: RouteMode[],
+    req: number,
+    onStage: (what: string) => void = () => undefined,
+  ): Promise<{ routes: PlannedRoute[]; hasGraph: boolean } | null> => {
+    onStage('Getting road data…');
+    const data = await routeData.load(navRegions());
+    await addDetailAround(data.graph, [from.at, to]);
+    if (req !== routeRequestRef.current) return null;
+    onStage('Working out routes…');
+    await tick();
+    const isDriven = drivenChecker();
+    const routes: PlannedRoute[] = [];
+    for (const mode of modes) {
+      const t0 = Date.now();
+      const r = data.graph.route({ lat: from.at[0], lon: from.at[1], heading: from.heading }, { lat: to[0], lon: to[1] }, mode, isDriven);
+      addLog(`sat-nav: ${mode} route ${r ? `${km(r.distance)} km` : 'not found'} in ${Date.now() - t0} ms`);
+      if (r && !routes.some((o) => sameRoute(o, r))) routes.push(r);
+      await tick();
+      if (req !== routeRequestRef.current) return null;
+    }
+    return { routes, hasGraph: data.withGraph.length > 0 };
+  };
+
+  const openSearch = () => {
+    setPanel(null);
+    setSearchQuery('');
+    setSearchResults([]);
+    setSearchNote('');
+    setNavStage('search');
+    routeData.load(navRegions()).catch(() => undefined); // ready for the first letters
+  };
+
+  // Towns and villages as you type (on the phone); Apple's search for
+  // addresses, Eircodes and businesses after a short pause (online).
+  useEffect(() => {
+    if (navStage !== 'search') return;
+    const q = searchQuery.trim();
+    setSearchNote('');
+    if (q.length < 2) {
+      setSearchResults([]);
+      return;
+    }
+    let live = true;
+    let local: Place[] = [];
+    const herePromise = hereNow();
+    (async () => {
+      const [here, data] = await Promise.all([herePromise, routeData.load(navRegions())]);
+      if (!live) return;
+      local = data.places.search(q, here?.at ?? null, 6);
+      setSearchResults((prev) => (prev.some((p) => p.source === 'online') ? prev : local));
+    })().catch(() => undefined);
+    if (!NavKit.canSearch() || q.length < 3) {
+      return () => {
+        live = false;
+      };
+    }
+    const timer = setTimeout(async () => {
+      setSearching(true);
+      try {
+        const here = await herePromise;
+        const found = await NavKit.search(q, here?.at ?? null);
+        if (!live) return;
+        const online: Place[] = found.map((f) => ({ ...f, source: 'online' as const }));
+        // A town of ours with the same name as an Apple result nearby: keep ours.
+        const dup = (o: Place) => local.some((l) => fold(l.name) === fold(o.name) && haversineM(l, o) < 3000);
+        const exact = local.filter((l) => fold(l.name).startsWith(fold(q)));
+        const rest = local.filter((l) => !exact.includes(l));
+        setSearchResults([...exact.slice(0, 3), ...online.filter((o) => !dup(o)), ...exact.slice(3), ...rest].slice(0, 15));
+      } catch {
+        if (live) setSearchNote("Couldn't search online (no connection?). Towns and villages still work.");
+      } finally {
+        if (live) setSearching(false);
+      }
+    }, 450);
+    return () => {
+      live = false;
+      clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchQuery, navStage]);
+
+  const chooseDestination = async (d: Dest) => {
+    Keyboard.dismiss();
+    const req = ++routeRequestRef.current;
+    setDest(d);
+    setNavStage('choose');
+    setPanel(null);
+    setRouteOptions([]);
+    setChosenRoute(0);
+    setRouteError('');
+    setRoutesLoading('Finding you…');
+    try {
+      const from = await hereNow();
+      if (!from) throw new Error('No GPS position yet. Try again in a moment.');
+      const res = await planRoutes(from, d.at, ['fastest', 'new'], req, (what) => req === routeRequestRef.current && setRoutesLoading(what));
+      if (!res) return;
+      if (res.routes.length === 0) {
+        throw new Error(
+          res.hasGraph
+            ? "Couldn't find a driving route to there."
+            : "Couldn't find a route. Long trips need the newest road data: try Settings → Road data → Check for updates.",
+        );
+      }
+      setRouteOptions(res.routes);
+      setChosenRoute(0);
+      setFollowing(false);
+      const pts = res.routes.flatMap((r) => r.coords.filter((_, i) => i % 10 === 0));
+      mapRef.current?.fitToCoordinates(toLatLng([...pts, d.at, from.at]), { edgePadding: { top: 120, right: 50, bottom: 340, left: 50 }, animated: true });
+    } catch (e) {
+      if (req === routeRequestRef.current) setRouteError((e as Error).message);
+    } finally {
+      if (req === routeRequestRef.current) setRoutesLoading('');
+    }
+  };
+
+  const cancelRoutes = () => {
+    routeRequestRef.current++;
+    setNavStage('off');
+    setDest(null);
+    setRouteOptions([]);
+    setRouteError('');
+    setRoutesLoading('');
+  };
+
+  // Long-press the map: route to that spot.
+  const onMapLongPress = (e: MapPressEvent) => {
+    if (editMode || navStage === 'driving') return;
+    const { latitude, longitude } = e.nativeEvent.coordinate;
+    const at: Coord = [latitude, longitude];
+    chooseDestination({ name: 'Dropped pin', at }).catch(() => undefined);
+    const rename = (name: string) => setDest((d) => (d && d.at[0] === at[0] && d.at[1] === at[1] && name ? { ...d, name } : d));
+    NavKit.placeName(at)
+      .then(async (name) => {
+        if (name) return rename(name);
+        const near = (await routeData.load(navRegions())).places.nearest(at);
+        if (near) rename(near.km < 1 ? near.name : `Near ${near.name}`);
+      })
+      .catch(() => undefined);
+  };
+
+  const spokenName = (d: Dest) => (d.name === 'Dropped pin' ? '' : d.name.split(',')[0]);
+
+  const startNavigation = async () => {
+    const route = routeOptions[chosenRoute];
+    if (!route || !dest) return;
+    const nav = new Navigator(route, spokenName(dest));
+    navRef.current = nav;
+    navDestRef.current = dest;
+    navModeRef.current = route.mode;
+    navLastFixRef.current = null;
+    rerouteAtRef.current = 0;
+    setNavRoute(route);
+    setNavUpdate(null);
+    setNavStage('driving');
+    setPanel(null);
+    setFollowing(true);
+    say(nav.start());
+    addLog(`sat-nav to ${dest.name}: ${route.mode}, ${km(route.distance)} km`);
+    if (!tracking) await startRecording('high');
+    else if (liveAutoRef.current) await bg.confirmDrive(); // navigating = definitely driving: keep it
+    if (tracking && activeModeRef.current !== 'high') {
+      activeModeRef.current = 'high';
+      bg.startUpdates('high').catch(() => undefined);
+    }
+  };
+
+  const endNavigation = () => {
+    navRef.current = null;
+    navDestRef.current = null;
+    routeRequestRef.current++;
+    NavKit.stopSpeaking();
+    setNavRoute(null);
+    setNavUpdate(null);
+    setNavStage('off');
+    setDest(null);
+    setRouteOptions([]);
+    setRerouting(false);
+  };
+
+  // Off the route: a new one from here, the same kind (at most every 10 s).
+  const reroute = async (from: Coord, heading: number | null) => {
+    const d = navDestRef.current;
+    if (!d || Date.now() - rerouteAtRef.current < 10_000) return;
+    rerouteAtRef.current = Date.now();
+    setRerouting(true);
+    try {
+      const res = await planRoutes({ at: from, heading }, d.at, [navModeRef.current], routeRequestRef.current);
+      if (!navRef.current || navDestRef.current !== d || !res || res.routes.length === 0) return;
+      navRef.current = new Navigator(res.routes[0], spokenName(d));
+      setNavRoute(res.routes[0]);
+      say('New route.');
+      addLog('sat-nav: new route');
+    } catch (e) {
+      addLog(`sat-nav: couldn't get a new route (${(e as Error).message})`);
+    } finally {
+      setRerouting(false);
+    }
+  };
+
+  // Each batch of GPS points from the recording drive.
+  const navFeed = (pts: Point[]) => {
+    const nav = navRef.current;
+    if (!nav) return;
+    const p = pts[pts.length - 1];
+    if (p.accuracy != null && p.accuracy > 50) return;
+    const prev = navLastFixRef.current;
+    const dt = prev ? (p.timestamp - prev.timestamp) / 1000 : 0;
+    const moved = prev ? distanceMeters(prev, p) : 0;
+    const speed = prev && dt >= 1 && dt < 30 ? moved / dt : null;
+    const heading = prev && moved > 8 ? headingBetween(prev, p) : null;
+    navLastFixRef.current = p;
+    const u = nav.update([p.latitude, p.longitude], speed, p.accuracy ?? null);
+    setNavUpdate(u);
+    if (u.say) say(u.say);
+    if (u.offRoute) reroute([p.latitude, p.longitude], heading).catch(() => undefined);
+    if (u.arrived) {
+      addLog('sat-nav: arrived');
+      setTimeout(() => {
+        if (navRef.current === nav) endNavigation();
+      }, 8000);
+    }
+  };
+  const navFeedRef = useRef(navFeed);
+  navFeedRef.current = navFeed;
+
+  const toggleMute = () => {
+    const m = !mutedRef.current;
+    mutedRef.current = m;
+    setMuted(m);
+    if (m) NavKit.stopSpeaking();
+    store.setMeta('nav_muted', m ? '1' : '0').catch(() => undefined);
+  };
+
+  // The route still ahead (what's been driven drops off), and the speed
+  // limit where you are on it.
+  const navAlongStep = navUpdate ? Math.floor(navUpdate.along / 40) : 0;
+  const navAhead = useMemo(() => {
+    const nav = navRef.current;
+    if (!navRoute || !nav || nav.route !== navRoute) return navRoute?.coords ?? [];
+    const along = navAlongStep * 40;
+    let i = 0;
+    while (i < nav.cum.length - 2 && nav.cum[i + 1] < along) i++;
+    return navRoute.coords.slice(i);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [navRoute, navAlongStep]);
+  const navSpeedLimit = useMemo(() => {
+    const nav = navRef.current;
+    if (!navRoute || !nav || nav.route !== navRoute || !navUpdate) return 0;
+    let i = 0;
+    while (i < nav.cum.length - 2 && nav.cum[i + 1] < navUpdate.along) i++;
+    return navRoute.speeds[i] ?? 0;
+  }, [navRoute, navUpdate]);
 
   // ---------- Editing ----------
 
@@ -2367,6 +2749,7 @@ function App() {
         followsUserLocation={following && !editMode}
         onPanDrag={() => following && setFollowing(false)}
         onPress={onMapPress}
+        onLongPress={onMapLongPress}
         onRegionChangeComplete={(r: Region) => setVisibleRegion(r)}
       >
         {MAP_TYPES[mapTypeIndex] === 'osm' && (
@@ -2431,6 +2814,49 @@ function App() {
         {/* Most-driven stretch picked from Stats → Roads. */}
         {highlight && drawLayers('hl', [{ chains: highlightChains, color: '#ffffff' }], false, baseRev, '#d0206a', 5)}
 
+        {/* Sat-nav: routes to choose from (the chosen one in blue), or the road ahead. */}
+        {navStage === 'choose' &&
+          routeOptions.map((r, i) =>
+            i === chosenRoute ? null : (
+              <Polyline
+                key={`alt-${i}-${baseRev}`}
+                coordinates={toLatLng(r.coords)}
+                strokeColor="#7f8b96"
+                strokeWidth={5}
+                lineCap="round"
+                lineJoin="round"
+                zIndex={8}
+                tappable
+                onPress={() => setChosenRoute(i)}
+              />
+            )
+          )}
+        {navStage === 'choose' && routeOptions[chosenRoute] && (
+          <Polyline
+            key={`route-${chosenRoute}-${baseRev}`}
+            coordinates={toLatLng(routeOptions[chosenRoute].coords)}
+            strokeColor="#3a8dff"
+            strokeWidth={7}
+            lineCap="round"
+            lineJoin="round"
+            zIndex={9}
+          />
+        )}
+        {navStage === 'driving' && navAhead.length > 1 && (
+          <Polyline
+            key={`nav-${baseRev}`}
+            coordinates={toLatLng(navAhead)}
+            strokeColor="#3a8dff"
+            strokeWidth={8}
+            lineCap="round"
+            lineJoin="round"
+            zIndex={9}
+          />
+        )}
+        {(navStage === 'choose' || navStage === 'driving') && dest && (
+          <Marker coordinate={{ latitude: dest.at[0], longitude: dest.at[1] }} title={dest.name} pinColor="#e5332a" />
+        )}
+
         {rawSessions &&
           rawSessions.map((session, i) =>
             session.length > 1 ? (
@@ -2445,7 +2871,23 @@ function App() {
           )}
       </MapView>
 
-      {/* Top bar */}
+      {/* Top bar (the sat-nav banner or search takes its place) */}
+      {navStage === 'driving' && <NavBanner update={navUpdate} rerouting={rerouting} />}
+      {navStage === 'search' && (
+        <SearchPanel
+          query={searchQuery}
+          onQuery={setSearchQuery}
+          results={searchResults}
+          searching={searching}
+          note={searchNote}
+          onPick={(p) => chooseDestination({ name: p.name || p.subtitle || 'Destination', at: [p.lat, p.lon] }).catch(() => undefined)}
+          onClose={() => {
+            Keyboard.dismiss();
+            setNavStage('off');
+          }}
+        />
+      )}
+      {(navStage === 'off' || navStage === 'choose') && (
       <View style={styles.topBar}>
         <View style={styles.topGroup}>
           <Pressable
@@ -2463,6 +2905,11 @@ function App() {
           <Pressable style={[styles.chip, panel === 'dev' && styles.chipActive]} onPress={() => togglePanel('dev')}>
             <Text style={styles.chipText}>⚙</Text>
           </Pressable>
+          {!editMode && navStage === 'off' && (
+            <Pressable style={[styles.chip, styles.chipGo]} onPress={openSearch}>
+              <Text style={styles.chipText}>Go</Text>
+            </Pressable>
+          )}
         </View>
         <View style={styles.topGroup}>
           <Pressable style={[styles.chip, heatOn && styles.chipHeat]} onPress={() => setHeatOn((v) => !v)}>
@@ -2480,9 +2927,10 @@ function App() {
           </Pressable>
         </View>
       </View>
+      )}
 
       {/* Heatmap legend, and the picked most-driven stretch */}
-      {(heatOn || highlight) && !panel && !editMode && (
+      {(heatOn || highlight) && !panel && !editMode && navStage === 'off' && (
         <View style={styles.heatBar}>
           {heatOn && (
             <View style={styles.legendRow}>
@@ -2877,7 +3325,9 @@ function App() {
         </View>
       )}
 
-      {!following && !editMode && (
+      {navStage === 'driving' && <SpeedLimit kmh={navSpeedLimit} />}
+
+      {!following && !editMode && navStage !== 'choose' && navStage !== 'search' && (
         <Pressable style={styles.recentreButton} onPress={recentre}>
           <Text style={styles.recentreText}>◎</Text>
         </Pressable>
@@ -2916,6 +3366,19 @@ function App() {
             </Pressable>
           </View>
         </View>
+      ) : navStage === 'choose' && dest ? (
+        <RouteChooser
+          destName={dest.name}
+          options={routeOptions}
+          chosen={chosenRoute}
+          loading={routesLoading}
+          error={routeError}
+          onChoose={setChosenRoute}
+          onGo={() => startNavigation().catch(() => undefined)}
+          onCancel={cancelRoutes}
+        />
+      ) : navStage === 'driving' ? (
+        <NavFooter update={navUpdate} muted={muted} onMute={toggleMute} onEnd={endNavigation} newM={tracking ? driveNewMRef.current : 0} />
       ) : (
         <View style={styles.bottomBar}>
           <View style={{ flex: 1 }}>
@@ -3097,6 +3560,7 @@ const styles = StyleSheet.create({
   chip: { backgroundColor: 'rgba(17,17,17,0.88)', borderRadius: 18, paddingVertical: 8, paddingHorizontal: 14 },
   chipActive: { backgroundColor: '#2f6f3a' },
   chipHeat: { backgroundColor: '#a3471a' },
+  chipGo: { backgroundColor: '#2a5fae' },
 
   heatBar: {
     position: 'absolute',

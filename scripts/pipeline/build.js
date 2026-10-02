@@ -7,7 +7,8 @@
 //   out/<region>/<version>/index.json      every tile, and the tiles of each county
 //   out/<region>/<version>/stats.json      road totals per county (and per road type)
 //   out/<region>/<version>/places.json     towns and villages (for search later)
-//   out/<region>/<version>/restrictions.json  turn restrictions (for routing later)
+//   out/<region>/<version>/restrictions.json  turn restrictions (for routing)
+//   out/<region>/<version>/graph.json     main-roads routing graph (graph.js)
 //
 // Usage (run.sh does this): node build.js <region> <version> <data dir> <out dir>
 
@@ -15,6 +16,7 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 const L = require('./lib');
+const { GraphBuilder } = require('./graph');
 
 const [region = 'ie', version = new Date().toISOString().slice(0, 10), dataDir = 'data', outDir = 'out'] = process.argv.slice(2);
 
@@ -139,6 +141,7 @@ async function main() {
   const totals = new Array(L.COUNTY_CODES.length).fill(0);
   const byClass = L.COUNTY_CODES.map(() => new Array(L.ROAD_CLASSES.length).fill(0));
   let ways = 0, pieces = 0, skipped = 0;
+  const graph = new GraphBuilder();
   for await (const f of features(path.join(dataDir, 'roads.geojsonseq'))) {
     const p = f.properties || {};
     if (!f.geometry || f.geometry.type !== 'LineString' || p['@type'] === 'node') continue;
@@ -161,6 +164,7 @@ async function main() {
     const h = L.ROAD_CLASSES.indexOf(p.highway);
     const sp = L.speedOf(p);
     const r = p.junction === 'roundabout' || p.junction === 'circular';
+    graph.addWay(wayId, nodes, coords, { o, h, sp, r, n });
     L.splitIntoChunks(coords).forEach((cc, i) => {
       if (cc.length < 2) return;
       const mid = cc[Math.floor(cc.length / 2)];
@@ -230,6 +234,11 @@ async function main() {
     .map(([from, via, to, kind]) => [from, ...viaNodes.get(via), to, kind]);
   fs.writeFileSync(path.join(dir, 'restrictions.json'), JSON.stringify({ kinds: L.RESTRICTIONS, r: rOut }));
 
+  // 6b. Routing graph (main roads) for the sat-nav.
+  const g = graph.build(region, version);
+  const graphJson = JSON.stringify(g.graph);
+  fs.writeFileSync(path.join(dir, 'graph.json'), graphJson);
+
   // 7. Manifest (other regions kept as they are).
   const manifestPath = path.join(outDir, 'manifest.json');
   let manifest = { v: 1, regions: {} };
@@ -245,6 +254,7 @@ async function main() {
   // Summary.
   console.log(`tiles: ${(bytes / 1e6).toFixed(1)} MB before compression`);
   console.log(`places: ${places.length}, turn restrictions: ${rOut.length}/${restrictions.length}`);
+  console.log(`routing graph: ${g.graph.nodes.length / 2} junctions, ${g.graph.edges.length} links, ${(g.meters / 1000).toFixed(0)} km of main road, ${(graphJson.length / 1e6).toFixed(1)} MB`);
   console.log('\nRoad totals:');
   L.COUNTY_CODES.forEach((c, i) => console.log(`  ${c.padEnd(18)} ${(totals[i] / 1000).toFixed(0).padStart(6)} km${counties.has(i) ? '' : '   (NO BOUNDARY FOUND)'}`));
   console.log(`  ${'Republic'.padEnd(18)} ${(national / 1000).toFixed(0).padStart(6)} km`);

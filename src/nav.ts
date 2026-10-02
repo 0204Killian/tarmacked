@@ -1,14 +1,13 @@
 // Sat-nav logic (v0.16): following a route, when to speak, going off
 // route, arriving, and how much never-driven road a route has. Pure logic
-// (no React or native calls) so it can be tested on its own. The routes
-// themselves come from Apple (modules/nav-kit) for now; anything that
-// gives a line plus turn steps can replace it later.
+// (no React or native calls) so it can be tested on its own. Since v0.18
+// the routes come from our own router (src/router.ts).
 
 import { RoadNetwork, Candidate, baseChunkId } from './roadMatcher';
 import { rangeOf, mergeStretches } from './coverage';
 import { Coord, haversine, metersPerDegLon, METERS_PER_DEG_LAT, headingBetween } from './geo';
 
-export type RouteStep = { instruction: string; notice: string; distance: number; coords: Coord[] };
+export type RouteStep = { instruction: string; notice: string; distance: number; coords: Coord[]; kind?: string };
 export type NavRoute = { name: string; distance: number; duration: number; coords: Coord[]; steps: RouteStep[] };
 
 // --- tuning ---
@@ -55,7 +54,7 @@ export function shortDistance(m: number): string {
 
 const lowerFirst = (s: string) => (s ? s[0].toLowerCase() + s.slice(1) : s);
 
-export type Maneuver = { at: number; instruction: string; final: boolean };
+export type Maneuver = { at: number; instruction: string; final: boolean; kind?: string };
 
 export type NavUpdate = {
   along: number; // metres along the route
@@ -97,11 +96,11 @@ export class Navigator {
       }
       at = Math.max(at, last);
       last = at;
-      if (i > 0 && s.instruction.trim()) out.push({ at, instruction: s.instruction.trim(), final: i === route.steps.length - 1 });
+      if (i > 0 && s.instruction.trim()) out.push({ at, instruction: s.instruction.trim(), final: i === route.steps.length - 1, kind: s.kind });
       byDistance += s.distance * k;
     });
     // Apple usually ends with an "arrive" step; make sure there is one.
-    if (!out.length || !out[out.length - 1].final) out.push({ at: this.length, instruction: 'You have arrived', final: true });
+    if (!out.length || !out[out.length - 1].final) out.push({ at: this.length, instruction: 'You have arrived', final: true, kind: 'arrive' });
     this.maneuvers = out;
   }
 

@@ -30,7 +30,7 @@ declare module 'react-native-maps' {
   export type LongPressEvent = { nativeEvent: { coordinate: { latitude: number; longitude: number } } };
 }
 declare module 'expo-location' {
-  export type LocationObject = { coords: { latitude: number; longitude: number; accuracy: number | null; speed?: number | null }; timestamp: number };
+  export type LocationObject = { coords: { latitude: number; longitude: number; accuracy: number | null; speed?: number | null; heading?: number | null }; timestamp: number };
   export type PermissionResponse = { status: 'granted' | 'denied' | 'undetermined'; canAskAgain: boolean };
   export function getForegroundPermissionsAsync(): Promise<PermissionResponse>;
   export function getBackgroundPermissionsAsync(): Promise<PermissionResponse>;
@@ -54,8 +54,8 @@ declare module 'expo-task-manager' { export function defineTask(n: string, f: (a
 declare module 'expo-sharing' { export function isAvailableAsync(): Promise<boolean>; export function shareAsync(u: string, o?: any): Promise<void>; }
 declare module 'expo-document-picker' { export function getDocumentAsync(o: any): Promise<{ canceled: boolean; assets?: { uri: string }[] }>; }
 declare module 'expo-file-system' {
-  export class Directory { constructor(...parts: (string | Directory | File)[]); readonly uri: string; readonly exists: boolean; create(o?: { intermediates?: boolean; idempotent?: boolean }): void; delete(): void; }
-  export class File { constructor(...parts: (string | Directory | File)[]); readonly uri: string; readonly exists: boolean; create(): void; delete(): void; write(c: string | Uint8Array): void; text(): Promise<string>; }
+  export class Directory { constructor(...parts: (string | Directory | File)[]); readonly uri: string; readonly exists: boolean; create(o?: { intermediates?: boolean; idempotent?: boolean }): void; delete(): void; list(): (Directory | File)[]; }
+  export class File { constructor(...parts: (string | Directory | File)[]); readonly uri: string; readonly name: string; readonly exists: boolean; create(): void; delete(): void; write(c: string | Uint8Array): void; text(): Promise<string>; }
   export const Paths: { cache: Directory; document: Directory };
 }
 declare module '@react-native-async-storage/async-storage' { const A: { getItem(k: string): Promise<string | null> }; export default A; }
