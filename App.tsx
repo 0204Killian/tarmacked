@@ -1,5 +1,5 @@
 import { Component, ReactNode, useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { StyleSheet, Text, View, Pressable, ScrollView, ActivityIndicator, AppState, Linking, Animated, Easing, Image, Switch, Platform } from 'react-native';
+import { StyleSheet, Text, View, Pressable, ScrollView, ActivityIndicator, AppState, Linking, Animated, Easing, Image, Switch, Platform, Alert, ActionSheetIOS } from 'react-native';
 import MapView, { Polyline, UrlTile, PROVIDER_DEFAULT, MapPressEvent, MapType, Region } from 'react-native-maps';
 import * as Location from 'expo-location';
 import * as Battery from 'expo-battery';
@@ -26,27 +26,65 @@ import { RecapCard } from './src/RecapCard';
 // scripts/pipeline). It's checked for a newer version at most this often.
 const ROAD_DATA_CHECK_MS = 6 * 60 * 60 * 1000;
 // Shown in Settings → Help. Keep in step with app.json.
-const APP_VERSION = '0.17.0';
+const APP_VERSION = '0.17.1';
 
 const formatBytes = (b: number) => (b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.max(0, Math.round(b / 1e3))} KB`);
 
 // A row in Settings: what it does, and a line saying what that means.
-function SettingButton(props: { title: string; info: string; onPress: () => void; disabled?: boolean; danger?: boolean }) {
+// Settings, iOS-style: rounded cards of rows split by inset hairlines.
+// A row with onPress gets a › ; `value` is a live value in grey on the right.
+function SettingsCard(props: { children: ReactNode }) {
+  return <View style={settingStyles.card}>{props.children}</View>;
+}
+function SettingsHeader(props: { title: string }) {
+  return <Text style={settingStyles.header}>{props.title}</Text>;
+}
+function SettingsRow(props: {
+  title: string;
+  value?: string;
+  onPress?: () => void;
+  right?: ReactNode;
+  first?: boolean;
+  disabled?: boolean;
+  danger?: boolean;
+}) {
+  const inner = (
+    <View style={[settingStyles.rowInner, !props.first && settingStyles.divider]}>
+      <Text style={[settingStyles.title, props.danger && settingStyles.danger]} numberOfLines={1}>
+        {props.title}
+      </Text>
+      {props.value !== undefined && (
+        <Text style={settingStyles.value} numberOfLines={1}>
+          {props.value}
+        </Text>
+      )}
+      {props.right}
+      {props.onPress && !props.danger && <Text style={settingStyles.chevron}>›</Text>}
+    </View>
+  );
+  if (!props.onPress) return <View style={settingStyles.row}>{inner}</View>;
   return (
     <Pressable
-      style={({ pressed }: { pressed: boolean }) => [settingStyles.row, pressed && { opacity: 0.6 }, props.disabled && { opacity: 0.4 }]}
+      style={({ pressed }: { pressed: boolean }) => [settingStyles.row, pressed && settingStyles.pressed, props.disabled && { opacity: 0.4 }]}
       onPress={props.onPress}
       disabled={props.disabled}
     >
-      <Text style={[settingStyles.title, props.danger && { color: '#ff6b6b' }]}>{props.title}</Text>
-      <Text style={settingStyles.info}>{props.info}</Text>
+      {inner}
     </Pressable>
   );
 }
 const settingStyles = StyleSheet.create({
-  row: { paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: '#2a2a2a' },
-  title: { color: '#fff', fontSize: 15, fontWeight: '600' },
-  info: { color: '#8a8a8a', fontSize: 12, marginTop: 3, lineHeight: 17 },
+  card: { backgroundColor: '#1f2723', borderRadius: 12, overflow: 'hidden' },
+  header: { color: '#8a8a8a', fontSize: 12, fontWeight: '600', textTransform: 'uppercase', letterSpacing: 0.4, marginTop: 18, marginBottom: 6, marginLeft: 14 },
+  row: { paddingLeft: 14 },
+  pressed: { backgroundColor: '#2a3530' },
+  rowInner: { flexDirection: 'row', alignItems: 'center', minHeight: 44, paddingVertical: 10, paddingRight: 14, gap: 8 },
+  divider: { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: '#3a4640' },
+  title: { color: '#fff', fontSize: 15, flex: 1 },
+  danger: { color: '#ff6b6b' },
+  value: { color: '#8a8a8a', fontSize: 15, flexShrink: 1, textAlign: 'right' },
+  chevron: { color: '#5c6a63', fontSize: 20, marginTop: -2 },
+  foot: { color: '#8a8a8a', fontSize: 12, lineHeight: 17, marginTop: 8, marginHorizontal: 14 },
 });
 
 // Edit mode only draws roads once zoomed in this far (a few km across).
@@ -87,7 +125,7 @@ const ACCURACY_MODES: { key: AccuracyMode; label: string; info: string }[] = [
   { key: 'auto', label: 'Auto', info: 'High while charging, Balanced on battery.' },
 ];
 const isCharging = (s: Battery.BatteryState) => s === Battery.BatteryState.CHARGING || s === Battery.BatteryState.FULL;
-type StatsTab = 'overview' | 'counties' | 'roads';
+type StatsTab = 'overview' | 'counties' | 'roads' | 'data';
 type AutoPerm = { key: 'motion' | 'location' | 'notifications'; state: 'ok' | 'ask' | 'settings' | 'phoneOff' | 'unavailable' };
 const PERM_TEXT: Record<AutoPerm['key'], { name: string; why: string; fix: string }> = {
   motion: {
@@ -110,6 +148,7 @@ const STATS_TABS: { key: StatsTab; label: string }[] = [
   { key: 'overview', label: 'Overview' },
   { key: 'counties', label: 'Counties' },
   { key: 'roads', label: 'Roads' },
+  { key: 'data', label: 'Your data' },
 ];
 const FALLBACK_REGION = { latitude: 53.1, longitude: -7.7, latitudeDelta: 4, longitudeDelta: 4 };
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -389,7 +428,7 @@ function App() {
   const [recap, setRecap] = useState<Recap | null>(null);
   const driveFreshRef = useRef<string[]>([]);
   const [storageInfo, setStorageInfo] = useState<{ tiles: number; bytes: number; pinned: number } | null>(null);
-  const [confirming, setConfirming] = useState<null | 'reset' | 'uninstall'>(null);
+  const [confirming, setConfirming] = useState<null | 'uninstall'>(null);
   const [backupBusy, setBackupBusy] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [note, setNoteText] = useState('');
@@ -1844,7 +1883,67 @@ function App() {
     }
   };
 
-  const confirmThen = (what: 'reset' | 'uninstall', action: () => void) => {
+  // ---------- Settings choices (native sheets and prompts) ----------
+  const pickSheet = (title: string, message: string | undefined, labels: string[], current: number, onPick: (i: number) => void) => {
+    const options = [...labels.map((l, i) => (i === current ? `${l} ✓` : l)), 'Cancel'];
+    ActionSheetIOS.showActionSheetWithOptions(
+      { title, message, options, cancelButtonIndex: options.length - 1, userInterfaceStyle: 'dark' },
+      (i: number) => {
+        if (i < labels.length) onPick(i);
+      },
+    );
+  };
+
+  const chooseAccuracySheet = () =>
+    pickSheet(
+      'GPS accuracy',
+      ACCURACY_MODES.map((m) => `${m.label}: ${m.info}`).join('\n') + (tracking ? '\n\nApplies from your next drive.' : ''),
+      ACCURACY_MODES.map((m) => m.label),
+      ACCURACY_MODES.findIndex((m) => m.key === accuracyMode),
+      (i) => chooseAccuracy(ACCURACY_MODES[i].key),
+    );
+
+  const chooseMapSheet = () =>
+    pickSheet('Map style', undefined, MAP_TYPES.map((t) => MAP_LABELS[t]), mapTypeIndex, (i) => {
+      setMapTypeIndex(i);
+      store.setMeta('map_type', MAP_TYPES[i]).catch(() => undefined);
+    });
+
+  const roadDataSheet = () =>
+    pickSheet(
+      'Road data',
+      `From OpenStreetMap${roadData.version ? `, version ${roadData.version}` : ''}. It updates by itself.\n\nFreeing up storage keeps your home county. Other areas download again when you're there.`,
+      ['Check for updates', 'Free up storage'],
+      -1,
+      (i) => {
+        if (i === 0) refreshRoadData();
+        else freeUpStorage().catch((e) => setNote(`Couldn't free up storage: ${(e as Error).message}`));
+      },
+    );
+
+  const confirmRecheck = () =>
+    Alert.alert('Recalculate your map?', 'Goes through every saved drive again and redraws your map from them. It can take a minute.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Recalculate',
+        onPress: () => {
+          setPanel(null);
+          runRecheck('manual');
+        },
+      },
+    ]);
+
+  const confirmDeleteAll = () =>
+    Alert.alert(
+      'Delete all your data?',
+      "Every drive, road and edit on this phone is deleted. This can't be undone, so back up first (Stats → Your data) if you might want them.",
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Delete everything', style: 'destructive', onPress: deleteAllData },
+      ],
+    );
+
+  const confirmThen = (what: 'uninstall', action: () => void) => {
     if (confirming !== what) {
       setConfirming(what);
       setTimeout(() => setConfirming((c) => (c === what ? null : c)), 4000);
@@ -2524,6 +2623,22 @@ function App() {
               </>
             )}
 
+            {statsTab === 'data' && (
+              <>
+                <Text style={styles.small}>
+                  Saved on this phone. Back up to keep a copy somewhere safe (Files, iCloud Drive, email). Restoring merges a backup
+                  in — it never removes anything already on the phone.
+                </Text>
+                <View style={styles.row}>
+                  <Pressable style={[styles.button, styles.buttonBlue]} onPress={exportBackup} disabled={backupBusy}>
+                    <Text style={styles.buttonText}>{backupBusy ? 'Working…' : 'Back up'}</Text>
+                  </Pressable>
+                  <Pressable style={[styles.button, styles.buttonGrey]} onPress={restoreBackup} disabled={backupBusy || tracking}>
+                    <Text style={styles.buttonText}>Restore</Text>
+                  </Pressable>
+                </View>
+              </>
+            )}
           </ScrollView>
         </View>
       )}
@@ -2610,21 +2725,27 @@ function App() {
       {panel === 'dev' && (
         <View style={styles.panel}>
           <ScrollView>
-            <Text style={[styles.sectionTitle, { marginTop: 0 }]}>Settings</Text>
-            <View style={styles.settingRow}>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.panelTitle}>Auto-detect drives</Text>
-                <Text style={styles.small}>
-                  Records drives you forget to start and asks before saving them. Ends drives you forget to stop.
-                </Text>
-              </View>
-              <Switch
-                value={autoDetect || autoWanted}
-                disabled={autoBusy}
-                onValueChange={(on: boolean) => (on ? enableAutoDetect() : disableAutoDetect())}
-                trackColor={{ true: '#2f6f3a', false: '#333' }}
+            <Text style={[settingStyles.header, { marginTop: 0 }]}>Settings</Text>
+            <SettingsCard>
+              <SettingsRow
+                first
+                title="Auto-detect drives"
+                right={
+                  <Switch
+                    value={autoDetect || autoWanted}
+                    disabled={autoBusy}
+                    onValueChange={(on: boolean) => (on ? enableAutoDetect() : disableAutoDetect())}
+                    trackColor={{ true: '#2f6f3a', false: '#333' }}
+                  />
+                }
               />
-            </View>
+              <SettingsRow
+                title="GPS accuracy"
+                value={ACCURACY_MODES.find((m) => m.key === accuracyMode)?.label}
+                onPress={chooseAccuracySheet}
+              />
+              <SettingsRow title="Map style" value={MAP_LABELS[MAP_TYPES[mapTypeIndex]]} onPress={chooseMapSheet} />
+            </SettingsCard>
             {(autoWanted || autoDetect) && autoPerms.some((p) => p.state !== 'ok') && (
               <View style={styles.missingBox}>
                 <Text style={styles.missingText}>{autoDetect ? 'Auto-detect is missing a permission:' : 'To finish turning on auto-detect:'}</Text>
@@ -2664,104 +2785,45 @@ function App() {
                   ))}
               </View>
             )}
-            <Text style={[styles.panelTitle, { marginTop: 16 }]}>GPS accuracy</Text>
-            <View style={[styles.row, { marginTop: 0 }]}>
-              {ACCURACY_MODES.map((m) => (
-                <Pressable
-                  key={m.key}
-                  style={[styles.smallButton, accuracyMode === m.key && styles.chipActive]}
-                  onPress={() => chooseAccuracy(m.key)}
-                >
-                  <Text style={styles.chipText}>{m.label}</Text>
-                </Pressable>
-              ))}
-            </View>
-            <Text style={styles.small}>
-              {ACCURACY_MODES.find((m) => m.key === accuracyMode)?.info}
-              {tracking ? ' Applies from your next drive.' : ''}
-            </Text>
-            <Text style={[styles.panelTitle, { marginTop: 16 }]}>Map style</Text>
-            <View style={[styles.row, { marginTop: 0 }]}>
-              {MAP_TYPES.map((t, i) => (
-                <Pressable
-                  key={t}
-                  style={[styles.smallButton, mapTypeIndex === i && styles.chipActive]}
-                  onPress={() => {
-                    setMapTypeIndex(i);
-                    store.setMeta('map_type', t).catch(() => undefined);
-                  }}
-                >
-                  <Text style={styles.chipText}>{MAP_LABELS[t]}</Text>
-                </Pressable>
-              ))}
-            </View>
 
-            <Text style={styles.sectionTitle}>Your map</Text>
-            <SettingButton
-              title="Fix my map"
-              info="Mark roads that are private or no longer there, or un-mark roads you didn't drive."
-              disabled={tracking}
-              onPress={() => {
-                setFollowing(false);
-                setEditMode(true);
-                setPanel(null);
-              }}
-            />
-            <SettingButton
-              title="Recalculate from my drives"
-              info="Goes through every saved drive again and redraws your map from them."
-              disabled={tracking || recheckProgress !== null}
-              onPress={() => {
-                setPanel(null);
-                runRecheck('manual');
-              }}
-            />
-            <SettingButton
-              title={backupBusy ? 'Working…' : 'Back up'}
-              info="Saves your drives and roads to a file you can keep in Files, iCloud Drive or email."
-              disabled={backupBusy}
-              onPress={exportBackup}
-            />
-            <SettingButton
-              title="Restore from a backup"
-              info="Adds a backup back in. Nothing already on this phone is removed."
-              disabled={backupBusy || tracking}
-              onPress={restoreBackup}
-            />
-            <SettingButton
-              title={refreshing ? 'Checking…' : 'Update road data'}
-              info={`Road data from OpenStreetMap${roadData.version ? `, version ${roadData.version}` : ''}. It updates by itself; this checks now.`}
-              disabled={tracking || refreshing}
-              onPress={refreshRoadData}
-            />
-            <SettingButton
-              title="Free up storage"
-              info={`Road data on this phone: ${storageInfo ? formatBytes(storageInfo.bytes) : '…'}. Keeps your home county; other areas download again when you're there.`}
-              disabled={tracking}
-              onPress={() => freeUpStorage().catch((e) => setNote(`Couldn't free up storage: ${(e as Error).message}`))}
-            />
-            <SettingButton
-              title={confirming === 'reset' ? 'Tap again to delete everything' : 'Delete all my data'}
-              info="Deletes every drive, road and edit from this phone. This can't be undone, so back up first if you might want them."
-              danger
-              disabled={tracking}
-              onPress={() => confirmThen('reset', deleteAllData)}
-            />
+            <SettingsHeader title="Your map" />
+            <SettingsCard>
+              <SettingsRow
+                first
+                title="Fix my map"
+                disabled={tracking}
+                onPress={() => {
+                  setFollowing(false);
+                  setEditMode(true);
+                  setPanel(null);
+                }}
+              />
+              <SettingsRow title="Recalculate from my drives" disabled={tracking || recheckProgress !== null} onPress={confirmRecheck} />
+              <SettingsRow
+                title="Road data"
+                value={refreshing ? 'Checking…' : [roadData.version ?? 'none', storageInfo ? formatBytes(storageInfo.bytes) : '…'].join(' · ')}
+                disabled={tracking || refreshing}
+                onPress={roadDataSheet}
+              />
+            </SettingsCard>
 
-            <Text style={styles.sectionTitle}>Help</Text>
-            <SettingButton
-              title="Send a problem report"
-              info="Opens a report with what the app has been doing (no drives or locations) so you can send it to support@tarmacked.com."
-              onPress={sendProblemReport}
-            />
-            <SettingButton title="Help and contact" info="tarmacked.com/support" onPress={() => Linking.openURL('https://tarmacked.com/support').catch(() => undefined)} />
-            <SettingButton title="Privacy" info="tarmacked.com/privacy" onPress={() => Linking.openURL('https://tarmacked.com/privacy').catch(() => undefined)} />
+            <SettingsHeader title="Help" />
+            <SettingsCard>
+              <SettingsRow first title="Send a problem report" onPress={sendProblemReport} />
+              <SettingsRow title="Help & privacy" onPress={() => Linking.openURL('https://tarmacked.com/support').catch(() => undefined)} />
+            </SettingsCard>
             <Pressable onPress={tapVersion}>
-              <Text style={[styles.small, { marginTop: 14 }]}>
-                tarmacked {APP_VERSION}
+              <Text style={settingStyles.foot}>
+                Version {APP_VERSION}
                 {'\n'}Map data © OpenStreetMap contributors, available under the Open Database License.
               </Text>
             </Pressable>
+
+            <View style={{ marginTop: 28 }}>
+              <SettingsCard>
+                <SettingsRow first title="Delete all my data" danger disabled={tracking} onPress={confirmDeleteAll} />
+              </SettingsCard>
+            </View>
 
             {devMenu && (
               <>
@@ -3005,7 +3067,6 @@ const styles = StyleSheet.create({
   offerPerm: { color: '#93a098', fontSize: 14, lineHeight: 20, marginBottom: 6 },
   offerPermName: { color: '#39d353', fontWeight: '700' },
 
-  settingRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
   missingBox: { backgroundColor: 'rgba(232,176,64,0.12)', borderRadius: 10, padding: 12, marginTop: 10, gap: 10 },
   permRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
   diagText: { color: '#6f7b74', fontSize: 11, marginTop: 8, fontFamily: 'Courier' },
