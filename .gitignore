@@ -1,6 +1,7 @@
 node_modules/
-ios/
-android/
+# Only the generated top-level folders: modules/*/ios holds our own native code.
+/ios/
+/android/
 build/
 *.ipa
 .expo/

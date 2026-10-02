@@ -47,6 +47,11 @@ export function diagnostics(): string {
   return `Motion module: ${native ? `loaded (${loaded.via})` : 'missing'} · permission: ${authorizationStatus()}`;
 }
 
+// False when this build doesn't include the native module at all.
+export function isLoaded(): boolean {
+  return !!native;
+}
+
 export function isAvailable(): boolean {
   try {
     return !!native && native.isAvailable();

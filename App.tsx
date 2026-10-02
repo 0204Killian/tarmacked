@@ -26,7 +26,7 @@ import { RecapCard } from './src/RecapCard';
 // scripts/pipeline). It's checked for a newer version at most this often.
 const ROAD_DATA_CHECK_MS = 6 * 60 * 60 * 1000;
 // Shown in Settings → Help. Keep in step with app.json.
-const APP_VERSION = '0.17.1';
+const APP_VERSION = '0.17.2';
 
 const formatBytes = (b: number) => (b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.max(0, Math.round(b / 1e3))} KB`);
 
@@ -126,7 +126,7 @@ const ACCURACY_MODES: { key: AccuracyMode; label: string; info: string }[] = [
 ];
 const isCharging = (s: Battery.BatteryState) => s === Battery.BatteryState.CHARGING || s === Battery.BatteryState.FULL;
 type StatsTab = 'overview' | 'counties' | 'roads' | 'data';
-type AutoPerm = { key: 'motion' | 'location' | 'notifications'; state: 'ok' | 'ask' | 'settings' | 'phoneOff' | 'unavailable' };
+type AutoPerm = { key: 'motion' | 'location' | 'notifications'; state: 'ok' | 'ask' | 'settings' | 'phoneOff' | 'unavailable' | 'missing' };
 const PERM_TEXT: Record<AutoPerm['key'], { name: string; why: string; fix: string }> = {
   motion: {
     name: 'Motion & Fitness',
@@ -1645,7 +1645,8 @@ function App() {
   // Fitness Tracking is off for the whole phone.
   const checkAutoPermissions = async (): Promise<AutoPerm[]> => {
     const out: AutoPerm[] = [];
-    if (!Motion.isAvailable()) out.push({ key: 'motion', state: 'unavailable' });
+    if (!Motion.isLoaded()) out.push({ key: 'motion', state: 'missing' });
+    else if (!Motion.isAvailable()) out.push({ key: 'motion', state: 'unavailable' });
     else {
       const st = Motion.authorizationStatus();
       out.push({ key: 'motion', state: st === 'authorized' ? 'ok' : st === 'notDetermined' ? 'ask' : st === 'restricted' ? 'phoneOff' : 'settings' });
@@ -2760,7 +2761,9 @@ function App() {
                             ? PERM_TEXT[p.key].why
                             : p.state === 'phoneOff'
                               ? 'Fitness Tracking is off for the whole phone: Settings → Privacy & Security → Motion & Fitness → Fitness Tracking.'
-                              : p.state === 'unavailable'
+                              : p.state === 'missing'
+                                ? "This version of the app was built without its motion part. Update the app to fix it."
+                                : p.state === 'unavailable'
                                 ? "This phone can't tell driving from walking, so auto-detect can't work here."
                                 : PERM_TEXT[p.key].fix}
                         </Text>
