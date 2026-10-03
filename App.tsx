@@ -14,7 +14,7 @@ import * as store from './src/storage';
 import * as bg from './src/background';
 import * as Motion from './modules/motion-activity';
 import * as NavKit from './modules/nav-kit';
-import { RoadNetwork, RoadSegment, parseChunkId, baseChunkId } from './src/roadMatcher';
+import { RoadNetwork, RoadSegment, baseChunkId } from './src/roadMatcher';
 import { DriveMatcher, Point, PieceIndex, isPatchy } from './src/coverage';
 import { recheckDrives, driveDistanceMeters } from './src/recheck';
 import { HEAT_STEPS, heatStep, stepColor, rankRoads, RoadRank } from './src/heat';
@@ -29,75 +29,20 @@ import { RouteData, Region as NavRegion, regionsFor } from './src/routeData';
 import { Place, fold } from './src/places';
 import { SearchPanel, RouteChooser, NavBanner, NavFooter, SpeedLimit } from './src/navUi';
 import { TILE_HOST } from './src/tiles';
+import { formatBytes, shortCounty, pad2, formatWhen, formatDuration, km } from './src/format';
+import { Chain, buildChains } from './src/chains';
+import { SettingsCard, SettingsHeader, SettingsRow, settingStyles } from './src/settingsUi';
 
 // Road data comes from tiles.tarmacked.com (see src/tiles.ts and
 // scripts/pipeline). It's checked for a newer version at most this often.
 const ROAD_DATA_CHECK_MS = 6 * 60 * 60 * 1000;
 // Shown in Settings → Help. Keep in step with app.json.
-const APP_VERSION = '0.20.6';
+const APP_VERSION = '0.20.7';
 // How far ahead of your position the route line is cut (under your dot).
 const NAV_TRIM_LEAD_M = 8;
 const SUPPORT_EMAIL = 'support@tarmacked.com';
 
-const formatBytes = (b: number) => (b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.max(0, Math.round(b / 1e3))} KB`);
 
-// A row in Settings: what it does, and a line saying what that means.
-// Settings, iOS-style: rounded cards of rows split by inset hairlines.
-// A row with onPress gets a › ; `value` is a live value in grey on the right.
-function SettingsCard(props: { children: ReactNode }) {
-  return <View style={settingStyles.card}>{props.children}</View>;
-}
-function SettingsHeader(props: { title: string }) {
-  return <Text style={settingStyles.header}>{props.title}</Text>;
-}
-function SettingsRow(props: {
-  key?: string;
-  title: string;
-  value?: string;
-  onPress?: () => void;
-  right?: ReactNode;
-  first?: boolean;
-  disabled?: boolean;
-  danger?: boolean;
-}) {
-  const inner = (
-    <View style={[settingStyles.rowInner, !props.first && settingStyles.divider]}>
-      <Text style={[settingStyles.title, props.danger && settingStyles.danger]} numberOfLines={1}>
-        {props.title}
-      </Text>
-      {props.value !== undefined && (
-        <Text style={settingStyles.value} numberOfLines={1}>
-          {props.value}
-        </Text>
-      )}
-      {props.right}
-      {props.onPress && !props.danger && <Text style={settingStyles.chevron}>›</Text>}
-    </View>
-  );
-  if (!props.onPress) return <View style={settingStyles.row}>{inner}</View>;
-  return (
-    <Pressable
-      style={({ pressed }: { pressed: boolean }) => [settingStyles.row, pressed && settingStyles.pressed, props.disabled && { opacity: 0.4 }]}
-      onPress={props.onPress}
-      disabled={props.disabled}
-    >
-      {inner}
-    </Pressable>
-  );
-}
-const settingStyles = StyleSheet.create({
-  card: { backgroundColor: '#1f2723', borderRadius: 12, overflow: 'hidden' },
-  header: { color: '#8a8a8a', fontSize: 12, fontWeight: '600', textTransform: 'uppercase', letterSpacing: 0.4, marginTop: 18, marginBottom: 6, marginLeft: 14 },
-  row: { paddingLeft: 14 },
-  pressed: { backgroundColor: '#2a3530' },
-  rowInner: { flexDirection: 'row', alignItems: 'center', minHeight: 44, paddingVertical: 10, paddingRight: 14, gap: 8 },
-  divider: { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: '#3a4640' },
-  title: { color: '#fff', fontSize: 15, flex: 1 },
-  danger: { color: '#ff6b6b' },
-  value: { color: '#8a8a8a', fontSize: 15, flexShrink: 1, textAlign: 'right' },
-  chevron: { color: '#5c6a63', fontSize: 20, marginTop: -2 },
-  foot: { color: '#8a8a8a', fontSize: 12, lineHeight: 17, marginTop: 8, marginHorizontal: 14 },
-});
 
 // Edit mode only draws roads once zoomed in this far (a few km across).
 const EDIT_MAX_LAT_DELTA = 0.06;
@@ -117,9 +62,7 @@ const LOG_LINES = 60;
 // road-data pipeline alongside the tiles (stats.json). Cached for offline use.
 type CountyStats = { counties: string[]; totalMeters: number[]; nationalMeters: number };
 type Panel = null | 'stats' | 'drives' | 'dev';
-type Chain = { coords: Coord[]; minLat: number; maxLat: number; minLon: number; maxLon: number };
 
-const shortCounty = (name: string) => name.replace(/^County /, '');
 // 'osm' = OpenStreetMap tiles drawn over a plain Apple map (the default).
 type MapChoice = 'osm' | MapType;
 const MAP_TYPES: MapChoice[] = ['osm', 'standard', 'satellite', 'hybrid'];
@@ -163,104 +106,9 @@ const STATS_TABS: { key: StatsTab; label: string }[] = [
   { key: 'data', label: 'Your data' },
 ];
 const FALLBACK_REGION = { latitude: 53.1, longitude: -7.7, latitudeDelta: 4, longitudeDelta: 4 };
-const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-
-const pad2 = (n: number) => String(n).padStart(2, '0');
-function formatWhen(t: number) {
-  const d = new Date(t);
-  return `${DAYS[d.getDay()]} ${d.getDate()} ${MONTHS[d.getMonth()]} · ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
-}
-function formatDuration(ms: number) {
-  const min = Math.max(0, Math.round(ms / 60000));
-  return min < 60 ? `${min} min` : `${Math.floor(min / 60)}h ${pad2(min % 60)}m`;
-}
-const km = (m: number, dp = 1) => (m / 1000).toFixed(dp);
 const haversineM = (a: { lat: number; lon: number }, b: { lat: number; lon: number }) => haversine([a.lat, a.lon], [b.lat, b.lon]);
 const toLatLng = (c: Coord[]) => c.map(([latitude, longitude]) => ({ latitude, longitude }));
 
-// Joins driven chunks of the same road into continuous lines, so the map
-// draws a few long lines instead of thousands of 100m pieces.
-function buildChains(ids: Iterable<string>, shapeOf: (id: string) => Coord[] | undefined): Chain[] {
-  const byWay = new Map<string, { idx: number; coords: Coord[] }[]>();
-  const loose: Coord[][] = [];
-  for (const id of ids) {
-    const coords = shapeOf(id);
-    if (!coords || coords.length < 2) continue;
-    const p = parseChunkId(id);
-    if (!p) {
-      loose.push(coords);
-      continue;
-    }
-    const list = byWay.get(p.way);
-    if (list) list.push({ idx: p.idx, coords });
-    else byWay.set(p.way, [{ idx: p.idx, coords }]);
-  }
-  const lines: Coord[][] = [...loose];
-  byWay.forEach((parts) => {
-    parts.sort((a, b) => a.idx - b.idx);
-    let cur = parts[0].coords.slice();
-    for (let i = 1; i < parts.length; i++) {
-      const prevEnd = cur[cur.length - 1];
-      const next = parts[i].coords;
-      if (parts[i].idx === parts[i - 1].idx + 1 && prevEnd[0] === next[0][0] && prevEnd[1] === next[0][1]) {
-        cur.push(...next.slice(1));
-      } else {
-        lines.push(cur);
-        cur = next.slice();
-      }
-    }
-    lines.push(cur);
-  });
-  return stitchLines(lines).map((coords) => {
-    let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
-    for (const [la, lo] of coords) {
-      if (la < minLat) minLat = la;
-      if (la > maxLat) maxLat = la;
-      if (lo < minLon) minLon = lo;
-      if (lo > maxLon) maxLon = lo;
-    }
-    return { coords, minLat, maxLat, minLon, maxLon };
-  });
-}
-
-// Joins lines end to end wherever exactly two of them meet (e.g. where one
-// road continues as another, or around a roundabout), so the map draws one
-// smooth line instead of separate pieces with visible joins.
-function stitchLines(input: Coord[][]): Coord[][] {
-  let lines = input.filter((l) => l.length >= 2);
-  const key = (c: Coord) => `${c[0]},${c[1]}`;
-  for (let pass = 0; pass < 50; pass++) {
-    const ends = new Map<string, { i: number; atStart: boolean }[]>();
-    lines.forEach((l, i) => {
-      for (const [c, atStart] of [[l[0], true], [l[l.length - 1], false]] as [Coord, boolean][]) {
-        const k = key(c);
-        const list = ends.get(k);
-        if (list) list.push({ i, atStart });
-        else ends.set(k, [{ i, atStart }]);
-      }
-    });
-    const used = new Set<number>();
-    const out: Coord[][] = [];
-    ends.forEach((list) => {
-      if (list.length !== 2) return;
-      const [a, b] = list;
-      if (a.i === b.i || used.has(a.i) || used.has(b.i)) return;
-      used.add(a.i);
-      used.add(b.i);
-      // Orient so the first line ends at the shared point and the second starts there.
-      const first = a.atStart ? lines[a.i].slice().reverse() : lines[a.i];
-      const second = b.atStart ? lines[b.i] : lines[b.i].slice().reverse();
-      out.push([...first, ...second.slice(1)]);
-    });
-    if (used.size === 0) return lines;
-    lines.forEach((l, i) => {
-      if (!used.has(i)) out.push(l);
-    });
-    lines = out;
-  }
-  return lines;
-}
 
 // Keep the native splash up until the loading screen (which looks the
 // same) is ready to take over, so there's no flash between them.
@@ -425,7 +273,6 @@ function App() {
   const [rawStats, setRawStats] = useState({ drives: 0, points: 0 });
   const [rawSessions, setRawSessions] = useState<Point[][] | null>(null);
   const [recheckProgress, setRecheckProgress] = useState<number | null>(null);
-  const [removedCount, setRemovedCount] = useState(0);
 
   // Edit roads: this session's edits, newest last, for Undo (v0.16).
   type Edit =
@@ -799,7 +646,6 @@ function App() {
         setExcludedIds(new Set(excludedRef.current));
         setUnmatchedCount(data.unmatched.length);
         setRawStats({ drives: data.driveCount, points: data.pointCount });
-        setRemovedCount(await store.countRemoved());
         if (data.homeCounty) setHomeCounty(data.homeCounty);
         setOnboarded(data.onboarded);
         setDataLoaded(true);
@@ -965,7 +811,6 @@ function App() {
       }
       setDrivenIds(new Set(drivenRef.current));
       setUnmatchedCount(result.unmatched.length);
-      setRemovedCount(await store.countRemoved());
       setRawStats({ drives: allDrives.length, points: allDrives.reduce((n, d) => n + d.points.length, 0) });
       if (drives !== null) setDrives(await store.listDrives());
       const changed = result.add.length + result.remove.length;
@@ -2472,7 +2317,6 @@ function App() {
     setUnmatchedCount(0);
     setRawSessions(null);
     setRawStats({ drives: 0, points: 0 });
-    setRemovedCount(0);
     setSelectedDrive(null);
     setDrives([]);
     setPanel(null);
@@ -3024,9 +2868,24 @@ function App() {
               <Text style={[styles.topText, styles.topGlyph]}>⚙</Text>
             </Pressable>
           </View>
-          <Pressable style={[styles.topPill, styles.topItem]} onPress={openMapSheet}>
-            <Text style={styles.topText}>Map</Text>
-          </Pressable>
+          {/* Map display: heatmap on/off, and the map style. */}
+          <View style={styles.topPill}>
+            <Pressable
+              style={[styles.topItem, styles.topIcon, heatOn && styles.topItemHeat]}
+              onPress={() => setHeatOn((v) => !v)}
+              accessibilityLabel={heatOn ? 'Hide heatmap' : 'Show heatmap'}
+            >
+              <View style={styles.heatIcon}>
+                {[0, Math.floor(HEAT_STEPS / 2), HEAT_STEPS - 1].map((k, n) => (
+                  <View key={k} style={[styles.heatIconBar, { height: 7 + n * 4, backgroundColor: heatOn ? '#fff' : stepColor(k) }]} />
+                ))}
+              </View>
+            </Pressable>
+            <View style={styles.topDivider} />
+            <Pressable style={styles.topItem} onPress={openMapSheet}>
+              <Text style={styles.topText}>Map</Text>
+            </Pressable>
+          </View>
         </View>
       )}
 
@@ -3456,16 +3315,6 @@ function App() {
               <Text style={styles.roundSearch}>⌕</Text>
             </Pressable>
           )}
-          {/* Heatmap on/off: its own button, not one of the map styles. */}
-          {navStage === 'off' && (
-            <Pressable style={[styles.roundButton, heatOn && styles.roundButtonHeat]} onPress={() => setHeatOn((v) => !v)} accessibilityLabel={heatOn ? 'Hide heatmap' : 'Show heatmap'}>
-              <View style={styles.heatIcon}>
-                {[0, Math.floor(HEAT_STEPS / 2), HEAT_STEPS - 1].map((k, n) => (
-                  <View key={k} style={[styles.heatIconBar, { height: 9 + n * 5, backgroundColor: heatOn ? '#fff' : stepColor(k) }]} />
-                ))}
-              </View>
-            </Pressable>
-          )}
           {!following && (
             <Pressable style={styles.roundButton} onPress={recentre}>
               <Text style={styles.recentreText}>◎</Text>
@@ -3713,6 +3562,7 @@ const styles = StyleSheet.create({
   topItem: { paddingVertical: 9, paddingHorizontal: 15 },
   topIcon: { paddingHorizontal: 13 },
   topItemActive: { backgroundColor: '#2f6f3a' },
+  topItemHeat: { backgroundColor: '#a3471a' },
   topDivider: { width: StyleSheet.hairlineWidth, height: 18, backgroundColor: 'rgba(255,255,255,0.25)' },
   topText: { color: '#fff', fontSize: 14, fontWeight: '600' },
   topGlyph: { fontSize: 15 },
@@ -3731,9 +3581,8 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 2 },
   },
   roundSearch: { color: '#fff', fontSize: 26, fontWeight: '600', marginTop: -2 },
-  roundButtonHeat: { backgroundColor: '#a3471a' },
-  heatIcon: { flexDirection: 'row', alignItems: 'flex-end', gap: 3, height: 19 },
-  heatIconBar: { width: 5, borderRadius: 2 },
+  heatIcon: { flexDirection: 'row', alignItems: 'flex-end', gap: 2, height: 17 },
+  heatIconBar: { width: 4, borderRadius: 1.5 },
   chipActive: { backgroundColor: '#2f6f3a' },
 
   heatBar: {

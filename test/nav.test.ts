@@ -1,6 +1,6 @@
 // Sat-nav logic (src/nav.ts): following a route, prompts, going off route,
 // arriving, and never-driven road on a route.
-import { Navigator, NavRoute, spokenDistance, shortDistance, newRoadOnRoute, drivenRanges, routeAhead, cumulative } from '../src/nav';
+import { Navigator, NavRoute, spokenDistance, shortDistance, routeAhead, cumulative } from '../src/nav';
 import { RoadNetwork, RoadSegment } from '../src/roadMatcher';
 import { metersPerDegLon, METERS_PER_DEG_LAT, Coord } from '../src/geo';
 
@@ -100,27 +100,6 @@ function drive(nav: Navigator, path: [number, number][], v: number, sigma = 5) {
 
 check('spoken distances', [spokenDistance(320), spokenDistance(75), spokenDistance(1480), spokenDistance(2000)].join(' | ') === 'In 300 metres | In 100 metres | In 1.5 kilometres | In 2 kilometres', [spokenDistance(320), spokenDistance(75), spokenDistance(1480), spokenDistance(2000)].join(' | '));
 check('banner distances', [shortDistance(320), shortDistance(42), shortDistance(1480), shortDistance(25300)].join(' | ') === '300 m | 40 m | 1.5 km | 25 km', [shortDistance(320), shortDistance(42), shortDistance(1480), shortDistance(25300)].join(' | '));
-
-// --- never-driven road on a route ---
-{
-  const segs: RoadSegment[] = [];
-  const way = (id: number, pts: [number, number][]) => {
-    const c = line(pts, 10);
-    for (let i = 0, k = 0; i < c.length - 1; i += 10, k++) segs.push({ id: `way/${id}#${k}`, coords: c.slice(i, i + 11) });
-  };
-  way(1, [[0, 0], [0, 2000]]);
-  way(2, [[0, 2000], [1500, 2000]]);
-  way(3, [[1500, 2000], [1500, 2300]]);
-  way(4, [[15, 0], [15, 2000]]); // a parallel road 15 m away (service road)
-  const net = new RoadNetwork();
-  net.add(segs);
-  // Driven: the first km of way 1 (chunks 0-9), and half of chunk way/2#0 as a section stretch.
-  const driven = [...Array.from({ length: 10 }, (_, i) => `way/1#${i}`), 'way/2#0~0-50'];
-  const r = newRoadOnRoute(net, drivenRanges(net, driven), coords);
-  check('new road on a route: only the parts never driven', Math.abs(r.newM - (1000 + 1450 + 300)) < 60 && Math.abs(r.knownM - 3800) < 60, `new ${r.newM.toFixed(0)} m of ${r.knownM.toFixed(0)} m`);
-  const r2 = newRoadOnRoute(new RoadNetwork(), new Map(), coords);
-  check('no road data: nothing known, nothing claimed', r2.knownM === 0 && r2.newM === 0);
-}
 
 // Route line ahead: cut exactly at your position, mid-segment (one long
 // 1 km straight: nothing behind you stays drawn).

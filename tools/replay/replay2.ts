@@ -1,7 +1,7 @@
 // Re-check starting from the user's real map (backup's driven roads), as the app does.
 import * as fs from 'fs';
-import { RoadNetwork, RoadSegment } from '../SRC/roadMatcher';
-import { recheckDrives } from '../SRC/recheck';
+import { RoadNetwork, RoadSegment } from '../../src/roadMatcher';
+import { recheckDrives } from '../../src/recheck';
 declare const process: any;
 const backup = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const net = new RoadNetwork();

@@ -2,7 +2,7 @@
   "expo": {
     "name": "tarmacked",
     "slug": "tarmacked",
-    "version": "0.20.6",
+    "version": "0.20.7",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "ios": {

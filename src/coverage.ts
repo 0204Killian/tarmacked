@@ -829,11 +829,6 @@ export function isSectionCovered(net: RoadNetwork, chunkId: string, sec: Section
   return spans(stretches, need0, need1);
 }
 
-// Whole-chunk version (every section covered).
-export function isCovered(net: RoadNetwork, id: string, stretches: [number, number][]): boolean {
-  return net.sections(id).every((sec) => isSectionCovered(net, id, sec, stretches));
-}
-
 // The joined-up stretch (gaps up to GAP_OK_M forgiven) that contains pos.
 function stretchAround(stretches: [number, number][], pos: number): [number, number] | null {
   const sorted = stretches.slice().sort((x, y) => x[0] - y[0]);

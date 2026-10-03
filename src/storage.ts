@@ -326,10 +326,6 @@ export async function fillExcludedInfo(rows: { id: string; county: number | null
   });
 }
 
-export async function removeDriven(id: string) {
-  await write((db) => db.runAsync('DELETE FROM driven WHERE id = ?', [id]));
-}
-
 export type DrivenRow = { id: string; shape: Shape | null; firstAt: number; county: number | null };
 
 // Un-marking by hand (v0.16): removes these pieces and returns them as they
@@ -817,27 +813,6 @@ export async function loadDrivenFirstAt(): Promise<Map<string, number>> {
   const db = await getDb();
   const rows = await db.getAllAsync<{ id: string; first_at: number }>('SELECT id, first_at FROM driven');
   return new Map(rows.map((r) => [r.id, r.first_at]));
-}
-
-export async function countRemoved(): Promise<number> {
-  const db = await getDb();
-  const row = await db.getFirstAsync<{ n: number }>('SELECT COUNT(*) AS n FROM driven_removed');
-  return row?.n ?? 0;
-}
-
-// Puts back everything re-checks have removed.
-export async function restoreRemoved(): Promise<number> {
-  const n = await countRemoved();
-  if (n === 0) return 0;
-  await write(async (db) => {
-    await db.runAsync(
-      'INSERT OR IGNORE INTO driven (id, shape, first_at, county) SELECT id, shape, first_at, county FROM driven_removed'
-    );
-    await db.runAsync('DELETE FROM driven_removed');
-    // Anything restored shouldn't be taken away again by the next re-check.
-    await db.runAsync('DELETE FROM unmarked WHERE id IN (SELECT id FROM driven)');
-  });
-  return n;
 }
 
 // --- tile cache (disposable) ---

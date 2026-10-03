@@ -1,11 +1,9 @@
 // Sat-nav logic (v0.16): following a route, when to speak, going off
-// route, arriving, and how much never-driven road a route has. Pure logic
+// route and arriving. Pure logic
 // (no React or native calls) so it can be tested on its own. Since v0.18
 // the routes come from our own router (src/router.ts).
 
-import { RoadNetwork, Candidate, baseChunkId } from './roadMatcher';
-import { rangeOf, mergeStretches } from './coverage';
-import { Coord, haversine, metersPerDegLon, METERS_PER_DEG_LAT, headingBetween } from './geo';
+import { Coord, haversine, metersPerDegLon, METERS_PER_DEG_LAT } from './geo';
 
 export type RouteStep = { instruction: string; notice: string; distance: number; coords: Coord[]; kind?: string };
 export type NavRoute = { name: string; distance: number; duration: number; coords: Coord[]; steps: RouteStep[] };
@@ -197,90 +195,4 @@ export class Navigator {
   resetOffRoute() {
     this.offCount = 0;
   }
-}
-
-// --- how much of a route you've never driven ---
-
-export type NewRoad = { newM: number; knownM: number };
-
-// Driven metres along each chunk, from the driven ids (whole chunks,
-// sections and start/stop stretches).
-export function drivenRanges(net: RoadNetwork, driven: Iterable<string>): Map<string, [number, number][]> {
-  const out = new Map<string, [number, number][]>();
-  for (const id of driven) {
-    const base = baseChunkId(id);
-    const r = rangeOf(id) ?? [0, net.length(base)];
-    const list = out.get(base);
-    if (list) list.push(r);
-    else out.set(base, [r]);
-  }
-  return out;
-}
-
-/**
- * Metres of a route on roads you've never driven, and metres the road data
- * could place at all (knownM; the rest isn't downloaded or isn't mapped).
- * The route is sampled every 10 m and each sample put on the nearest road
- * going the same way.
- */
-export function newRoadOnRoute(net: RoadNetwork, ranges: Map<string, [number, number][]>, coords: Coord[]): NewRoad {
-  const covered = new Map<string, [number, number][]>();
-  const cum = cumulative(coords);
-  const total = cum[cum.length - 1];
-  let prev: Coord | null = null;
-  let heading: number | null = null;
-  let lastId: string | null = null;
-  let lastPos = 0;
-  const add = (id: string, a: number, b: number) => {
-    const r: [number, number] = [Math.max(0, Math.min(a, b)), Math.max(a, b)];
-    const st = covered.get(id);
-    if (st) st.push(r);
-    else covered.set(id, [r]);
-  };
-  for (let d = 0, i = 0; d <= total; d += 10) {
-    while (i < coords.length - 2 && cum[i + 1] < d) i++;
-    const segLen = cum[i + 1] - cum[i];
-    const f = segLen > 0 ? (d - cum[i]) / segLen : 0;
-    const p: Coord = [coords[i][0] + (coords[i + 1][0] - coords[i][0]) * f, coords[i][1] + (coords[i + 1][1] - coords[i][1]) * f];
-    if (prev) heading = headingBetween({ latitude: prev[0], longitude: prev[1] }, { latitude: p[0], longitude: p[1] });
-    prev = p;
-    const { list } = net.near({ latitude: p[0], longitude: p[1] }, heading, 40, new Set());
-    if (!list.length) {
-      lastId = null;
-      continue;
-    }
-    // Nearest; within 3 m of that, stay on the road we were on (parallel roads).
-    const best = list.reduce((x, y) => (y.dist < x.dist ? y : x));
-    const prevId = lastId;
-    const stay = prevId ? list.find((x) => x.id === prevId) : undefined;
-    const c: Candidate = stay && stay.dist <= best.dist + 3 ? stay : best;
-    // Crossing from one road piece to the next: both run to where they meet.
-    if (lastId && lastId !== c.id) {
-      const v = net.sharedVertex(lastId, c.id);
-      if (v) {
-        const pa = net.posOfVertex(lastId, v);
-        const pb = net.posOfVertex(c.id, v);
-        if (pa !== null) add(lastId, lastPos, pa);
-        if (pb !== null) add(c.id, pb, c.pos);
-      }
-    }
-    add(c.id, c.pos - 5, c.pos + 5);
-    lastId = c.id;
-    lastPos = c.pos;
-  }
-  let newM = 0;
-  let knownM = 0;
-  covered.forEach((st, id) => {
-    const len = net.length(id);
-    const route = mergeStretches(st).map(([a, b]) => [Math.max(0, a), Math.min(len, b)] as [number, number]);
-    const drv = mergeStretches(ranges.get(id) ?? []);
-    for (const [a, b] of route) {
-      if (b <= a) continue;
-      knownM += b - a;
-      let overlap = 0;
-      for (const [x, y] of drv) overlap += Math.max(0, Math.min(b, y) - Math.max(a, x));
-      newM += Math.max(0, b - a - overlap);
-    }
-  });
-  return { newM, knownM };
 }

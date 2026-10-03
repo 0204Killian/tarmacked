@@ -31,7 +31,7 @@ import * as TaskManager from 'expo-task-manager';
 import * as Notifications from 'expo-notifications';
 import * as store from './storage';
 import * as Motion from '../modules/motion-activity';
-import { Watch, newWatch, updateWatch, hasEnded, trialStep, PROMPT_AFTER_MS, MOVE_RADIUS_M, TRIAL_MS } from './driveWatch';
+import { Watch, newWatch, updateWatch, hasEnded, trialStep, PROMPT_AFTER_MS, MOVE_RADIUS_M, TRIAL_MS, PENDING_KEEP_MS } from './driveWatch';
 import { distanceMeters } from './geo';
 
 export const LOCATION_TASK = 'tarmacked-background-location';
@@ -432,7 +432,7 @@ export function discardDrive() {
 // 15+ minutes, restarts GPS for one still going, clears old pending drives.
 export function settle(): Promise<'none' | 'recording' | 'ended'> {
   return serial(async () => {
-    const dropped = await store.deleteStalePending(7 * 24 * 60 * 60_000);
+    const dropped = await store.deleteStalePending(PENDING_KEEP_MS);
     if (dropped > 0) log(`${dropped} unconfirmed auto drive(s) deleted after 7 days`);
     const w = await loadWatch();
     if (!w) {

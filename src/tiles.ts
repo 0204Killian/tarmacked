@@ -65,8 +65,3 @@ export function decodeTile(data: any): RoadSegment[] {
   return out;
 }
 
-export const manifestUrl = () => `${TILE_HOST}manifest.json`;
-export const regionUrl = (m: Manifest, file: string) => {
-  const r = m.regions?.[REGION];
-  return r ? `${TILE_HOST}${r.path}${file}` : null;
-};
