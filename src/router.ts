@@ -66,7 +66,8 @@ const UNPAVED_KMH = 30;
 const MAX_KMH = 130; // for the A* estimate (no road averages more)
 const ROUNDABOUT_KMH = 25;
 const FERRY_BOARDING_S = 900; // getting on and off a ferry
-const AVOID_FACTOR = 20; // avoided roads count as this many times slower
+const AVOID_FACTOR = 20; // avoided roads count as this many times slower...
+const AVOID_FIXED_S = 1800; // ...plus half an hour each (a toll is often a short stretch at the plaza)
 const NEW_ROAD_DISCOUNT = 0.45; // 'new' mode: never-driven road counts as 55% of its time
 const BEARING_M = 15; // a road's direction is measured over this far from a junction
 
@@ -618,7 +619,7 @@ export class RoadGraph {
       let sec = this.seconds(e, metres);
       if (this.eFlags[e] & 32) sec += FERRY_BOARDING_S;
       if (mode === 'new') sec *= 1 - NEW_ROAD_DISCOUNT * fracNew(e);
-      if (anyAvoid && this.isAvoided(e, avoid)) sec *= AVOID_FACTOR;
+      if (anyAvoid && this.isAvoided(e, avoid)) sec = sec * AVOID_FACTOR + AVOID_FIXED_S;
       return sec;
     };
     const hFactor = mode === 'new' ? 1 - NEW_ROAD_DISCOUNT : 1;

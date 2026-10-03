@@ -25,6 +25,9 @@ if [ -z "${2:-}" ] && [ -n "$LIVE" ] && [[ "$LIVE" == "$VERSION"* ]]; then
   SUFFIX="${LIVE#"$VERSION"}" # '' or a letter
   if [ -z "$SUFFIX" ]; then VERSION="${VERSION}b"; else VERSION="$VERSION$(printf "\\$(printf '%03o' $(( $(printf '%d' "'$SUFFIX") + 1 )))")"; fi
 fi
+# Couldn't tell what's live (no connection, or the website turned the
+# server away): add the time, so the name can't be one that's in use.
+if [ -z "${2:-}" ] && [ -z "$LIVE" ]; then VERSION="$(date -u +%Y-%m-%d-%H%M)"; fi
 if [ "$VERSION" = "$LIVE" ]; then echo "Version $VERSION is already live. Pick a new name, e.g. bash run.sh $REGION ${VERSION}b"; exit 1; fi
 COUNTRY="${R_CLIP:-}"
 [ "$REGION" = "ie" ] && COUNTRY=IE
