@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Uploads built road data to Cloudflare R2 (tiles.tarmacked.com).
-# Needs rclone, and the R2 keys either as environment variables (GitHub
-# Actions secrets) or in ~/.tarmacked-r2 (a Codespace), never in the repo:
+# Uploads built road data to Cloudflare R2 (tiles.tarmacked.com) with r2.js.
+# Needs Node.js 18+, and the R2 keys either as environment variables
+# (GitHub Actions secrets) or in ~/.tarmacked-r2 (a Codespace), never in the repo:
 #   R2_ACCOUNT_ID=...
 #   R2_ACCESS_KEY_ID=...
 #   R2_SECRET_ACCESS_KEY=...
@@ -16,60 +16,45 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 MODE="${1:-all}"
-if [ -z "${R2_ACCESS_KEY_ID:-}" ] && [ -f ~/.tarmacked-r2 ]; then source ~/.tarmacked-r2; fi
+if [ -z "${R2_ACCESS_KEY_ID:-}" ] && [ -f ~/.tarmacked-r2 ]; then set -a; source ~/.tarmacked-r2; set +a; fi
 : "${R2_ACCOUNT_ID:?R2 keys missing: set them as secrets or in ~/.tarmacked-r2}"
-# A secret pasted with a space or new line at the end still works.
-R2_ACCOUNT_ID="$(printf '%s' "$R2_ACCOUNT_ID" | tr -d '[:space:]')"
-R2_ACCESS_KEY_ID="$(printf '%s' "$R2_ACCESS_KEY_ID" | tr -d '[:space:]')"
-R2_SECRET_ACCESS_KEY="$(printf '%s' "$R2_SECRET_ACCESS_KEY" | tr -d '[:space:]')"
-
-export RCLONE_CONFIG_R2_TYPE=s3
-export RCLONE_CONFIG_R2_PROVIDER=Cloudflare
-export RCLONE_CONFIG_R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
-export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
-export RCLONE_CONFIG_R2_ENDPOINT="https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com"
-export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
-BUCKET="r2:tarmacked-tiles"
-RETRY=(--retries 5 --low-level-retries 20)
+export R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY
 
 if [ "$MODE" != "--manifest-only" ]; then
   for dir in out/*/*/; do
     [ -d "$dir" ] || continue
     rel="${dir#out/}"
-    echo "Uploading $rel ($(ls "$dir" | wc -l) files) ..."
-    # A new version folder is empty on R2, so no need to compare first.
-    rclone copy "$dir" "$BUCKET/$rel" --transfers 32 --checkers 32 --no-check-dest "${RETRY[@]}" \
-      --header-upload "Cache-Control: public, max-age=31536000, immutable" \
-      --header-upload "Content-Type: application/json"
+    node r2.js upload "$dir" "$rel" "public, max-age=31536000, immutable"
   done
 fi
 [ "$MODE" = "--data-only" ] && exit 0
 
 # The live manifest straight from R2 (not through Cloudflare's website,
-# which can turn away servers like GitHub's).
-if rclone cat "$BUCKET/manifest.json" "${RETRY[@]}" > out/live-manifest.json 2>/dev/null && [ -s out/live-manifest.json ]; then
-  : # read it
-elif LIST="$(rclone lsf "$BUCKET/" --files-only "${RETRY[@]}")" && ! grep -qx manifest.json <<< "$LIST"; then
-  echo '{"v":1,"regions":{}}' > out/live-manifest.json # the very first one
-else
+# which can turn away servers like GitHub's). Missing = the very first one;
+# couldn't read = stop, so other regions are never dropped.
+set +e
+node r2.js cat manifest.json > out/live-manifest.json
+CODE=$?
+set -e
+if [ "$CODE" = "2" ]; then
+  echo '{"v":1,"regions":{}}' > out/live-manifest.json
+elif [ "$CODE" != "0" ]; then
   echo "Couldn't read the live manifest from R2: not publishing (nothing changed for phones)."
   exit 1
 fi
 node publish.js out out/live-manifest.json
 echo "Uploading manifest.json ..."
-rclone copyto out/manifest.json "$BUCKET/manifest.json" "${RETRY[@]}" \
-  --header-upload "Cache-Control: public, max-age=300" \
-  --header-upload "Content-Type: application/json"
+node r2.js put out/manifest.json manifest.json "public, max-age=300"
 
 # Tidy up: in each rebuilt region, delete versions older than the one phones
-# were on (they've had a month to move on; R2 storage stays small).
+# were on (they've had time to move on; R2 storage stays small).
 for f in out/entry-*.json; do
   region="$(basename "$f" .json)"
   region="${region#entry-}"
-  for v in $(rclone lsf "$BUCKET/$region/" --dirs-only 2>/dev/null || true); do
-    if ! grep -qx "$region/$v" out/keep.txt; then
-      echo "Deleting old version $region/$v ..."
-      rclone purge "$BUCKET/$region/$v" "${RETRY[@]}" || echo "  (couldn't delete it; next time)"
+  for v in $(node r2.js dirs "$region" || true); do
+    if ! grep -qx "$v" out/keep.txt; then
+      echo "Deleting old version $v ..."
+      node r2.js purge "$v" || echo "  (couldn't delete it; next time)"
     fi
   done
 done

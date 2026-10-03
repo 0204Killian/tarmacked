@@ -8,7 +8,7 @@
 #   bash run.sh fr              # France
 #   bash run.sh ie 2026-11-01b  # pick the version name yourself
 #
-# Then check the totals it prints, and upload with: bash upload.sh
+# Then check the totals it prints, and upload with: bash upload.sh (needs the R2 keys)
 # Big countries are cut into parts and built one part at a time, so memory
 # stays at about what Ireland needs (NODE_HEAP, in MB, raises the limit).
 set -euo pipefail
@@ -20,7 +20,9 @@ VERSION="${2:-$(date +%Y-%m-%d)}"
 # A version name is never reused: phones and Cloudflare keep a version's
 # files forever, so the same name twice would mix two builds. If today's
 # date is already live, the next free one is used (2026-10-02b, c...).
-LIVE="$(curl -s https://tiles.tarmacked.com/manifest.json | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).regions['$REGION'].version)}catch{console.log('')}})" || true)"
+# (Read from R2 itself when the keys are here: the website can turn servers away.)
+if [ -n "${R2_ACCOUNT_ID:-}" ]; then MANIFEST_CMD=(node r2.js cat manifest.json); else MANIFEST_CMD=(curl -s https://tiles.tarmacked.com/manifest.json); fi
+LIVE="$("${MANIFEST_CMD[@]}" 2>/dev/null | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).regions['$REGION'].version)}catch{console.log('')}})" || true)"
 if [ -z "${2:-}" ] && [ -n "$LIVE" ] && [[ "$LIVE" == "$VERSION"* ]]; then
   SUFFIX="${LIVE#"$VERSION"}" # '' or a letter
   if [ -z "$SUFFIX" ]; then VERSION="${VERSION}b"; else VERSION="$VERSION$(printf "\\$(printf '%03o' $(( $(printf '%d' "'$SUFFIX") + 1 )))")"; fi
