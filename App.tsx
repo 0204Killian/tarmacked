@@ -34,7 +34,7 @@ import { TILE_HOST } from './src/tiles';
 // scripts/pipeline). It's checked for a newer version at most this often.
 const ROAD_DATA_CHECK_MS = 6 * 60 * 60 * 1000;
 // Shown in Settings → Help. Keep in step with app.json.
-const APP_VERSION = '0.20.4';
+const APP_VERSION = '0.20.6';
 // How far ahead of your position the route line is cut (under your dot).
 const NAV_TRIM_LEAD_M = 8;
 const SUPPORT_EMAIL = 'support@tarmacked.com';
@@ -2564,6 +2564,19 @@ function App() {
     return { rows, nationalDriven, nationalTotal, nationalPercent: nationalTotal > 0 ? (nationalDriven / nationalTotal) * 100 : 0, unassigned };
   }, [countyStats, drivenIds, excludedIds]);
 
+  // Counties tab: most complete first (then most driven, then A to Z).
+  const countiesByCompletion = useMemo(
+    () => [...countyFigures.rows].sort((a, b) => b.percent - a.percent || b.driven - a.driven || a.name.localeCompare(b.name)),
+    [countyFigures]
+  );
+
+  // Tapping the county in the bottom bar: its stats.
+  const openCountyStats = () => {
+    setStatsTab('counties');
+    setPanel('stats');
+    store.listDrives().then(setDrives).catch(() => undefined);
+  };
+
   const focusRow =
     currentCounty !== null ? countyFigures.rows[currentCounty] : countyFigures.rows.find((r) => r.name === homeCounty) ?? null;
 
@@ -2828,12 +2841,11 @@ function App() {
   // Map: the style and the heatmap, in one place.
   const openMapSheet = () => {
     const styleIdx = mapTypeIndex;
-    const labels = [heatOn ? 'Heatmap: on ✓' : 'Heatmap: off', ...MAP_TYPES.map((t, i) => `${MAP_LABELS[t]} map${i === styleIdx ? ' ✓' : ''}`), 'Cancel'];
-    ActionSheetIOS.showActionSheetWithOptions({ title: 'Map', options: labels, cancelButtonIndex: labels.length - 1, userInterfaceStyle: 'dark' }, (i: number) => {
-      if (i === 0) setHeatOn((v) => !v);
-      else if (i > 0 && i <= MAP_TYPES.length) {
-        setMapTypeIndex(i - 1);
-        store.setMeta('map_type', MAP_TYPES[i - 1]).catch(() => undefined);
+    const labels = [...MAP_TYPES.map((t, i) => `${MAP_LABELS[t]} map${i === styleIdx ? ' ✓' : ''}`), 'Cancel'];
+    ActionSheetIOS.showActionSheetWithOptions({ title: 'Map style', options: labels, cancelButtonIndex: labels.length - 1, userInterfaceStyle: 'dark' }, (i: number) => {
+      if (i >= 0 && i < MAP_TYPES.length) {
+        setMapTypeIndex(i);
+        store.setMeta('map_type', MAP_TYPES[i]).catch(() => undefined);
       }
     });
   };
@@ -3012,7 +3024,7 @@ function App() {
               <Text style={[styles.topText, styles.topGlyph]}>⚙</Text>
             </Pressable>
           </View>
-          <Pressable style={[styles.topPill, styles.topItem, heatOn && styles.topItemHeat]} onPress={openMapSheet}>
+          <Pressable style={[styles.topPill, styles.topItem]} onPress={openMapSheet}>
             <Text style={styles.topText}>Map</Text>
           </Pressable>
         </View>
@@ -3113,7 +3125,7 @@ function App() {
                     Ireland {countyFigures.nationalPercent.toFixed(3)}% · {km(countyFigures.nationalDriven)} /{' '}
                     {km(countyFigures.nationalTotal, 0)} km
                   </Text>
-                  {countyFigures.rows.map((r) => (
+                  {countiesByCompletion.map((r) => (
                     <View key={r.name} style={[styles.countyStatRow, r.code === focusRow?.code && styles.countyStatRowCurrent]}>
                       <Text style={[styles.countyStatName, r.driven > 0 && styles.countyStatNameDriven]}>{shortCounty(r.name)}</Text>
                       <Text style={styles.countyStatValue}>
@@ -3444,6 +3456,16 @@ function App() {
               <Text style={styles.roundSearch}>⌕</Text>
             </Pressable>
           )}
+          {/* Heatmap on/off: its own button, not one of the map styles. */}
+          {navStage === 'off' && (
+            <Pressable style={[styles.roundButton, heatOn && styles.roundButtonHeat]} onPress={() => setHeatOn((v) => !v)} accessibilityLabel={heatOn ? 'Hide heatmap' : 'Show heatmap'}>
+              <View style={styles.heatIcon}>
+                {[0, Math.floor(HEAT_STEPS / 2), HEAT_STEPS - 1].map((k, n) => (
+                  <View key={k} style={[styles.heatIconBar, { height: 9 + n * 5, backgroundColor: heatOn ? '#fff' : stepColor(k) }]} />
+                ))}
+              </View>
+            </Pressable>
+          )}
           {!following && (
             <Pressable style={styles.roundButton} onPress={recentre}>
               <Text style={styles.recentreText}>◎</Text>
@@ -3504,12 +3526,12 @@ function App() {
         <View style={styles.bottomBar}>
           <View style={{ flex: 1 }}>
             {countyStats ? (
-              <>
+              <Pressable onPress={openCountyStats} hitSlop={8}>
                 <Text style={styles.barLine}>
                   {focusRow ? `${shortCounty(focusRow.name)} ${focusRow.percent.toFixed(2)}%` : 'Ireland'}
                   <Text style={styles.barDim}>{`  ·  Ireland ${countyFigures.nationalPercent.toFixed(3)}%`}</Text>
                 </Text>
-              </>
+              </Pressable>
             ) : (
               <Text style={styles.barDim}>Connect once to load road totals</Text>
             )}
@@ -3691,7 +3713,6 @@ const styles = StyleSheet.create({
   topItem: { paddingVertical: 9, paddingHorizontal: 15 },
   topIcon: { paddingHorizontal: 13 },
   topItemActive: { backgroundColor: '#2f6f3a' },
-  topItemHeat: { backgroundColor: '#a3471a' },
   topDivider: { width: StyleSheet.hairlineWidth, height: 18, backgroundColor: 'rgba(255,255,255,0.25)' },
   topText: { color: '#fff', fontSize: 14, fontWeight: '600' },
   topGlyph: { fontSize: 15 },
@@ -3710,6 +3731,9 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 2 },
   },
   roundSearch: { color: '#fff', fontSize: 26, fontWeight: '600', marginTop: -2 },
+  roundButtonHeat: { backgroundColor: '#a3471a' },
+  heatIcon: { flexDirection: 'row', alignItems: 'flex-end', gap: 3, height: 19 },
+  heatIconBar: { width: 5, borderRadius: 2 },
   chipActive: { backgroundColor: '#2f6f3a' },
 
   heatBar: {

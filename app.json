@@ -2,7 +2,7 @@
   "expo": {
     "name": "tarmacked",
     "slug": "tarmacked",
-    "version": "0.20.4",
+    "version": "0.20.6",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "ios": {
@@ -78,8 +78,7 @@
           "resizeMode": "contain",
           "backgroundColor": "#0f1311"
         }
-      ],
-      "expo-mail-composer"
+      ]
     ],
     "backgroundColor": "#0f1311",
     "scheme": "tarmacked",
