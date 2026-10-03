@@ -33,7 +33,7 @@ import { TILE_HOST } from './src/tiles';
 // scripts/pipeline). It's checked for a newer version at most this often.
 const ROAD_DATA_CHECK_MS = 6 * 60 * 60 * 1000;
 // Shown in Settings → Help. Keep in step with app.json.
-const APP_VERSION = '0.19.2';
+const APP_VERSION = '0.20.0';
 
 const formatBytes = (b: number) => (b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.max(0, Math.round(b / 1e3))} KB`);
 
@@ -2778,13 +2778,28 @@ function App() {
   const elapsed = tracking ? Date.now() - driveStartRef.current : 0;
   const togglePanel = (p: Panel) => setPanel((cur) => (cur === p ? null : p));
 
+  // Map: the style and the heatmap, in one place.
+  const openMapSheet = () => {
+    const styleIdx = mapTypeIndex;
+    const labels = [heatOn ? 'Heatmap: on ✓' : 'Heatmap: off', ...MAP_TYPES.map((t, i) => `${MAP_LABELS[t]} map${i === styleIdx ? ' ✓' : ''}`), 'Cancel'];
+    ActionSheetIOS.showActionSheetWithOptions({ title: 'Map', options: labels, cancelButtonIndex: labels.length - 1, userInterfaceStyle: 'dark' }, (i: number) => {
+      if (i === 0) setHeatOn((v) => !v);
+      else if (i > 0 && i <= MAP_TYPES.length) {
+        setMapTypeIndex(i - 1);
+        store.setMeta('map_type', MAP_TYPES[i - 1]).catch(() => undefined);
+      }
+    });
+  };
+
   return (
     <View style={styles.container}>
       <MapView
         ref={mapRef}
         style={styles.map}
         provider={PROVIDER_DEFAULT}
-        mapType={MAP_TYPES[mapTypeIndex] === 'osm' ? 'standard' : (MAP_TYPES[mapTypeIndex] as MapType)}
+        // Under OSM tiles: satellite, which has no labels of its own (Apple's
+        // place names otherwise showed through, doubled with OSM's).
+        mapType={MAP_TYPES[mapTypeIndex] === 'osm' ? 'satellite' : (MAP_TYPES[mapTypeIndex] as MapType)}
         showsPointsOfInterest={MAP_TYPES[mapTypeIndex] !== 'osm'}
         initialRegion={region}
         showsUserLocation
@@ -2930,45 +2945,30 @@ function App() {
         />
       )}
       {(navStage === 'off' || navStage === 'choose') && (
-      <View style={styles.topBar}>
-        <View style={styles.topGroup}>
-          <Pressable
-            style={[styles.chip, panel === 'stats' && styles.chipActive]}
-            onPress={() => {
-              togglePanel('stats');
-              store.listDrives().then(setDrives).catch(() => undefined);
-            }}
-          >
-            <Text style={styles.chipText}>Stats</Text>
-          </Pressable>
-          <Pressable style={[styles.chip, panel === 'drives' && styles.chipActive]} onPress={openDrives}>
-            <Text style={styles.chipText}>Drives</Text>
-          </Pressable>
-          <Pressable style={[styles.chip, panel === 'dev' && styles.chipActive]} onPress={() => togglePanel('dev')}>
-            <Text style={styles.chipText}>⚙</Text>
-          </Pressable>
-          {!editMode && navStage === 'off' && (
-            <Pressable style={[styles.chip, styles.chipGo]} onPress={openSearch}>
-              <Text style={styles.chipText}>Go</Text>
+        <View style={styles.topBar}>
+          <View style={styles.topPill}>
+            <Pressable
+              style={[styles.topItem, panel === 'stats' && styles.topItemActive]}
+              onPress={() => {
+                togglePanel('stats');
+                store.listDrives().then(setDrives).catch(() => undefined);
+              }}
+            >
+              <Text style={styles.topText}>Stats</Text>
             </Pressable>
-          )}
-        </View>
-        <View style={styles.topGroup}>
-          <Pressable style={[styles.chip, heatOn && styles.chipHeat]} onPress={() => setHeatOn((v) => !v)}>
-            <Text style={styles.chipText}>Heat</Text>
-          </Pressable>
-          <Pressable
-            style={styles.chip}
-            onPress={() => {
-              const next = (mapTypeIndex + 1) % MAP_TYPES.length;
-              setMapTypeIndex(next);
-              store.setMeta('map_type', MAP_TYPES[next]).catch(() => undefined);
-            }}
-          >
-            <Text style={styles.chipText}>{MAP_LABELS[MAP_TYPES[mapTypeIndex]]}</Text>
+            <View style={styles.topDivider} />
+            <Pressable style={[styles.topItem, panel === 'drives' && styles.topItemActive]} onPress={openDrives}>
+              <Text style={styles.topText}>Drives</Text>
+            </Pressable>
+            <View style={styles.topDivider} />
+            <Pressable style={[styles.topItem, styles.topIcon, panel === 'dev' && styles.topItemActive]} onPress={() => togglePanel('dev')}>
+              <Text style={[styles.topText, styles.topGlyph]}>⚙</Text>
+            </Pressable>
+          </View>
+          <Pressable style={[styles.topPill, styles.topItem, heatOn && styles.topItemHeat]} onPress={openMapSheet}>
+            <Text style={styles.topText}>Map</Text>
           </Pressable>
         </View>
-      </View>
       )}
 
       {/* Heatmap legend, and the picked most-driven stretch */}
@@ -3389,10 +3389,20 @@ function App() {
 
       {navStage === 'driving' && <SpeedLimit kmh={navSpeedLimit} />}
 
-      {!following && !editMode && navStage !== 'choose' && navStage !== 'search' && (
-        <Pressable style={styles.recentreButton} onPress={recentre}>
-          <Text style={styles.recentreText}>◎</Text>
-        </Pressable>
+      {/* Map buttons on the right, above the bottom card: find a place, and back to you. */}
+      {!editMode && (navStage === 'off' || navStage === 'driving') && (
+        <View style={[styles.sideButtons, navStage === 'driving' && styles.sideButtonsDriving]} pointerEvents="box-none">
+          {navStage === 'off' && (
+            <Pressable style={styles.roundButton} onPress={openSearch}>
+              <Text style={styles.roundSearch}>⌕</Text>
+            </Pressable>
+          )}
+          {!following && (
+            <Pressable style={styles.roundButton} onPress={recentre}>
+              <Text style={styles.recentreText}>◎</Text>
+            </Pressable>
+          )}
+        </View>
       )}
 
       {/* Bottom bar */}
@@ -3619,12 +3629,41 @@ const styles = StyleSheet.create({
   skipLink: { marginTop: 16 },
   linkText: { color: '#6aa9ff', fontSize: 14 },
 
-  topBar: { position: 'absolute', top: 56, left: 12, right: 12, flexDirection: 'row', justifyContent: 'space-between' },
-  topGroup: { flexDirection: 'row', gap: 8 },
-  chip: { backgroundColor: 'rgba(17,17,17,0.88)', borderRadius: 18, paddingVertical: 8, paddingHorizontal: 14 },
+  topBar: { position: 'absolute', top: 56, left: 12, right: 12, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  topPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(20,24,22,0.92)',
+    borderRadius: 20,
+    overflow: 'hidden',
+    shadowColor: '#000',
+    shadowOpacity: 0.25,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 2 },
+  },
+  topItem: { paddingVertical: 9, paddingHorizontal: 15 },
+  topIcon: { paddingHorizontal: 13 },
+  topItemActive: { backgroundColor: '#2f6f3a' },
+  topItemHeat: { backgroundColor: '#a3471a' },
+  topDivider: { width: StyleSheet.hairlineWidth, height: 18, backgroundColor: 'rgba(255,255,255,0.25)' },
+  topText: { color: '#fff', fontSize: 14, fontWeight: '600' },
+  topGlyph: { fontSize: 15 },
+  sideButtons: { position: 'absolute', right: 16, bottom: 104, gap: 10, alignItems: 'center' },
+  sideButtonsDriving: { bottom: 116 },
+  roundButton: {
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    backgroundColor: 'rgba(20,24,22,0.92)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#000',
+    shadowOpacity: 0.25,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 2 },
+  },
+  roundSearch: { color: '#fff', fontSize: 26, fontWeight: '600', marginTop: -2 },
   chipActive: { backgroundColor: '#2f6f3a' },
-  chipHeat: { backgroundColor: '#a3471a' },
-  chipGo: { backgroundColor: '#2a5fae' },
 
   heatBar: {
     position: 'absolute',
@@ -3711,18 +3750,7 @@ const styles = StyleSheet.create({
   smallButton: { backgroundColor: '#333', borderRadius: 8, paddingVertical: 7, paddingHorizontal: 12 },
   smallButtonDanger: { backgroundColor: '#a03030' },
 
-  recentreButton: {
-    position: 'absolute',
-    bottom: 124,
-    right: 16,
-    width: 48,
-    height: 48,
-    borderRadius: 24,
-    backgroundColor: 'rgba(17,17,17,0.9)',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  recentreText: { color: '#6aa9ff', fontSize: 24, fontWeight: '700' },
+  recentreText: { color: '#6aa9ff', fontSize: 22, fontWeight: '700' },
 
   bottomBar: {
     position: 'absolute',
@@ -3732,15 +3760,16 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
-    backgroundColor: 'rgba(17,17,17,0.9)',
+    backgroundColor: 'rgba(20,24,22,0.92)',
     borderRadius: 16,
-    paddingVertical: 12,
-    paddingHorizontal: 16,
+    paddingVertical: 8,
+    paddingLeft: 16,
+    paddingRight: 8,
   },
   barLine: { color: '#fff', fontSize: 15, fontWeight: '600' },
   barDim: { color: '#9a9a9a', fontSize: 13, fontWeight: '400' },
   barLive: { color: '#ff7a7a', fontSize: 13, marginTop: 4 },
-  mainButton: { backgroundColor: '#2a6f2a', paddingVertical: 14, paddingHorizontal: 26, borderRadius: 12 },
+  mainButton: { backgroundColor: '#2a6f2a', paddingVertical: 10, paddingHorizontal: 22, borderRadius: 11 },
   mainButtonStop: { backgroundColor: '#8a2a2a' },
   mainButtonBusy: { opacity: 0.4 },
 });
