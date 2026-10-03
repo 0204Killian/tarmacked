@@ -7,14 +7,23 @@
 //   ie/<version>/stats.json         road totals per county
 //   ie/<version>/t_<a>_<b>.json     road pieces, compact format (v2)
 // A version never changes once uploaded, so tiles can be cached forever;
-// a data refresh is a new version, picked up through the manifest.
+// a data refresh is a new version, picked up through the manifest. Other
+// countries (v0.21) are more regions next to ie/, same layout.
 
 import type { RoadSegment } from './roadMatcher';
 
 export const TILE_HOST = 'https://tiles.tarmacked.com/';
-export const REGION = 'ie';
-
-export type Manifest = { v: number; regions: Record<string, { version: string; path: string; tiles: number }> };
+export type RegionEntry = {
+  version: string;
+  path: string;
+  tiles: number;
+  name?: string;
+  num?: number; // v0.21: area codes are num * 1000 + index
+  country?: string; // v0.21: ISO code its areas mostly belong to
+  bbox?: number[] | null;
+  cells?: string[] | null; // 1-degree squares with roads ("53,-8")
+};
+export type Manifest = { v: number; regions: Record<string, RegionEntry> };
 export type TileIndex = { v: number; region: string; version: string; tiles: string[]; counties: Record<string, string[]>; classes: string[] };
 
 // Road types, in the order the pipeline numbers them (scripts/pipeline/lib.js).
@@ -30,10 +39,10 @@ const SCALE = 100000;
  * Road pieces from a tile file. Reads the compact v2 format:
  *   { v: 2, names: [...], s: [[way, n, flags, county, name, class, speed, lat0, lon0, dlat, dlon, ...]] }
  * (flags: 1 one-way forward, 2 one-way reverse, 4 roundabout, 8 toll, 16
- * unpaved), and the old
- * { segments: [...] } format too.
+ * unpaved), and the old { segments: [...] } format too. `areaOffset`
+ * makes area codes unique across regions (src/areas.ts).
  */
-export function decodeTile(data: any): RoadSegment[] {
+export function decodeTile(data: any, areaOffset = 0): RoadSegment[] {
   if (!data) return [];
   if (Array.isArray(data.segments)) return data.segments as RoadSegment[];
   if (data.v !== 2 || !Array.isArray(data.s)) return [];
@@ -56,7 +65,7 @@ export function decodeTile(data: any): RoadSegment[] {
     if (flags & 4) seg.r = 1;
     if (flags & 8) seg.t = 1; // toll (v0.19 data)
     if (flags & 16) seg.u = 1; // unpaved (v0.19 data)
-    if (county >= 0) seg.c = county;
+    if (county >= 0) seg.c = areaOffset + county;
     if (name >= 0 && names[name]) seg.n = names[name];
     if (cls >= 0) seg.h = cls;
     if (speed > 0) seg.sp = speed;

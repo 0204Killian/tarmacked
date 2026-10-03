@@ -126,6 +126,54 @@ function phone() {
   await rd5.refresh();
   check('a missing tile is not a failure', (await rd5.ensure([real[1]])) === 0 && rd5.isLoaded(real[1]));
 
+  // ---- More than one region (v0.21) ----
+  {
+    const { cellOfTile, splitHome, joinHome } = await import('../src/roadData');
+    const gbTile = 't_1025_5'; // 51.25, 0.25: south-east England
+    const shared = real[0]; // a square both regions have (a border)
+    const v2 = (way: number, county: number, lat: number, lon: number) => ({ v: 2, names: [], s: [[way, 0, 0, county, -1, 11, 0, lat, lon, 50, 50]] });
+    const gbTiles: Record<string, any> = { [gbTile]: v2(777, 3, 5126000, 26000), [shared]: v2(778, 0, 5300000, -700000) };
+    let gbVersion = 'g1';
+    const calls: string[] = [];
+    const fetchJson = async (url: string): Promise<FetchResult> => {
+      const u = url.replace(TILE_HOST, '');
+      calls.push(u);
+      if (u === 'manifest.json')
+        return { ok: true, data: { v: 1, regions: {
+          ie: { version: 'i1', path: 'ie/i1/', tiles: real.length, num: 0, cells: [...new Set(real.map((t) => cellOfTile(t)!))] },
+          gb: { version: gbVersion, path: `gb/${gbVersion}/`, tiles: 2, num: 1, country: 'GB', cells: [cellOfTile(gbTile)!, cellOfTile(shared)!] },
+        } } };
+      if (u === 'ie/i1/index.json') return { ok: true, data: { v: 2, region: 'ie', version: 'i1', tiles: real, counties: { 'County Kilkenny': real.slice(0, 4) }, classes: [] } };
+      if (u === `gb/${gbVersion}/index.json`) return { ok: true, data: { v: 2, region: 'gb', version: gbVersion, tiles: Object.keys(gbTiles), counties: { Kent: [gbTile] }, classes: [] } };
+      let m = /^ie\/i1\/(t_[-0-9_]+)\.json$/.exec(u);
+      if (m && tileData.has(m[1])) return { ok: true, data: tileData.get(m[1]) };
+      m = new RegExp(`^gb/${gbVersion}/(t_[-0-9_]+)\\.json$`).exec(u);
+      if (m && gbTiles[m[1]]) return { ok: true, data: gbTiles[m[1]] };
+      return { ok: false, missing: true };
+    };
+    const pm = phone();
+    const rm = new RoadData(pm.deps(fetchJson));
+    await rm.loadCached();
+    await rm.refresh();
+    check('a fresh phone starts with Ireland only', rm.regionsInUse().join() === 'ie' && !calls.some((c) => c.startsWith('gb/')));
+    const f = await rm.ensure([gbTile]);
+    const kent = pm.got.find((sg) => sg.id === 'way/777#0');
+    check('driving into another region: its index and tiles fetched as needed', f === 0 && rm.regionsInUse().join() === 'ie,gb' && pm.tiles.has(`gb:${gbTile}`) && !!kent, calls.filter((c) => c.startsWith('gb/')).join(' '));
+    check("that region's area codes don't clash with Ireland's (1000 + index)", kent?.c === 1003, `c=${kent?.c}`);
+    pm.got.length = 0;
+    await rm.ensure([shared]);
+    check('a square both regions have: both loaded, kept apart on the phone', pm.got.some((sg) => sg.id === 'way/778#0') && pm.got.some((sg) => sg.id !== 'way/778#0') && pm.tiles.has(shared) && pm.tiles.has(`gb:${shared}`));
+    check('both versions shown', rm.version === 'ie i1 · gb g1', String(rm.version));
+    gbVersion = 'g2';
+    const ch = await rm.refresh();
+    check('a new version of one region: only that region changes', ch?.regions.join() === 'gb' && ch?.to === 'g2' && ch?.from === 'g1');
+    // Next launch: both regions straight from the phone.
+    const rm2 = new RoadData(pm.deps(async () => ({ ok: false, missing: false })));
+    check('regions in use remembered offline', (await rm2.loadCached()) && rm2.regionsInUse().join() === 'ie,gb' && rm2.version === 'ie i1 · gb g2');
+    check('home areas: Ireland by name, others with their region', splitHome('County Kilkenny').region === 'ie' && splitHome('gb/Kent').name === 'Kent' && joinHome('gb', 'Kent') === 'gb/Kent' && joinHome('ie', 'County Cork') === 'County Cork');
+    check("another region's area tiles", rm.countyTiles('gb/Kent').join() === gbTile && rm.areas('gb').join() === 'Kent');
+  }
+
   // ---- Moving edits onto new road data ----
   const all: RoadSegment[] = real.flatMap((t) => tileData.get(t).segments);
   const net = new RoadNetwork();

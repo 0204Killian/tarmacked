@@ -1,6 +1,7 @@
 // Drive recap figures and the little map (src/recap.ts).
 //   npx tsx test/recap.test.ts
 import { driveGains, formatGain, fitPaths } from '../src/recap';
+import { buildBook } from '../src/areas';
 
 const results: boolean[] = [];
 const check = (name: string, ok: boolean, info = '') => {
@@ -8,7 +9,7 @@ const check = (name: string, ok: boolean, info = '') => {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${info ? `\n      ${info}` : ''}`);
 };
 
-const totals = { counties: ['County A', 'County B', 'County C'], totalMeters: [100_000, 1_000_000, 50_000], nationalMeters: 1_150_000 };
+const totals = buildBook([{ id: 'ie', num: 0, names: ['County A', 'County B', 'County C'], meters: [100_000, 1_000_000, 50_000], countries: ['IE', 'IE', 'IE'] }]);
 
 const g = driveGains(
   [
@@ -21,10 +22,20 @@ const g = driveGains(
 );
 check('county with the most new road is shown', g.county === 'County B', JSON.stringify(g));
 check('county gain = new road there / county total', Math.abs(g.countyGain! - 0.12) < 1e-9);
-check('national gain counts every piece', Math.abs(g.nationalGain! - (2500 / 1_150_000) * 100) < 1e-9);
+check('national gain counts every piece in that country', Math.abs(g.nationalGain! - (2200 / 1_150_000) * 100) < 1e-9);
 check('no new road: nothing to show', driveGains([], totals).county === null);
 check('no totals yet (offline first run): nothing to show', driveGains([{ lengthM: 5, county: 0 }], null).countyGain === null);
 check('county codes outside the list ignored', driveGains([{ lengthM: 5, county: 99 }], totals).county === null);
+{
+  // Two countries in one drive (over the border): the gain is for the
+  // shown county's own country.
+  const two = buildBook([
+    { id: 'ie', num: 0, names: ['County Louth', 'County Armagh'], meters: [1_000_000, 2_000_000], countries: ['IE', 'GB'] },
+    { id: 'gb', num: 1, names: ['Kent'], meters: [3_000_000], countries: ['GB'] },
+  ]);
+  const x = driveGains([{ lengthM: 3000, county: 1 }, { lengthM: 1000, county: 0 }, { lengthM: 500, county: 1000 }], two);
+  check('cross-border: county and its own country', x.county === 'County Armagh' && Math.abs(x.nationalGain! - (3500 / 5_000_000) * 100) < 1e-9, JSON.stringify(x));
+}
 
 check('gains readable at every size', [formatGain(2.345), formatGain(0.2149), formatGain(0.0123), formatGain(0.00042), formatGain(0)].join(' ') === '+2.3% +0.21% +0.012% +0.0004% +0%', [formatGain(2.345), formatGain(0.2149), formatGain(0.0123), formatGain(0.00042), formatGain(0)].join(' '));
 

@@ -32,6 +32,7 @@ declare module 'react-native-maps' {
 declare module 'expo-location' {
   export type LocationObject = { coords: { latitude: number; longitude: number; accuracy: number | null; speed?: number | null; heading?: number | null }; timestamp: number };
   export type PermissionResponse = { status: 'granted' | 'denied' | 'undetermined'; canAskAgain: boolean };
+  export function reverseGeocodeAsync(at: { latitude: number; longitude: number }): Promise<{ isoCountryCode: string | null; country: string | null }[]>;
   export function getForegroundPermissionsAsync(): Promise<PermissionResponse>;
   export function getBackgroundPermissionsAsync(): Promise<PermissionResponse>;
   export function hasStartedLocationUpdatesAsync(n: string): Promise<boolean>;

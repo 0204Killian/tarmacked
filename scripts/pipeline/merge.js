@@ -95,6 +95,10 @@ function merge(region, version, partsDir, areas, outDir) {
       classes: L.ROAD_CLASSES,
       byClass: byClass.slice(0, national).map(r),
       areas: areas.names,
+      // v0.21: which country each area is in, and the region's number
+      // (the app's area code = num * 1000 + index).
+      areaCountry: areas.countries ?? areas.names.map(() => byId(region)?.country ?? region.toUpperCase()),
+      num: byId(region)?.num ?? 0,
       areaLevel: areas.level,
       areaMeters: r(totals),
       areaByClass: byClass.map(r),
@@ -145,6 +149,8 @@ function merge(region, version, partsDir, areas, outDir) {
   const entry = {
     id: region,
     name: byId(region)?.name ?? region,
+    num: byId(region)?.num ?? 0,
+    country: byId(region)?.country ?? region.toUpperCase(),
     version,
     path: `${region}/${version}/`,
     tiles: tiles.length,

@@ -4,10 +4,10 @@
 import { StyleSheet, Text, View, Pressable, TextInput, ScrollView, ActivityIndicator } from 'react-native';
 import type { NavUpdate } from './nav';
 import { shortDistance } from './nav';
+import { distShort, speedNum } from './units';
 import type { PlannedRoute, Avoid } from './router';
 import type { Place } from './places';
 
-const km = (m: number) => (m >= 10_000 ? (m / 1000).toFixed(0) : (m / 1000).toFixed(1));
 export function minutes(s: number) {
   const m = Math.max(1, Math.round(s / 60));
   return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${m} min`;
@@ -116,7 +116,7 @@ export function RouteChooser(props: {
           <Pressable key={i} style={[s.routeRow, i === props.chosen && s.routeRowChosen]} onPress={() => props.onChoose(i)}>
             <View style={{ flex: 1 }}>
               <Text style={s.routeMain}>
-                {minutes(o.duration)} <Text style={s.routeDim}>· {km(o.distance)} km</Text>
+                {minutes(o.duration)} <Text style={s.routeDim}>· {distShort(o.distance)}</Text>
               </Text>
               <Text style={s.routeSub} numberOfLines={1}>
                 {o.roadNames.length ? `via ${o.roadNames.filter((n) => /^[MNRAB]\d/.test(n)).slice(0, 3).join(', ') || o.roadNames.slice(0, 2).join(', ')}` : ''}
@@ -124,7 +124,7 @@ export function RouteChooser(props: {
               {usesNote(o) ? <Text style={s.usesNote}>{usesNote(o)}</Text> : null}
             </View>
             <View style={{ alignItems: 'flex-end' }}>
-              <Text style={s.routeNew}>{km(o.newM)} km new</Text>
+              <Text style={s.routeNew}>{distShort(o.newM)} new</Text>
               <Text style={[s.tag, o.mode === 'new' && s.tagNew]}>
                 {o.mode === 'new' ? `New roads${extra > 0 ? ` · +${extra} min` : ''}` : props.options.length > 1 ? 'Fastest' : 'Fastest · also the most new road'}
               </Text>
@@ -195,7 +195,7 @@ export function SpeedLimit(props: { kmh: number }) {
   if (!props.kmh) return null;
   return (
     <View style={s.limit}>
-      <Text style={[s.limitText, props.kmh >= 100 && { fontSize: 19 }]}>{props.kmh}</Text>
+      <Text style={[s.limitText, speedNum(props.kmh) >= 100 && { fontSize: 19 }]}>{speedNum(props.kmh)}</Text>
     </View>
   );
 }
@@ -211,7 +211,7 @@ export function NavFooter(props: { update: NavUpdate | null; muted: boolean; onM
               {clock(Date.now() + u.remainingS * 1000)} <Text style={s.footerDim}>arrival</Text>
             </Text>
             <Text style={s.footerDim}>
-              {minutes(u.remainingS)} · {km(u.remainingM)} km{props.newM > 0 ? ` · +${km(props.newM)} km new` : ''}
+              {minutes(u.remainingS)} · {distShort(u.remainingM)}{props.newM > 0 ? ` · +${distShort(props.newM)} new` : ''}
             </Text>
           </>
         ) : (

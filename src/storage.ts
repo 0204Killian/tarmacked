@@ -888,8 +888,12 @@ export async function evictStaleTiles(): Promise<number> {
   return res.changes;
 }
 
-export async function clearTiles() {
-  await write((db) => db.runAsync('DELETE FROM tiles'));
+// One region's cached tiles (v0.21: other regions' are filed as "gb:t_..."),
+// or all of them.
+export async function clearTiles(region?: string) {
+  if (!region) await write((db) => db.runAsync('DELETE FROM tiles'));
+  else if (region === 'ie') await write((db) => db.runAsync("DELETE FROM tiles WHERE tile_id NOT LIKE '%:%'"));
+  else await write((db) => db.runAsync('DELETE FROM tiles WHERE tile_id LIKE ?', [`${region}:%`]));
 }
 
 // --- reset (dev tool) ---

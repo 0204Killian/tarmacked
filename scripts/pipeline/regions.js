@@ -11,6 +11,12 @@
 //          falls back to another level if this one finds too few)
 //   main   road types in the routing graph: 10 = down to tertiary roads,
 //          8 = down to secondary roads (big countries, to keep it small)
+//   num    the region's number (its place in this list): the app files each
+//          area as num * 1000 + its index, so areas of different regions
+//          never share a code. Only ever add regions at the end.
+//   country  ISO code of the country its areas belong to, for the app's
+//          country totals (Ireland's region splits it: Northern Ireland's
+//          six counties count for the UK, 'GB')
 //
 //   node regions.js ids                  every id
 //   node regions.js matrix all|ie,gb,fr  a JSON list, for GitHub Actions
@@ -65,9 +71,18 @@ const REGIONS = [
   { id: 'mc', name: 'Monaco', slug: 'europe/monaco', clip: 'MC', level: 8, main: 10 },
 ];
 
+// Countries the regions without a border cut (islands) belong to.
+const ISLAND_COUNTRY = { ie: 'IE', im: 'IM', gj: 'GJ', is: 'IS', fo: 'FO', cy: 'CY', mt: 'MT' };
+REGIONS.forEach((r, i) => {
+  r.num = i;
+  r.country = r.clip ?? ISLAND_COUNTRY[r.id] ?? r.id.toUpperCase();
+});
+// Areas per region must stay under this (the app's code = num * 1000 + index).
+const MAX_AREAS = 1000;
+
 const byId = (id) => REGIONS.find((r) => r.id === id);
 
-module.exports = { REGIONS, byId };
+module.exports = { REGIONS, byId, MAX_AREAS };
 
 if (require.main === module) {
   const [cmd, arg] = process.argv.slice(2);

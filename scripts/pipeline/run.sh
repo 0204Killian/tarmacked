@@ -54,7 +54,10 @@ osmium fileinfo "$PBF" | grep -E "Bounding|timestamp" || true
 # 2. Areas (counties etc.) and the country border, once for the whole region.
 LEVELS=2,4,5,6,7
 [ "$R_LEVEL" = "8" ] && LEVELS=2,4,5,6,7,8 # municipalities only where asked: big countries have tens of thousands
-osmium tags-filter "$PBF" "r/admin_level=$LEVELS" -o "$WORK/admin.osm.pbf" --overwrite
+# (Ireland also needs historic boundaries: Northern Ireland's six counties.)
+HISTORIC=()
+[ "$REGION" = "ie" ] && HISTORIC=(r/boundary=historic,traditional)
+osmium tags-filter "$PBF" "r/admin_level=$LEVELS" ${HISTORIC[@]+"${HISTORIC[@]}"} -o "$WORK/admin.osm.pbf" --overwrite
 osmium export "$WORK/admin.osm.pbf" --geometry-types=polygon -f geojsonseq -o "$WORK/admin.geojsonseq" --overwrite
 node --max-old-space-size="${NODE_HEAP:-6144}" areas.js "$REGION" "$WORK/admin.geojsonseq" "$WORK/areas.json"
 rm -f "$WORK/admin.osm.pbf" "$WORK/admin.geojsonseq"
@@ -104,6 +107,15 @@ done < "$WORK/parts.txt"
 # 5. Join the parts into out/<region>/<version>.
 node --max-old-space-size="${NODE_HEAP:-6144}" merge.js "$REGION" "$VERSION" "$WORK/built" "$WORK/areas.json" out
 rm -rf "$WORK/built" "$WORK/parts"
+
+# 6. Scenic drives (scenic-drives.js), for regions that have any: their
+#    roads come from the finished tiles and OSM's route relations.
+if node -e "process.exit((require('./scenic-drives').SCENIC['$REGION'] || []).length ? 0 : 1)"; then
+  osmium tags-filter "$PBF" r/route=road -R -o "$WORK/routes.osm.pbf" --overwrite
+  osmium cat "$WORK/routes.osm.pbf" -f opl -o "$WORK/routes.opl" --overwrite
+  node --max-old-space-size="${NODE_HEAP:-6144}" scenic.js "$REGION" "out/$REGION/$VERSION" "$WORK/routes.opl"
+  rm -f "$WORK/routes.osm.pbf" "$WORK/routes.opl"
+fi
 
 echo
 echo "Built out/$REGION/$VERSION. If the totals look right: bash upload.sh"

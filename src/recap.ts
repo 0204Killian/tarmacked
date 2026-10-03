@@ -2,6 +2,7 @@
 // the little map on it. Pure functions, so they can be tested on their own.
 
 import { Coord, METERS_PER_DEG_LAT, metersPerDegLon } from './geo';
+import type { AreaBook } from './areas';
 
 export type Recap = {
   driveId: number;
@@ -13,35 +14,39 @@ export type Recap = {
   oldShapes: Coord[][]; // roads driven before (grey)
   county: string | null; // the county with the most new road this drive
   countyGain: number | null; // percentage points of that county gained
-  nationalGain: number | null; // percentage points of the whole country gained
+  nationalGain: number | null; // percentage points of that county's country gained
 };
 
-export type Totals = { counties: string[]; totalMeters: number[]; nationalMeters: number };
-
 /**
- * How much of a county and of the country this drive added: the new road
- * per county, over that county's total. The county shown is the one with
- * the most new road.
+ * How much of an area (county) and of its country this drive added: the
+ * new road per area, over that area's total. The area shown is the one
+ * with the most new road.
  */
 export function driveGains(
   fresh: { lengthM: number; county: number | null }[],
-  totals: Totals | null
+  book: AreaBook | null
 ): { county: string | null; countyGain: number | null; nationalGain: number | null } {
-  if (!totals || fresh.length === 0) return { county: null, countyGain: null, nationalGain: null };
+  if (!book || fresh.length === 0) return { county: null, countyGain: null, nationalGain: null };
   const per = new Map<number, number>();
-  let all = 0;
   for (const f of fresh) {
-    all += f.lengthM;
-    if (f.county !== null && f.county >= 0 && f.county < totals.counties.length) per.set(f.county, (per.get(f.county) ?? 0) + f.lengthM);
+    if (f.county !== null && book.areas.has(f.county)) per.set(f.county, (per.get(f.county) ?? 0) + f.lengthM);
   }
   let best: number | null = null;
   per.forEach((m, c) => {
     if (best === null || m > per.get(best)!) best = c;
   });
-  const nationalGain = totals.nationalMeters > 0 ? (all / totals.nationalMeters) * 100 : null;
-  if (best === null) return { county: null, countyGain: null, nationalGain };
-  const total = totals.totalMeters[best];
-  return { county: totals.counties[best], countyGain: total > 0 ? (per.get(best)! / total) * 100 : null, nationalGain };
+  if (best === null) return { county: null, countyGain: null, nationalGain: null };
+  const area = book.areas.get(best)!;
+  const country = book.countries.get(area.country);
+  let inCountry = 0;
+  per.forEach((m, c) => {
+    if (book.areas.get(c)?.country === area.country) inCountry += m;
+  });
+  return {
+    county: area.name,
+    countyGain: area.meters > 0 ? (per.get(best)! / area.meters) * 100 : null,
+    nationalGain: country && country.meters > 0 ? (inCountry / country.meters) * 100 : null,
+  };
 }
 
 /** "+0.21%" with enough decimals that a short drive doesn't show as 0. */

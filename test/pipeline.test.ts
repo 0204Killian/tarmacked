@@ -13,7 +13,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
-import { decodeTile } from '../src/tiles';
+import { decodeTile, ROAD_CLASSES } from '../src/tiles';
 import { runPipeline } from './fixture';
 declare const require: any;
 declare const process: any;
@@ -88,7 +88,11 @@ fs.writeFileSync(path.join(data, 'roads.geojsonseq'), lines.join('\n') + '\n');
 const box = (a: number, b: number, c: number, d: number) => [[b, a], [d, a], [d, c], [b, c], [b, a]];
 fs.writeFileSync(
   path.join(data, 'admin.geojsonseq'),
-  '\x1e' + JSON.stringify({ type: 'Feature', geometry: { type: 'Polygon', coordinates: [box(52.4, -8.0, 52.8, -7.75), box(52.5, -7.95, 52.52, -7.9)] }, properties: { name: 'County Tipperary', boundary: 'administrative', admin_level: '6' } }) + '\n'
+  '\x1e' + JSON.stringify({ type: 'Feature', geometry: { type: 'Polygon', coordinates: [box(52.4, -8.0, 52.8, -7.75), box(52.5, -7.95, 52.52, -7.9)] }, properties: { name: 'County Tipperary', boundary: 'administrative', admin_level: '6' } }) + '\n' +
+    // Northern Ireland's counties are only historic boundaries in OSM.
+    '\x1e' + JSON.stringify({ type: 'Feature', geometry: { type: 'Polygon', coordinates: [box(52.4, -7.6, 52.8, -7.4)] }, properties: { name: 'County Antrim', boundary: 'historic' } }) + '\n' +
+    // A historic boundary named like a Republic county never beats the real one.
+    '\x1e' + JSON.stringify({ type: 'Feature', geometry: { type: 'Polygon', coordinates: [box(52.4, -7.6, 52.8, -7.4)] }, properties: { name: 'County Tipperary', boundary: 'historic' } }) + '\n'
 );
 fs.writeFileSync(
   path.join(data, 'places.geojsonseq'),
@@ -166,6 +170,11 @@ const tollPieces = [...got.values()].filter((sg) => sg.t);
 const gravel = [...got.values()].filter((sg) => sg.u);
 check('tiles: toll and unpaved pieces flagged', tollPieces.length > 0 && tollPieces.every((sg) => tollWays.includes(Number(/way\/(\d+)/.exec(sg.id)![1]))) && gravel.length > 0, `${tollPieces.length} toll, ${gravel.length} unpaved pieces`);
 check("Ireland's stats: the Republic's 26 counties as before, Northern Ireland's listed after", stats.counties.length === 26 && stats.totalMeters.length === 26 && stats.areas.length === 32 && stats.areas[26] === 'County Antrim');
+check(
+  "Northern Ireland's counties from historic boundaries, counted for the UK",
+  stats.areaMeters[26] > 0 && stats.areaCountry[26] === 'GB' && stats.areaCountry[9] === 'IE' && stats.num === 0 && stats.areaMeters[21] > 0,
+  `Antrim ${(stats.areaMeters[26] / 1000).toFixed(0)} km, Tipperary ${(stats.areaMeters[21] / 1000).toFixed(0)} km`
+);
 const { publish } = require('../scripts/pipeline/publish.js');
 const entry = JSON.parse(fs.readFileSync(path.join(out, 'entry-ie.json'), 'utf8'));
 const pub = publish({ v: 1, regions: { ie: { version: '2026-10-02', path: 'ie/2026-10-02/' }, fr: { version: '2026-09-02', path: 'fr/2026-09-02/' } } }, [entry]);
@@ -247,10 +256,50 @@ check(
   const east = cpieces.filter((sg) => sg.coords[Math.floor(sg.coords.length / 2)][1] > -7.59);
   check(
     "another country: roads over its border left out, its own areas (not the neighbour's)",
-    east.length === 0 && cpieces.length > 1000 && cst.areas.join() === 'North,South' && cst.nationalMeters > 0,
+    east.length === 0 && cpieces.length > 1000 && cst.areas.join() === 'North,South' && cst.nationalMeters > 0 && cst.areaCountry.join() === 'LU,LU' && cst.num > 0,
     `${cpieces.length} pieces kept, ${east.length} over the border; areas ${cst.areas.join(', ')}`
   );
 }
+// Scenic drives (v0.21): from road numbers in a box, and from route
+// relations (with sub-relations, like the Wild Atlantic Way's stages).
+async function scenicTest() {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { buildScenic } = require('../scripts/pipeline/scenic.js');
+  // A small region: R115 inside the box (kept), R115 outside it, a
+  // roundabout and a slip road on R115 (left out), and another road.
+  const sdir = path.join(tmp, 'scenic');
+  fs.mkdirSync(sdir, { recursive: true });
+  const link = ROAD_CLASSES.indexOf('secondary_link');
+  const sec = ROAD_CLASSES.indexOf('secondary');
+  const row = (way: number, idx: number, flags: number, name: number, cls: number, lat: number, lon: number) => [way, idx, flags, -1, name, cls, 0, lat, lon, 100, 100];
+  fs.writeFileSync(
+    path.join(sdir, 't_1062_-127.json'),
+    JSON.stringify({
+      v: 2,
+      names: ['R115 Military Road', 'R759', 'R115/R759'],
+      s: [row(1, 0, 0, 0, sec, 5313000, -630000), row(1, 1, 0, 0, sec, 5313100, -629900), row(2, 0, 0, 2, sec, 5314000, -630000), row(3, 0, 4, 0, sec, 5313500, -630000), row(4, 0, 0, 0, link, 5313600, -630000), row(5, 0, 0, 0, sec, 5340000, -630000), row(6, 0, 0, 1, sec, 5313000, -631000)],
+    })
+  );
+  // Route relations: a super-relation and its stage (like the Wild Atlantic Way's).
+  const opl = path.join(tmp, 'routes.opl');
+  fs.writeFileSync(opl, 'r1 v1 Ttype=route,route=road,name=Test%20%Way Mr2@\nr2 v1 Ttype=route,route=road,name=Test%20%Way%20%-%20%Stage Mw6@,w1@\nr3 v1 Ttype=route,route=road,name=Other Mw5@\n');
+  const defs = [
+    { id: 'by-ref', name: 'By ref', need: 1, roads: [{ ref: 'R115', box: [53.0, -6.4, 53.21, -6.24] }] },
+    { id: 'by-relation', name: 'By relation', need: 1, relation: /^Test Way\b/ },
+    { id: 'nothing', name: 'Nothing', need: 1, roads: [{ ref: 'Z999', box: [50, -11, 56, -5] }] },
+  ];
+  await buildScenic('ie', sdir, opl, defs);
+  const sc = JSON.parse(fs.readFileSync(path.join(sdir, 'scenic.json'), 'utf8'));
+  const ids = (d: any) => d.pieces.flatMap((r: number[]) => r.slice(1).filter((_: number, k: number) => k % 2 === 0).map((i: number) => `${r[0]}#${i}`)).sort().join(',');
+  const byRef = sc.drives.find((d: any) => d.id === 'by-ref');
+  const byRel = sc.drives.find((d: any) => d.id === 'by-relation');
+  check('scenic: a road number in a box (shared numbers too; no roundabouts, slip roads or bits outside)', ids(byRef) === '1#0,1#1,2#0' && byRef.m > 0, ids(byRef));
+  check('scenic: a route relation and its stages', ids(byRel) === '1#0,1#1,6#0' && byRel.lines.length > 0, ids(byRel));
+  check('scenic: a drive with no roads found is left out', !sc.drives.some((d: any) => d.id === 'nothing'));
+}
+
 check('tiles smaller than before', newBytes < oldBytes * 0.7, `${(newBytes / 1e6).toFixed(2)} MB vs ${(oldBytes / 1e6).toFixed(2)} MB for the same area (${Math.round((100 * newBytes) / oldBytes)}%), before Cloudflare's compression`);
 console.log(`      (built in ${Date.now() - t0} ms)\n${log.split('\n').filter((l) => /roads:|counties:|tiles:/.test(l)).map((l) => '      ' + l).join('\n')}`);
-console.log(results.every(Boolean) ? '\nALL PASS' : '\nSOME FAILED');
+scenicTest()
+  .then(() => console.log(results.every(Boolean) ? '\nALL PASS' : '\nSOME FAILED'))
+  .finally(() => fs.rmSync(tmp, { recursive: true, force: true })); // ~1 GB of test output

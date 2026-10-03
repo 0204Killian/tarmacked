@@ -1,7 +1,7 @@
 // Sat-nav logic (src/nav.ts): following a route, prompts, going off route,
-// arriving, and never-driven road on a route.
+// arriving, units.
 import { Navigator, NavRoute, spokenDistance, shortDistance, routeAhead, cumulative } from '../src/nav';
-import { RoadNetwork, RoadSegment } from '../src/roadMatcher';
+import { speedNum, dist, setUnits, getUnits } from '../src/units';
 import { metersPerDegLon, METERS_PER_DEG_LAT, Coord } from '../src/geo';
 
 const LAT0 = 52.7, LON0 = -7.4;
@@ -100,6 +100,22 @@ function drive(nav: Navigator, path: [number, number][], v: number, sigma = 5) {
 
 check('spoken distances', [spokenDistance(320), spokenDistance(75), spokenDistance(1480), spokenDistance(2000)].join(' | ') === 'In 300 metres | In 100 metres | In 1.5 kilometres | In 2 kilometres', [spokenDistance(320), spokenDistance(75), spokenDistance(1480), spokenDistance(2000)].join(' | '));
 check('banner distances', [shortDistance(320), shortDistance(42), shortDistance(1480), shortDistance(25300)].join(' | ') === '300 m | 40 m | 1.5 km | 25 km', [shortDistance(320), shortDistance(42), shortDistance(1480), shortDistance(25300)].join(' | '));
+
+// Imperial (v0.21): UK sat-nav style.
+{
+  const sd = spokenDistance;
+  const bd = shortDistance;
+  const said = [100, 270, 380, 600, 900, 1300, 2600, 25000].map((m) => sd(m, 'imperial')).join(' | ');
+  check('imperial spoken: yards, then quarter/half/three quarters, then miles', said === 'In 100 yards | In 300 yards | In a quarter of a mile | In a quarter of a mile | In half a mile | In three quarters of a mile | In 1.5 miles | In 16 miles', said);
+  const shown = [40, 300, 640, 25000].map((m) => bd(m, 'imperial')).join(' | ');
+  check('imperial banner: yards, then miles', shown === '40 yd | 350 yd | 0.4 mi | 16 mi', shown);
+  check('speed limits: mph roads round-trip exactly, km/h roads converted', [48, 97, 113, 100].map((k) => speedNum(k, 'imperial')).join() === '30,60,70,62' && speedNum(100, 'metric') === 100);
+  check('distances in either unit', dist(16093.44, 1, 'imperial') === '10.0 mi' && dist(12345, 1, 'metric') === '12.3 km');
+  setUnits('imperial');
+  const navSaid = sd(800);
+  setUnits('metric');
+  check('the setting switches what the sat-nav says', navSaid === 'In half a mile' && getUnits() === 'metric');
+}
 
 // Route line ahead: cut exactly at your position, mid-segment (one long
 // 1 km straight: nothing behind you stays drawn).

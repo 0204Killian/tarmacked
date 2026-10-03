@@ -17,3 +17,5 @@ npx tsx test/pipeline.test.ts | grep -E "^FAIL|ALL PASS|SOME FAILED"
 npx tsx test/router.test.ts | grep -E "^FAIL|ALL PASS|SOME FAILED"
 npx tsx test/places.test.ts | grep -E "^FAIL|ALL PASS|SOME FAILED"
 npx tsx test/r2.test.ts | grep -E "^FAIL|ALL PASS|SOME FAILED" | tail -1
+npx tsx test/areas.test.ts | grep -E "^FAIL|ALL PASS|SOME FAILED"
+npx tsx test/scenic.test.ts | grep -E "^FAIL|ALL PASS|SOME FAILED"

@@ -14,12 +14,16 @@ import * as store from './src/storage';
 import * as bg from './src/background';
 import * as Motion from './modules/motion-activity';
 import * as NavKit from './modules/nav-kit';
+import * as Store from './modules/store-kit';
+import { Paywall, LockedCard, PREMIUM_ID } from './src/premiumUi';
+import { ScenicDrive, parseScenic, scenicProgress, drivenMeters } from './src/scenic';
 import { RoadNetwork, RoadSegment, baseChunkId } from './src/roadMatcher';
 import { DriveMatcher, Point, PieceIndex, isPatchy } from './src/coverage';
 import { recheckDrives, driveDistanceMeters } from './src/recheck';
 import { HEAT_STEPS, heatStep, stepColor, rankRoads, RoadRank } from './src/heat';
 import { Coord, lineLengthMeters, distanceMeters, headingBetween, haversine, tileIdForPoint, neighbourTileIds, simplifyLine } from './src/geo';
-import { RoadData, fetchJson } from './src/roadData';
+import { RoadData, fetchJson, splitHome, joinHome, HOME_REGION } from './src/roadData';
+import { RegionStats, regionStatsFrom, buildBook, figures, byCompletion, areaCode, badgeFor, nextBadge, BADGES } from './src/areas';
 import { migrateEdits, OldEdit } from './src/editMigrate';
 import { Recap, driveGains } from './src/recap';
 import { RecapCard } from './src/RecapCard';
@@ -30,6 +34,7 @@ import { Place, fold } from './src/places';
 import { SearchPanel, RouteChooser, NavBanner, NavFooter, SpeedLimit } from './src/navUi';
 import { TILE_HOST } from './src/tiles';
 import { formatBytes, shortCounty, pad2, formatWhen, formatDuration, km } from './src/format';
+import { Units, getUnits, setUnits, dist, distNum } from './src/units';
 import { Chain, buildChains } from './src/chains';
 import { SettingsCard, SettingsHeader, SettingsRow, settingStyles } from './src/settingsUi';
 
@@ -37,7 +42,7 @@ import { SettingsCard, SettingsHeader, SettingsRow, settingStyles } from './src/
 // scripts/pipeline). It's checked for a newer version at most this often.
 const ROAD_DATA_CHECK_MS = 6 * 60 * 60 * 1000;
 // Shown in Settings → Help. Keep in step with app.json.
-const APP_VERSION = '0.20.7';
+const APP_VERSION = '0.21.0';
 // How far ahead of your position the route line is cut (under your dot).
 const NAV_TRIM_LEAD_M = 8;
 const SUPPORT_EMAIL = 'support@tarmacked.com';
@@ -58,9 +63,6 @@ const NOTE_MS = 7000;
 const MATCHER_REV = 5;
 const LOG_LINES = 60;
 
-// Real road totals for every county and the whole Republic, made by the
-// road-data pipeline alongside the tiles (stats.json). Cached for offline use.
-type CountyStats = { counties: string[]; totalMeters: number[]; nationalMeters: number };
 type Panel = null | 'stats' | 'drives' | 'dev';
 
 // 'osm' = OpenStreetMap tiles drawn over a plain Apple map (the default).
@@ -80,7 +82,7 @@ const ACCURACY_MODES: { key: AccuracyMode; label: string; info: string }[] = [
   { key: 'auto', label: 'Auto', info: 'High while charging, Balanced on battery.' },
 ];
 const isCharging = (s: Battery.BatteryState) => s === Battery.BatteryState.CHARGING || s === Battery.BatteryState.FULL;
-type StatsTab = 'overview' | 'counties' | 'roads' | 'data';
+type StatsTab = 'overview' | 'counties' | 'scenic' | 'roads' | 'data';
 type AutoPerm = { key: 'motion' | 'location' | 'notifications'; state: 'ok' | 'ask' | 'settings' | 'phoneOff' | 'unavailable' | 'missing' };
 const PERM_TEXT: Record<AutoPerm['key'], { name: string; why: string; fix: string }> = {
   motion: {
@@ -102,6 +104,7 @@ const PERM_TEXT: Record<AutoPerm['key'], { name: string; why: string; fix: strin
 const STATS_TABS: { key: StatsTab; label: string }[] = [
   { key: 'overview', label: 'Overview' },
   { key: 'counties', label: 'Counties' },
+  { key: 'scenic', label: 'Scenic' },
   { key: 'roads', label: 'Roads' },
   { key: 'data', label: 'Your data' },
 ];
@@ -177,6 +180,7 @@ function App() {
   // null = still loading; false = needs onboarding; true = ready
   const [onboarded, setOnboarded] = useState<boolean | null>(null);
   const [onboardingCounties, setOnboardingCounties] = useState<string[] | null>(null);
+  const [onboardingRegion, setOnboardingRegion] = useState(HOME_REGION);
   const [onboardingError, setOnboardingError] = useState('');
   const [onboardTry, setOnboardTry] = useState(0);
   const [downloadingCounty, setDownloadingCounty] = useState<string | null>(null);
@@ -189,6 +193,13 @@ function App() {
   const [following, setFollowing] = useState(true);
   const [panel, setPanel] = useState<Panel>(null);
   const [mapTypeIndex, setMapTypeIndex] = useState(0);
+  // Metric or imperial (src/units.ts holds it for everything that formats).
+  const [units, setUnitsState] = useState<Units>(getUnits());
+  const applyUnits = (u: Units, save = true) => {
+    setUnits(u);
+    setUnitsState(u);
+    if (save) store.setMeta('units', u).catch(() => undefined);
+  };
   const [region, setRegion] = useState(FALLBACK_REGION);
   const [visibleRegion, setVisibleRegion] = useState<Region>(FALLBACK_REGION);
   const mapRef = useRef<MapView | null>(null);
@@ -216,6 +227,7 @@ function App() {
   const onSegmentsRef = useRef<(segs: RoadSegment[]) => void>(() => undefined);
   const logRef = useRef<(line: string) => void>(() => undefined);
   const snapshotEditsRef = useRef<() => Promise<void>>(async () => undefined);
+  const regionAddedRef = useRef<(id: string) => void>(() => undefined);
   if (!roadDataRef.current) {
     roadDataRef.current = new RoadData({
       fetchJson,
@@ -225,6 +237,7 @@ function App() {
       putTiles: store.putTiles,
       clearTiles: store.clearTiles,
       beforeClear: () => snapshotEditsRef.current(),
+      onRegionAdded: (id) => regionAddedRef.current(id),
       onSegments: (segs) => onSegmentsRef.current(segs),
       log: (line) => logRef.current(line),
     });
@@ -233,7 +246,26 @@ function App() {
   const lastRoadCheckRef = useRef(0);
   const [netRev, setNetRev] = useState(0);
 
-  const [countyStats, setCountyStats] = useState<CountyStats | null>(null);
+  // Real road totals for every area (county) of each region in use, made by
+  // the road-data pipeline alongside the tiles (stats.json). Cached for
+  // offline use. v0.21: several regions, adding up to countries.
+  const [regionStats, setRegionStats] = useState<RegionStats[]>([]);
+  const areaBook = useMemo(() => (regionStats.length ? buildBook(regionStats) : null), [regionStats]);
+
+  // Scenic drives (v0.21) of each region in use, from its scenic.json.
+  const [scenic, setScenic] = useState<ScenicDrive[]>([]);
+  const [scenicShown, setScenicShown] = useState<ScenicDrive | null>(null);
+
+  // tarmacked Premium (v0.21): bought once through Apple. The developer
+  // menu can force it on or off for testing.
+  const [premiumOwned, setPremiumOwned] = useState(false);
+  const [premiumDev, setPremiumDev] = useState<'on' | 'off' | null>(null);
+  const premium = premiumDev ? premiumDev === 'on' : premiumOwned;
+  const [paywall, setPaywall] = useState(false);
+  const [premiumPrice, setPremiumPrice] = useState<string | null>(null);
+  const [premiumBusy, setPremiumBusy] = useState(false);
+  const [premiumMsg, setPremiumMsg] = useState('');
+  const premiumOwnedRef = useRef<(owned: boolean) => void>(() => undefined);
   const [currentCounty, setCurrentCounty] = useState<number | null>(null);
 
   // The drive in progress.
@@ -452,11 +484,13 @@ function App() {
     if (tiles.length <= 30) roadData.ensure(tiles).catch(() => undefined);
   };
 
-  const downloadHomeCounty = async (county: string) => {
-    setDownloadingCounty(county);
+  const downloadHomeCounty = async (name: string) => {
+    const county = joinHome(onboardingRegion, name); // "County Kilkenny", or "gb/Kent"
+    setDownloadingCounty(name);
     setOnboardingError('');
     try {
       const tileIds = roadData.countyTiles(county);
+      if (tileIds.length === 0) throw new Error('no road data for that county');
       setDownloadProgress({ done: 0, total: tileIds.length });
       const failed = await roadData.ensure(tileIds, {
         pinned: true, // home county is never auto-cleared
@@ -464,6 +498,8 @@ function App() {
       });
       if (failed > 0) throw new Error(`${failed} area(s) didn't download`);
       await store.setMeta('home_county', county);
+      await store.setMeta('units_pending', '1'); // picked from where you are (pickUnitsOnce)
+      if (onboardingRegion === 'gb') applyUnits('imperial'); // home in Britain: miles
       await store.setMeta('onboarded', 'true');
       setHomeCounty(county);
       setOnboarded(true);
@@ -552,21 +588,120 @@ function App() {
     return true;
   };
 
+  // Road totals per region: Ireland's kept under the name it always had.
+  const statsKey = (id: string) => (id === HOME_REGION ? 'county_stats' : `stats_${id}`);
+  const applyStats = (id: string, json: any): boolean => {
+    const info = roadData.regionInfo(id);
+    const num = info?.num ?? (id === HOME_REGION ? 0 : -1);
+    const rs = regionStatsFrom(json, id, num, info?.country ?? id.toUpperCase());
+    if (!rs || rs.num < 0) return false;
+    setRegionStats((prev) => [...prev.filter((r) => r.id !== id), rs].sort((a, b) => a.num - b.num));
+    return true;
+  };
+  const loadCachedStats = async (id: string) => {
+    try {
+      const cached = await store.getMeta(statsKey(id));
+      if (cached) applyStats(id, JSON.parse(cached));
+    } catch {
+      // no cached copy yet
+    }
+  };
+  const refreshStats = async (id: string) => {
+    const fresh = await roadData.statsJson(id);
+    if (fresh && applyStats(id, fresh)) await store.setMeta(statsKey(id), JSON.stringify(fresh));
+  };
+  // Scenic drives per region, kept with the version they came from.
+  const applyScenic = (id: string, json: any) => {
+    const drives = parseScenic(json, id);
+    setScenic((prev) => [...prev.filter((d) => d.region !== id), ...drives]);
+  };
+  const loadCachedScenic = async (id: string) => {
+    try {
+      const cached = await store.getMeta(`scenic_${id}`);
+      if (cached) applyScenic(id, JSON.parse(cached).data);
+    } catch {
+      // none yet
+    }
+  };
+  const refreshScenic = async (id: string) => {
+    const version = roadData.regionInfo(id)?.version;
+    if (!version) return;
+    try {
+      const cached = await store.getMeta(`scenic_${id}`);
+      if (cached && JSON.parse(cached).version === version) return; // already have this version's
+    } catch {
+      // fetch it
+    }
+    const r = await roadData.regionFile(id, 'scenic.json');
+    if (!r || (!r.ok && !r.missing)) return; // no connection: keep what we have, try again next time
+    const fresh = r.ok ? r.data : null; // missing = this region has no scenic drives
+    applyScenic(id, fresh);
+    await store.setMeta(`scenic_${id}`, JSON.stringify({ version, data: fresh }));
+  };
+
+  // Driving into another country: its totals, from the phone or downloaded.
+  regionAddedRef.current = (id: string) => {
+    addLog(`road data: started using ${roadData.regionInfo(id)?.name ?? id}`);
+    loadCachedStats(id).then(() => refreshStats(id)).catch(() => undefined);
+    loadCachedScenic(id).then(() => refreshScenic(id)).catch(() => undefined);
+  };
+
+  // ---------- Premium ----------
+
+  const openPaywall = () => {
+    setPremiumMsg('');
+    setPaywall(true);
+    if (!premium) {
+      setPremiumPrice(null);
+      Store.product(PREMIUM_ID).then((p) => setPremiumPrice(p?.price ?? ''));
+    }
+  };
+  const setOwned = (owned: boolean) => {
+    setPremiumOwned(owned);
+    store.setMeta('premium', owned ? '1' : '').catch(() => undefined);
+  };
+  premiumOwnedRef.current = setOwned;
+  const buyPremium = async () => {
+    setPremiumBusy(true);
+    setPremiumMsg('');
+    const r = await Store.purchase(PREMIUM_ID);
+    setPremiumBusy(false);
+    if (r === 'purchased') {
+      setOwned(true);
+      setPremiumMsg('');
+      setPaywall(false);
+      setNote('Premium unlocked. Thank you!');
+    } else if (r === 'pending') setPremiumMsg("Waiting for approval (Ask to Buy). It'll unlock by itself once it's approved.");
+    else if (r === 'failed' || r === 'unavailable') setPremiumMsg("The App Store couldn't complete that. Nothing was charged; try again in a while.");
+    addLog(`premium: purchase ${r}`);
+  };
+  const restorePremium = async () => {
+    setPremiumBusy(true);
+    setPremiumMsg('');
+    const owned = await Store.restore(PREMIUM_ID);
+    setPremiumBusy(false);
+    if (owned) {
+      setOwned(true);
+      setPaywall(false);
+      setNote('Premium restored.');
+    } else setPremiumMsg(owned === null ? "Couldn't reach the App Store. Try again with a connection." : "No Premium purchase found for this Apple ID.");
+    addLog(`premium: restore ${owned}`);
+  };
+
   // Checks for newer road data (not mid-drive: the road pieces would change
   // under the drive being matched). A new version reloads the road data,
   // moves map edits across and re-checks every drive against it.
   const syncRoadData = async (force = false): Promise<'new' | 'same' | 'offline' | 'busy'> => {
     if (!force && Date.now() - lastRoadCheckRef.current < ROAD_DATA_CHECK_MS) return 'same';
     if ((await bg.currentWatch()) || recheckRunning.current) return 'busy';
-    const hadIndex = !!roadData.index;
+    const hadIndex = roadData.hasData();
     const change = await roadData.refresh();
-    if (!roadData.index) return 'offline';
+    if (!roadData.hasData()) return 'offline';
     lastRoadCheckRef.current = Date.now();
-    roadData.statsJson().then(async (fresh) => {
-      if (!fresh || !Array.isArray(fresh.counties) || !Array.isArray(fresh.totalMeters)) return;
-      setCountyStats(fresh);
-      await store.setMeta('county_stats', JSON.stringify(fresh));
-    });
+    for (const id of roadData.regionsInUse()) {
+      refreshStats(id).catch(() => undefined);
+      refreshScenic(id).catch(() => undefined);
+    }
     if (!change) return hadIndex ? 'same' : 'new';
     addLog(`road data ${change.from || 'from before 0.17'} → ${change.to}`);
     netRef.current.clear();
@@ -580,6 +715,7 @@ function App() {
   };
 
   const skipOnboarding = async () => {
+    await store.setMeta('units_pending', '1');
     await store.setMeta('onboarded', 'true');
     setOnboarded(true);
   };
@@ -608,6 +744,19 @@ function App() {
         setBootStep('Clearing old road data…');
         await store.evictStaleTiles();
         const hasIndex = await roadData.loadCached();
+        // Area totals: the cached copies straight away; fresh ones come with
+        // each road-data check (syncRoadData).
+        for (const id of roadData.regionsInUse().length ? roadData.regionsInUse() : [HOME_REGION]) {
+          await loadCachedStats(id);
+          await loadCachedScenic(id);
+        }
+        // Premium: as last known straight away, then Apple's answer.
+        setPremiumOwned((await store.getMeta('premium')) === '1');
+        const dev = await store.getMeta('premium_dev');
+        setPremiumDev(dev === 'on' || dev === 'off' ? dev : null);
+        Store.owned(PREMIUM_ID).then((o) => {
+          if (o !== null) setOwned(o);
+        });
         setBootStep('Loading your roads…');
         const data = await store.loadAll();
         setBootStep('Setting up the map…');
@@ -632,6 +781,11 @@ function App() {
         } catch {
           // none saved
         }
+        // Units: as chosen. Phones set up before v0.21 stay metric; a new
+        // phone picks once, from where it's first used (imperial in the UK).
+        const savedUnits = await store.getMeta('units');
+        if (savedUnits === 'metric' || savedUnits === 'imperial') applyUnits(savedUnits, false);
+        else if (data.onboarded && (await store.getMeta('units_pending')) !== '1') applyUnits('metric');
         const savedMap = await store.getMeta('map_type');
         if (savedMap && MAP_TYPES.includes(savedMap as MapChoice)) setMapTypeIndex(MAP_TYPES.indexOf(savedMap as MapChoice));
         if (hasIndex) {
@@ -658,29 +812,38 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // County totals: the cached copy straight away; a fresh one comes with
-  // each road-data check (syncRoadData).
-  useEffect(() => {
-    (async () => {
-      try {
-        const cached = await store.getMeta('county_stats');
-        if (cached) setCountyStats(JSON.parse(cached));
-      } catch {
-        // no cached copy yet
-      }
-    })();
-  }, []);
 
   useEffect(() => {
     if (onboarded !== false || onboardingCounties !== null) return;
+    let cancelled = false; // the region was changed meanwhile
     (async () => {
       await syncRoadData(true);
-      const counties = roadData.counties();
+      if (onboardingRegion !== HOME_REGION) await roadData.useRegion(onboardingRegion);
+      if (cancelled) return;
+      const counties = roadData.areas(onboardingRegion);
       if (counties.length > 0) setOnboardingCounties(counties);
       else setOnboardingError("Couldn't download the road data. Check your connection and try again.");
     })();
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [onboarded, onboardingCounties, onboardTry]);
+  }, [onboarded, onboardingCounties, onboardTry, onboardingRegion]);
+
+  // First time on a new phone: miles in the UK (Northern Ireland included),
+  // kilometres everywhere else. Asked once; the Units setting changes it.
+  const pickUnitsOnce = async (lat: number, lon: number) => {
+    if (await store.getMeta('units')) return;
+    try {
+      const [place] = await withTimeout(Location.reverseGeocodeAsync({ latitude: lat, longitude: lon }), 8000, 'country lookup');
+      const uk = place?.isoCountryCode === 'GB';
+      applyUnits(uk ? 'imperial' : 'metric');
+      await store.setMeta('units_pending', '');
+      addLog(`units: ${uk ? 'imperial (set up in the UK)' : 'metric'}`);
+    } catch (e) {
+      addLog(`units: country lookup failed (${(e as Error).message}); metric for now`);
+    }
+  };
 
   // Location permissions and a first fix to centre the map.
   useEffect(() => {
@@ -699,6 +862,7 @@ function App() {
         setVisibleRegion(here);
         mapRef.current?.animateToRegion(here, 300);
         roadData.ensure(neighbourTileIds(here.latitude, here.longitude)).catch(() => undefined);
+        await pickUnitsOnce(here.latitude, here.longitude);
       } catch (e) {
         addLog(`no position yet: ${(e as Error).message}`);
       }
@@ -1012,6 +1176,10 @@ function App() {
     if (!dataLoaded || onboarded !== true) return;
     const sub = AppState.addEventListener('change', (state) => {
       if (state !== 'active') return;
+      // Premium bought elsewhere, or approved through Ask to Buy, meanwhile.
+      Store.owned(PREMIUM_ID).then((o) => {
+        if (o !== null) premiumOwnedRef.current(o);
+      });
       (async () => {
         try {
           refreshPermsRef.current().catch(() => undefined);
@@ -1070,7 +1238,7 @@ function App() {
     }
     setRawStats((prev) => ({ ...prev, points: prev.points + newPoints.length }));
     setLiveTrail((prev) => [...prev, ...newPoints]);
-    store.touchTiles(Array.from(new Set(newPoints.map((p) => tileIdForPoint(p.latitude, p.longitude))))).catch(() => undefined);
+    store.touchTiles(Array.from(new Set(newPoints.flatMap((p) => roadData.cachedKeys(tileIdForPoint(p.latitude, p.longitude)))))).catch(() => undefined);
   };
 
   // Saves the partly-driven stretches this drive changed.
@@ -1171,7 +1339,7 @@ function App() {
     // Pieces can replace shorter bits driven before: scale to the real new metres.
     const sum = pieces.reduce((a, p) => a + p.lengthM, 0);
     const k = sum > 0 ? Math.max(0, Math.min(1, r.newM / sum)) : 0;
-    const gains = driveGains(pieces.map((p) => ({ ...p, lengthM: p.lengthM * k })), countyStats);
+    const gains = driveGains(pieces.map((p) => ({ ...p, lengthM: p.lengthM * k })), areaBook);
     setRecap({ driveId: r.driveId, startedAt: r.startedAt, endedAt: r.endedAt, distanceM: r.distanceM, newM: r.newM, newShapes, oldShapes, ...gains });
   };
 
@@ -1206,7 +1374,7 @@ function App() {
       .catch(() => undefined);
     const patchy = isPatchy(ignored, pointCountRef.current);
     setNote(
-      `Drive saved: ${km(driveDistanceRef.current)} km, ${km(driveNewMRef.current)} km of new road.` +
+      `Drive saved: ${dist(driveDistanceRef.current)}, ${dist(driveNewMRef.current)} of new road.` +
         (patchy ? ' ⚠ Patchy GPS on this drive — check it in Drives.' : '')
     );
     showRecap({
@@ -2379,50 +2547,106 @@ function App() {
 
   // ---------- Stats ----------
 
-  // Per-county and national figures. Totals come from county-stats.json;
-  // driven km uses each driven road's stored shape and county. Excluded
-  // roads come off both sides.
+  // Per-area (county) and per-country figures. Totals come from each
+  // region's stats.json; driven km uses each driven road's stored shape and
+  // area. Excluded roads come off both sides.
   const countyFigures = useMemo(() => {
-    const n = countyStats?.counties.length ?? 0;
-    const driven = new Array(n).fill(0);
-    const excluded = new Array(n).fill(0);
+    const driven = new Map<number, number>();
+    const excluded = new Map<number, number>();
     drivenIds.forEach((id) => {
       const base = baseChunkId(id);
       if (excludedIds.has(base)) return;
       if (base !== id && drivenIds.has(base)) return; // whole piece already counted
       const c = drivenCountyRef.current.get(id);
-      if (c === undefined || c >= n) return;
-      driven[c] += lengthRef.current.get(id) ?? 0;
+      if (c === undefined || c === null) return;
+      driven.set(c, (driven.get(c) ?? 0) + (lengthRef.current.get(id) ?? 0));
     });
     excludedIds.forEach((id) => {
       const info = excludedInfoRef.current.get(id);
-      if (info && info.c !== null && info.c < n && info.l !== null) excluded[info.c] += info.l;
+      if (info && info.c !== null && info.l !== null) excluded.set(info.c, (excluded.get(info.c) ?? 0) + info.l);
     });
-    const rows = (countyStats?.counties ?? []).map((name, i) => {
-      const total = Math.max(0, countyStats!.totalMeters[i] - excluded[i]);
-      return { code: i, name, driven: driven[i], total, percent: total > 0 ? (driven[i] / total) * 100 : 0 };
-    });
-    const nationalDriven = driven.reduce((a: number, b: number) => a + b, 0);
-    const nationalTotal = Math.max(0, (countyStats?.nationalMeters ?? 0) - excluded.reduce((a: number, b: number) => a + b, 0));
+    const f = areaBook ? figures(areaBook, driven, excluded) : { areas: [], countries: [] };
     const unassigned = Array.from(drivenIds).filter((id) => !drivenCountyRef.current.has(id)).length;
-    return { rows, nationalDriven, nationalTotal, nationalPercent: nationalTotal > 0 ? (nationalDriven / nationalTotal) * 100 : 0, unassigned };
-  }, [countyStats, drivenIds, excludedIds]);
+    return { ...f, byCode: new Map(f.areas.map((a) => [a.code, a])), unassigned };
+  }, [areaBook, drivenIds, excludedIds]);
 
-  // Counties tab: most complete first (then most driven, then A to Z).
+  // Home county as an area code (saved by name: "County Kilkenny", "gb/Kent").
+  const homeCode = useMemo(() => {
+    if (!homeCounty) return null;
+    const { region, name } = splitHome(homeCounty);
+    const rs = regionStats.find((r) => r.id === region);
+    const i = rs ? rs.names.indexOf(name) : -1;
+    return rs && i >= 0 ? areaCode(rs.num, i) : null;
+  }, [homeCounty, regionStats]);
+
+  // The county you're in (or home), and its country.
+  const focusRow = countyFigures.byCode.get(currentCounty ?? homeCode ?? -1) ?? (homeCode !== null ? countyFigures.byCode.get(homeCode) : undefined) ?? null;
+  const focusCountry =
+    countyFigures.countries.find((c) => c.iso === (focusRow?.country ?? 'IE')) ?? countyFigures.countries[0] ?? null;
+
+  // Counties tab: one country at a time (the one you're in to start with),
+  // most complete first.
+  const [statsCountry, setStatsCountry] = useState<string | null>(null);
+  const shownCountry = countyFigures.countries.find((c) => c.iso === statsCountry) ?? focusCountry;
   const countiesByCompletion = useMemo(
-    () => [...countyFigures.rows].sort((a, b) => b.percent - a.percent || b.driven - a.driven || a.name.localeCompare(b.name)),
-    [countyFigures]
+    () => byCompletion(countyFigures.areas.filter((a) => a.country === shownCountry?.iso)),
+    [countyFigures, shownCountry]
   );
+  // Countries worth a chip: ones you've driven in, and the one you're in.
+  const statsCountries = useMemo(
+    () => countyFigures.countries.filter((c) => c.driven > 0 || c.iso === focusCountry?.iso).sort((a, b) => b.driven - a.driven),
+    [countyFigures, focusCountry]
+  );
+
+  // Scenic drives and how far along each is (tracked for everyone, shown
+  // with Premium), furthest along first.
+  const scenicRows = useMemo(() => {
+    const drivenOf = drivenMeters(drivenIds, (id) => lengthRef.current.get(id));
+    return scenic
+      .map((d) => ({ d, p: scenicProgress(d, drivenOf, excludedIds) }))
+      .sort((a, b) => Number(b.p.done) - Number(a.p.done) || b.p.percent - a.p.percent || a.d.name.localeCompare(b.d.name));
+  }, [scenic, drivenIds, excludedIds]);
+  // Finishing one: a note (not for ones already done when the app opened).
+  // The first time a region's drives are seen (after your roads have
+  // loaded) they're only noted, never announced.
+  const scenicDoneRef = useRef(new Map<string, Set<string>>()); // region -> drives done
+  useEffect(() => {
+    if (!dataLoaded || !scenic.length) return;
+    const fresh: string[] = [];
+    const byRegion = new Map<string, typeof scenicRows>();
+    for (const r of scenicRows) byRegion.set(r.d.region, [...(byRegion.get(r.d.region) ?? []), r]);
+    byRegion.forEach((rows, region) => {
+      const done = new Set(rows.filter((r) => r.p.done).map((r) => r.d.id));
+      const before = scenicDoneRef.current.get(region);
+      scenicDoneRef.current.set(region, done);
+      if (before) rows.forEach((r) => r.p.done && !before.has(r.d.id) && fresh.push(r.d.name));
+    });
+    if (fresh.length && premium) setNote(`Scenic drive complete: ${fresh.join(', ')}!`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scenicRows, dataLoaded]);
+
+  const showScenic = (d: ScenicDrive) => {
+    setScenicShown(d);
+    setHighlight(null);
+    setPanel(null);
+    setFollowing(false);
+    const [south, west, north, east] = d.box;
+    mapRef.current?.fitToCoordinates(
+      [
+        { latitude: south, longitude: west },
+        { latitude: north, longitude: east },
+      ],
+      { edgePadding: { top: 160, right: 50, bottom: 220, left: 50 }, animated: true }
+    );
+  };
 
   // Tapping the county in the bottom bar: its stats.
   const openCountyStats = () => {
+    setStatsCountry(null);
     setStatsTab('counties');
     setPanel('stats');
     store.listDrives().then(setDrives).catch(() => undefined);
   };
-
-  const focusRow =
-    currentCounty !== null ? countyFigures.rows[currentCounty] : countyFigures.rows.find((r) => r.name === homeCounty) ?? null;
 
   // ---------- Map drawing ----------
 
@@ -2645,6 +2869,23 @@ function App() {
             <Text style={styles.onboardText}>
               Pick your home county to download it now — everywhere else downloads automatically as you drive there.
             </Text>
+            {roadData.allRegions().length > 1 && (
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ flexGrow: 0, marginBottom: 8 }} contentContainerStyle={{ gap: 6 }}>
+                {roadData.allRegions().map((r) => (
+                  <Pressable
+                    key={r.id}
+                    style={[styles.tabPill, r.id === onboardingRegion && styles.tabPillActive]}
+                    onPress={() => {
+                      if (r.id === onboardingRegion) return;
+                      setOnboardingRegion(r.id);
+                      setOnboardingCounties(null);
+                    }}
+                  >
+                    <Text style={styles.chipText}>{r.name ?? r.id}</Text>
+                  </Pressable>
+                ))}
+              </ScrollView>
+            )}
             {onboardingError ? <Text style={styles.onboardError}>{onboardingError}</Text> : null}
             {onboardingError && onboardingCounties === null ? (
               <Pressable
@@ -2771,6 +3012,12 @@ function App() {
           />
         )}
 
+        {/* A scenic drive picked from Stats → Scenic (driven bits show green on top). */}
+        {scenicShown &&
+          scenicShown.lines.map((line, i) => (
+            <Polyline key={`sc${i}`} coordinates={toLatLng(line)} strokeColor="rgba(255,210,74,0.85)" strokeWidth={6} zIndex={1} />
+          ))}
+
         {/* Most-driven stretch picked from Stats → Roads. */}
         {highlight && drawLayers('hl', [{ chains: highlightChains, color: '#ffffff' }], false, baseRev, '#d0206a', 5)}
 
@@ -2872,7 +3119,7 @@ function App() {
           <View style={styles.topPill}>
             <Pressable
               style={[styles.topItem, styles.topIcon, heatOn && styles.topItemHeat]}
-              onPress={() => setHeatOn((v) => !v)}
+              onPress={() => (premium || heatOn ? setHeatOn((v) => !v) : openPaywall())}
               accessibilityLabel={heatOn ? 'Hide heatmap' : 'Show heatmap'}
             >
               <View style={styles.heatIcon}>
@@ -2890,7 +3137,7 @@ function App() {
       )}
 
       {/* Heatmap legend, and the picked most-driven stretch */}
-      {(heatOn || highlight) && !panel && !editMode && navStage === 'off' && (
+      {(heatOn || highlight || scenicShown) && !panel && !editMode && navStage === 'off' && (
         <View style={styles.heatBar}>
           {heatOn && (
             <View style={styles.legendRow}>
@@ -2900,6 +3147,14 @@ function App() {
               ))}
               <Text style={styles.legendText}>{maxCount}×</Text>
             </View>
+          )}
+          {scenicShown && (
+            <Pressable style={styles.legendRow} onPress={() => setScenicShown(null)}>
+              <Text style={styles.highlightText} numberOfLines={1}>
+                {scenicShown.name} · {(scenicRows.find((r) => r.d.id === scenicShown.id)?.p.percent ?? 0).toFixed(1)}% driven
+              </Text>
+              <Text style={styles.legendText}>  ✕</Text>
+            </Pressable>
           )}
           {highlight && (
             <Pressable style={styles.legendRow} onPress={() => setHighlight(null)}>
@@ -2935,60 +3190,100 @@ function App() {
           </ScrollView>
           <ScrollView>
             {statsTab === 'overview' &&
-              (countyStats ? (
+              (focusCountry ? (
                 <>
-                  <Text style={styles.bigStat}>{countyFigures.nationalPercent.toFixed(3)}%</Text>
+                  <Text style={styles.bigStat}>{focusCountry.percent.toFixed(3)}%</Text>
                   <Text style={styles.small}>
-                    of Ireland's roads · {km(countyFigures.nationalDriven)} / {km(countyFigures.nationalTotal, 0)} km
+                    of {focusCountry.name}'s roads · {distNum(focusCountry.driven)} / {dist(focusCountry.total, 0)}
                   </Text>
+                  {statsCountries
+                    .filter((c) => c.iso !== focusCountry.iso)
+                    .map((c) => (
+                      <Text key={c.iso} style={styles.recordLine}>
+                        {c.name} {c.percent.toFixed(3)}% · {dist(c.driven)}
+                      </Text>
+                    ))}
+                  <Text style={styles.sectionTitle}>County badges</Text>
+                  <View style={styles.badgeRow}>
+                    {BADGES.map((b) => (
+                      <View key={b.badge} style={styles.badgeCount}>
+                        <View style={[styles.badgeDot, { backgroundColor: b.color }]} />
+                        <Text style={styles.statValue}>{countyFigures.areas.filter((a) => badgeFor(a)?.badge === b.badge).length}</Text>
+                        <Text style={styles.statLabel}>{b.label}</Text>
+                      </View>
+                    ))}
+                  </View>
+                  {focusRow && nextBadge(focusRow) && (
+                    <Text style={styles.recordLine}>
+                      {shortCounty(focusRow.name)}: {nextBadge(focusRow)!.toGo.toFixed(2)}% to {nextBadge(focusRow)!.badge.label.toLowerCase()}
+                    </Text>
+                  )}
                   <Text style={styles.sectionTitle}>New road</Text>
                   <View style={styles.statGrid}>
-                    <StatTile label="This week" value={`+${km(overview.week)} km`} />
-                    <StatTile label="This month" value={`+${km(overview.month)} km`} />
-                    <StatTile label="All time" value={`${km(overview.all)} km`} />
+                    <StatTile label="This week" value={`+${dist(overview.week)}`} />
+                    <StatTile label="This month" value={`+${dist(overview.month)}`} />
+                    <StatTile label="All time" value={dist(overview.all)} />
                   </View>
                   <Text style={styles.sectionTitle}>Drives</Text>
                   <View style={styles.statGrid}>
                     <StatTile label="Drives" value={String(overview.count)} />
-                    <StatTile label="Distance" value={`${km(overview.dist, 0)} km`} />
+                    <StatTile label="Distance" value={dist(overview.dist, 0)} />
                     <StatTile label="Time" value={formatDuration(overview.time)} />
                   </View>
                   <Text style={styles.sectionTitle}>Records</Text>
-                  {overview.longest && (
+                  {!premium ? (
+                    <LockedCard title="Your records" text="Longest drive, biggest day for new road, your most driven road." onUnlock={openPaywall} />
+                  ) : null}
+                  {premium && overview.longest && (
                     <Text style={styles.recordLine}>
-                      Longest drive: {km(overview.longest.distanceM ?? 0)} km · {formatWhen(overview.longest.startedAt)}
+                      Longest drive: {dist(overview.longest.distanceM ?? 0)} · {formatWhen(overview.longest.startedAt)}
                     </Text>
                   )}
-                  {overview.mostNew && (
+                  {premium && overview.mostNew && (
                     <Text style={styles.recordLine}>
-                      Most new road: +{km(overview.mostNew.newM ?? 0)} km · {formatWhen(overview.mostNew.startedAt)}
+                      Most new road: +{dist(overview.mostNew.newM ?? 0)} · {formatWhen(overview.mostNew.startedAt)}
                     </Text>
                   )}
-                  {topRoad && (
+                  {premium && topRoad && (
                     <Pressable onPress={() => showRoad(topRoad)}>
                       <Text style={styles.recordLine}>
                         Most driven road: {topRoad.name} · {topRoad.count}× <Text style={styles.linkText}>show</Text>
                       </Text>
                     </Pressable>
                   )}
-                  {!overview.longest && !topRoad && <Text style={styles.small}>Records appear after your first drive.</Text>}
+                  {premium && !overview.longest && !topRoad && <Text style={styles.small}>Records appear after your first drive.</Text>}
                 </>
               ) : (
                 <Text style={styles.small}>Road totals haven't loaded yet — connect to the internet once and they're saved for offline use.</Text>
               ))}
 
             {statsTab === 'counties' &&
-              (countyStats ? (
+              (shownCountry ? (
                 <>
+                  {statsCountries.length > 1 && (
+                    <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.tabBar} contentContainerStyle={{ gap: 6 }}>
+                      {statsCountries.map((c) => (
+                        <Pressable key={c.iso} style={[styles.tabPill, c.iso === shownCountry.iso && styles.tabPillActive]} onPress={() => setStatsCountry(c.iso)}>
+                          <Text style={styles.chipText}>{c.name}</Text>
+                        </Pressable>
+                      ))}
+                    </ScrollView>
+                  )}
                   <Text style={styles.statsHeadline}>
-                    Ireland {countyFigures.nationalPercent.toFixed(3)}% · {km(countyFigures.nationalDriven)} /{' '}
-                    {km(countyFigures.nationalTotal, 0)} km
+                    {shownCountry.name} {shownCountry.percent.toFixed(3)}% · {distNum(shownCountry.driven)} / {dist(shownCountry.total, 0)}
                   </Text>
                   {countiesByCompletion.map((r) => (
-                    <View key={r.name} style={[styles.countyStatRow, r.code === focusRow?.code && styles.countyStatRowCurrent]}>
-                      <Text style={[styles.countyStatName, r.driven > 0 && styles.countyStatNameDriven]}>{shortCounty(r.name)}</Text>
+                    <View key={r.code} style={[styles.countyStatRow, r.code === focusRow?.code && styles.countyStatRowCurrent]}>
+                      <View style={styles.countyNameWrap}>
+                        <Text style={[styles.countyStatName, r.driven > 0 && styles.countyStatNameDriven]}>{shortCounty(r.name)}</Text>
+                        {badgeFor(r) && (
+                          <View style={[styles.badgePill, { backgroundColor: badgeFor(r)!.color }]}>
+                            <Text style={styles.badgePillText}>{badgeFor(r)!.label}</Text>
+                          </View>
+                        )}
+                      </View>
                       <Text style={styles.countyStatValue}>
-                        {r.percent.toFixed(2)}% · {km(r.driven)} / {km(r.total, 0)} km
+                        {r.percent.toFixed(2)}% · {distNum(r.driven)} / {dist(r.total, 0)}
                       </Text>
                     </View>
                   ))}
@@ -3003,7 +3298,46 @@ function App() {
                 <Text style={styles.small}>Road totals haven't loaded yet — connect to the internet once and they're saved for offline use.</Text>
               ))}
 
-            {statsTab === 'roads' && (
+            {statsTab === 'roads' && !premium && (
+              <LockedCard title="Your most driven roads" text="Every road you drive, ranked by how often, with the heatmap to match." onUnlock={openPaywall} />
+            )}
+
+            {statsTab === 'scenic' && (
+              <>
+                {!premium && (
+                  <LockedCard
+                    title="Scenic drives"
+                    text="Famous routes to complete. Your progress is already being kept: unlock to see it, and every drive added later."
+                    onUnlock={openPaywall}
+                  />
+                )}
+                {scenicRows.length === 0 ? (
+                  <Text style={styles.small}>Scenic drives come with the road data. Connect to the internet and they'll appear here.</Text>
+                ) : (
+                  scenicRows.map(({ d, p }) => (
+                    <Pressable key={d.id} style={styles.roadRow} onPress={() => (premium ? showScenic(d) : openPaywall())}>
+                      <View style={{ flex: 1 }}>
+                        <Text style={[styles.roadName, p.done && premium && { color: '#39d353' }]} numberOfLines={1}>
+                          {d.name}
+                        </Text>
+                        <Text style={styles.driveInfo} numberOfLines={1}>
+                          {d.where ? `${d.where} · ` : ''}
+                          {dist(d.meters, 0)}
+                        </Text>
+                        {premium && (
+                          <View style={styles.progressTrack}>
+                            <View style={[styles.progressFill, { width: `${p.percent}%` }]} />
+                          </View>
+                        )}
+                      </View>
+                      <Text style={styles.roadCount}>{premium ? (p.done ? 'Done' : `${p.percent < 10 ? p.percent.toFixed(1) : Math.floor(p.percent)}%`) : ''}</Text>
+                    </Pressable>
+                  ))
+                )}
+              </>
+            )}
+
+            {statsTab === 'roads' && premium && (
               <>
                 <Text style={styles.small}>
                   Your most driven roads — the number is how many drives covered the busiest bit. Tap one to see it on the map
@@ -3021,8 +3355,8 @@ function App() {
                           {r.name}
                         </Text>
                         <Text style={styles.driveInfo}>
-                          {r.county !== null && countyStats ? `${shortCounty(countyStats.counties[r.county] ?? '')} · ` : ''}
-                          {km(r.hotM, 2)} km at that
+                          {r.county !== null && areaBook?.areas.get(r.county) ? `${shortCounty(areaBook.areas.get(r.county)!.name)} · ` : ''}
+                          {dist(r.hotM, 2)} at that
                         </Text>
                       </View>
                       <Text style={styles.roadCount}>{r.count}×</Text>
@@ -3083,8 +3417,8 @@ function App() {
                       )}
                       <Text style={styles.driveInfo}>
                         {d.endedAt ? `${formatDuration(d.endedAt - d.startedAt)} · ` : ''}
-                        {d.distanceM !== null ? `${km(d.distanceM)} km` : `${d.pointCount} points`}
-                        {d.newM !== null && d.newM > 0 ? ` · +${km(d.newM)} km new` : ''}
+                        {d.distanceM !== null ? dist(d.distanceM) : `${d.pointCount} points`}
+                        {d.newM !== null && d.newM > 0 ? ` · +${dist(d.newM)} new` : ''}
                       </Text>
                     </View>
                     {pending && (
@@ -3154,6 +3488,19 @@ function App() {
                 onPress={chooseAccuracySheet}
               />
               <SettingsRow title="Map style" value={MAP_LABELS[MAP_TYPES[mapTypeIndex]]} onPress={chooseMapSheet} />
+              <SettingsRow
+                title="Units"
+                value={units === 'imperial' ? 'Miles' : 'Kilometres'}
+                onPress={() =>
+                  ActionSheetIOS.showActionSheetWithOptions(
+                    { title: 'Units', options: ['Kilometres (km, km/h)', 'Miles (mi, mph)', 'Cancel'], cancelButtonIndex: 2, userInterfaceStyle: 'dark' },
+                    (i: number) => {
+                      if (i === 0) applyUnits('metric');
+                      else if (i === 1) applyUnits('imperial');
+                    }
+                  )
+                }
+              />
             </SettingsCard>
             {(autoWanted || autoDetect) && autoPerms.some((p) => p.state !== 'ok') && (
               <View style={styles.missingBox}>
@@ -3238,10 +3585,17 @@ function App() {
             </SettingsCard>
             <Text style={settingStyles.foot}>Used only when there's another way. You can change them for one trip on the route screen.</Text>
 
+            <SettingsHeader title="Premium" />
+            <SettingsCard>
+              <SettingsRow first title="tarmacked Premium" value={premium ? 'Unlocked' : 'What you get'} onPress={openPaywall} />
+              {!premium && <SettingsRow title="Restore purchase" disabled={premiumBusy} onPress={restorePremium} />}
+            </SettingsCard>
+
             <SettingsHeader title="Help" />
             <SettingsCard>
               <SettingsRow first title="Send a problem report" onPress={sendProblemReport} />
               <SettingsRow title="Help & privacy" onPress={() => Linking.openURL('https://tarmacked.com/support').catch(() => undefined)} />
+              <SettingsRow title="Terms of use" onPress={() => Linking.openURL('https://tarmacked.com/terms').catch(() => undefined)} />
             </SettingsCard>
             <Pressable onPress={tapVersion}>
               <Text style={settingStyles.foot}>
@@ -3265,6 +3619,19 @@ function App() {
                   </Pressable>
                   <Pressable style={[styles.button, styles.buttonGrey, simulateTaps && styles.buttonOn]} onPress={() => setSimulateTaps((v) => !v)}>
                     <Text style={styles.buttonText}>Tap-to-simulate: {simulateTaps ? 'on' : 'off'}</Text>
+                  </Pressable>
+                </View>
+                <View style={styles.row}>
+                  {/* Premium for testing: as bought (App Store), forced on, forced off. */}
+                  <Pressable
+                    style={[styles.button, styles.buttonGrey, premiumDev === 'on' && styles.buttonOn]}
+                    onPress={() => {
+                      const next = premiumDev === null ? 'on' : premiumDev === 'on' ? 'off' : null;
+                      setPremiumDev(next);
+                      store.setMeta('premium_dev', next ?? '').catch(() => undefined);
+                    }}
+                  >
+                    <Text style={styles.buttonText}>Premium: {premiumDev === null ? `as bought (${premiumOwned ? 'yes' : 'no'})` : premiumDev === 'on' ? 'forced on' : 'forced off'}</Text>
                   </Pressable>
                 </View>
                 <View style={styles.row}>
@@ -3374,11 +3741,11 @@ function App() {
       ) : (
         <View style={styles.bottomBar}>
           <View style={{ flex: 1 }}>
-            {countyStats ? (
+            {focusCountry ? (
               <Pressable onPress={openCountyStats} hitSlop={8}>
                 <Text style={styles.barLine}>
-                  {focusRow ? `${shortCounty(focusRow.name)} ${focusRow.percent.toFixed(2)}%` : 'Ireland'}
-                  <Text style={styles.barDim}>{`  ·  Ireland ${countyFigures.nationalPercent.toFixed(3)}%`}</Text>
+                  {focusRow ? `${shortCounty(focusRow.name)} ${focusRow.percent.toFixed(2)}%` : focusCountry.name}
+                  <Text style={styles.barDim}>{`  ·  ${focusCountry.name} ${focusCountry.percent.toFixed(3)}%`}</Text>
                 </Text>
               </Pressable>
             ) : (
@@ -3387,11 +3754,11 @@ function App() {
             {tracking &&
               (liveAuto ? (
                 <Text style={styles.barLive}>
-                  ● Auto-detected · {formatDuration(elapsed)} · {km(driveDistanceRef.current)} km · Stop to save
+                  ● Auto-detected · {formatDuration(elapsed)} · {dist(driveDistanceRef.current)} · Stop to save
                 </Text>
               ) : (
                 <Text style={styles.barLive}>
-                  ● {formatDuration(elapsed)} · {km(driveDistanceRef.current)} km · +{km(driveNewMRef.current)} km new
+                  ● {formatDuration(elapsed)} · {dist(driveDistanceRef.current)} · +{dist(driveNewMRef.current)} new
                 </Text>
               ))}
           </View>
@@ -3417,6 +3784,18 @@ function App() {
       )}
 
       {recap && <RecapCard recap={recap} onClose={() => setRecap(null)} />}
+
+      {paywall && (
+        <Paywall
+          premium={premium}
+          price={premiumPrice}
+          busy={premiumBusy}
+          message={premiumMsg}
+          onBuy={buyPremium}
+          onRestore={restorePremium}
+          onClose={() => setPaywall(false)}
+        />
+      )}
 
       {offerAuto && loadingGone && !tracking && (
         <View style={styles.offerBackdrop}>
@@ -3649,6 +4028,14 @@ const styles = StyleSheet.create({
   statsHeadline: { color: '#39d353', fontSize: 14, fontWeight: '600', marginBottom: 8 },
   countyStatRow: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 5, paddingHorizontal: 6, borderRadius: 6 },
   countyStatRowCurrent: { backgroundColor: 'rgba(57,211,83,0.15)' },
+  countyNameWrap: { flexDirection: 'row', alignItems: 'center', gap: 6, flexShrink: 1 },
+  badgePill: { borderRadius: 6, paddingHorizontal: 5, paddingVertical: 1 },
+  badgePillText: { color: '#14100a', fontSize: 9, fontWeight: '800', letterSpacing: 0.3, textTransform: 'uppercase' },
+  badgeRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 4 },
+  badgeCount: { flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: '#1f1f1f', borderRadius: 10, paddingVertical: 6, paddingHorizontal: 10 },
+  badgeDot: { width: 10, height: 10, borderRadius: 5 },
+  progressTrack: { height: 4, borderRadius: 2, backgroundColor: '#2a2a2a', marginTop: 6, overflow: 'hidden' },
+  progressFill: { height: 4, backgroundColor: '#39d353' },
   countyStatName: { color: '#888', fontSize: 13 },
   countyStatNameDriven: { color: '#fff', fontWeight: '600' },
   countyStatValue: { color: '#aaa', fontSize: 12 },

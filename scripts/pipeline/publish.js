@@ -34,7 +34,7 @@ function publish(live, entries) {
   for (const e of entries) {
     const before = manifest.regions[e.id];
     if (before?.path && before.path !== e.path) keep.push(before.path);
-    manifest.regions[e.id] = { version: e.version, path: e.path, tiles: e.tiles, builtAt: e.builtAt, name: e.name, bbox: e.bbox, cells: e.cells, km: e.km };
+    manifest.regions[e.id] = { version: e.version, path: e.path, tiles: e.tiles, builtAt: e.builtAt, name: e.name, num: e.num, country: e.country, bbox: e.bbox, cells: e.cells, km: e.km };
     keep.push(e.path);
   }
   // Regions not rebuilt this time: keep what they're on.

@@ -11,7 +11,7 @@
 const fs = require('fs');
 const readline = require('readline');
 const L = require('./lib');
-const { byId } = require('./regions');
+const { byId, MAX_AREAS } = require('./regions');
 
 async function* features(file) {
   if (!fs.existsSync(file)) return;
@@ -103,8 +103,12 @@ async function chooseAreas(regionId, adminFile) {
   const admin = async function* () {
     for await (const f of features(adminFile)) {
       const p = f.properties || {};
-      if (!f.geometry || p.boundary !== 'administrative') continue;
-      yield { p, level: String(p.admin_level || ''), geometry: f.geometry };
+      if (!f.geometry) continue;
+      // Northern Ireland's six counties are only mapped as historic
+      // boundaries (councils replaced them): accepted for Ireland only.
+      const historic = regionId === 'ie' && (p.boundary === 'historic' || p.boundary === 'traditional');
+      if (p.boundary !== 'administrative' && !historic) continue;
+      yield { p, level: historic ? 'historic' : String(p.admin_level || ''), geometry: f.geometry };
     }
   };
 
@@ -112,15 +116,17 @@ async function chooseAreas(regionId, adminFile) {
   if (regionId === 'ie') {
     const polys = L.COUNTY_CODES.map(() => null);
     const levelOf = L.COUNTY_CODES.map(() => '');
+    const rank = { '6': 3, '5': 2, historic: 1 }; // the county level wins
     for await (const f of admin()) {
-      if (f.level !== '5' && f.level !== '6') continue;
+      if (!rank[f.level]) continue;
       const code = L.COUNTY_CODES.indexOf(f.p.name);
       if (code < 0) continue;
-      if (polys[code] && levelOf[code] === '6') continue; // the county level wins
+      if (polys[code] && rank[levelOf[code]] >= rank[f.level]) continue;
       polys[code] = ringsOf(f.geometry);
       levelOf[code] = f.level;
     }
-    return { level: 6, names: L.COUNTY_CODES, polys, clip: null };
+    const countries = L.COUNTY_CODES.map((_, i) => (i < L.REPUBLIC_COUNTIES ? 'IE' : 'GB'));
+    return { level: 6, names: L.COUNTY_CODES, polys, clip: null, countries };
   }
 
   // Pass 1: the country's border, and how many named areas each level has.
@@ -147,7 +153,8 @@ async function chooseAreas(regionId, adminFile) {
   // (municipalities, level 8, only when asked for: there are too many).
   const levels = [...new Set([String(region.level), '6', '4', '5', '7'])];
   const level = levels.find((l) => (counts.get(l) ?? 0) >= 3) ?? levels.find((l) => (counts.get(l) ?? 0) >= 1);
-  if (!level) return { level: 0, names: [], polys: [], clip };
+  const country = region.country ?? regionId.toUpperCase();
+  if (!level) return { level: 0, names: [], polys: [], clip, countries: [] };
 
   // Pass 2: that level's areas inside the country.
   const found = [];
@@ -166,7 +173,8 @@ async function chooseAreas(regionId, adminFile) {
     seen.set(f.name, n);
     return n > 1 ? `${f.name} (${n})` : f.name;
   });
-  return { level: Number(level), names, polys: found.map((f) => f.rings), clip };
+  if (names.length >= MAX_AREAS) throw new Error(`${names.length} areas at level ${level}: the app allows ${MAX_AREAS - 1} per region`);
+  return { level: Number(level), names, polys: found.map((f) => f.rings), clip, countries: names.map(() => country) };
 }
 
 module.exports = { chooseAreas, insideRings, ringsOf, simplifyRing };

@@ -48,21 +48,9 @@ function snapToSegment(coords: Coord[], cum: number[], i: number, p: Coord): [nu
   return [cum[i] + t * (cum[i + 1] - cum[i]), Math.sqrt(cx * cx + cy * cy)];
 }
 
-// "In 300 metres" / "In 1.5 kilometres".
-export function spokenDistance(m: number): string {
-  if (m >= 950) {
-    const km = Math.round(m / 500) / 2;
-    return `In ${km % 1 === 0 ? km.toFixed(0) : km.toFixed(1)} kilometre${km === 1 ? '' : 's'}`;
-  }
-  const r = m >= 200 ? Math.round(m / 100) * 100 : Math.max(50, Math.round(m / 50) * 50);
-  return `In ${r} metres`;
-}
-
-// For the banner: "300 m" / "1.4 km".
-export function shortDistance(m: number): string {
-  if (m >= 1000) return `${(m / 1000).toFixed(m >= 10_000 ? 0 : 1)} km`;
-  return `${m >= 200 ? Math.round(m / 50) * 50 : Math.max(10, Math.round(m / 10) * 10)} m`;
-}
+// "In 300 metres" / "In 1.5 kilometres" (or yards and miles): src/units.ts.
+export { spokenDistance, shortDistance } from './units';
+import { spokenDistance } from './units';
 
 const lowerFirst = (s: string) => (s ? s[0].toLowerCase() + s.slice(1) : s);
 
