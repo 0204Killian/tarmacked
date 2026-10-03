@@ -24,6 +24,20 @@ export function cumulative(coords: Coord[]): number[] {
   return cum;
 }
 
+// The part of a route still ahead of `along` metres, starting exactly there
+// (cut mid-segment, so nothing you've driven past stays drawn).
+export function routeAhead(coords: Coord[], cum: number[], along: number): Coord[] {
+  if (coords.length < 2 || along <= 0) return coords;
+  const total = cum[cum.length - 1];
+  if (along >= total) return [coords[coords.length - 1]];
+  let i = 0;
+  while (i < cum.length - 2 && cum[i + 1] <= along) i++;
+  const len = cum[i + 1] - cum[i];
+  const f = len > 0 ? (along - cum[i]) / len : 0;
+  const p: Coord = [coords[i][0] + (coords[i + 1][0] - coords[i][0]) * f, coords[i][1] + (coords[i + 1][1] - coords[i][1]) * f];
+  return [p, ...coords.slice(i + 1)];
+}
+
 // Nearest point on segment i of the line: [metres along, metres off].
 function snapToSegment(coords: Coord[], cum: number[], i: number, p: Coord): [number, number] {
   const mLon = metersPerDegLon(p[0]);

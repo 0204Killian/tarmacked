@@ -45,6 +45,9 @@ export const CATEGORY_MANUAL = 'manual-drive';
 // An auto-detected "drive" shorter than this wasn't a drive (a walk to the
 // shop, GPS wander) and is dropped without asking.
 const MIN_AUTO_DRIVE_M = 500;
+// After Stop (or Delete) while you're still driving, auto-detect stays off
+// for the rest of that trip: it comes back once you've been still this long.
+const PAUSE_AFTER_STOP_MS = 15 * 60_000;
 
 export type Mode = 'high' | 'balanced' | 'saver';
 
@@ -325,7 +328,9 @@ async function dropTrial(w: Watch, reason: string) {
 async function finishDrive(w: Watch, reason: string, opts: { trim: boolean; matched: boolean }): Promise<store.DriveStatus | 'dropped'> {
   await cancelPrompt();
   let status: store.DriveStatus | 'dropped';
-  if (w.trial || (w.auto && !w.confirmed && w.distanceM < MIN_AUTO_DRIVE_M)) {
+  // Auto drives that went nowhere are dropped, even after Stop or Save:
+  // a 0 km "drive" is never one you wanted.
+  if (w.trial || (w.auto && w.distanceM < MIN_AUTO_DRIVE_M)) {
     await store.deleteDrive(w.driveId);
     status = 'dropped';
   } else {
@@ -352,6 +357,7 @@ export function startManualDrive(mode: Mode): Promise<Watch> {
   return serial(async () => {
     const existing = await loadWatch();
     if (existing) return existing;
+    await store.setMeta('autodetect_paused', '');
     const now = Date.now();
     let where: [number, number] | null = null;
     try {
@@ -367,11 +373,27 @@ export function startManualDrive(mode: Mode): Promise<Watch> {
   });
 }
 
-// Stop pressed (or "End drive" tapped).
+// Auto-detect paused for the rest of this trip (Stop or Delete pressed).
+// The value is when you were last seen moving: each fence exit pushes it on.
+async function pauseAutoDetect(at: number) {
+  await store.setMeta('autodetect_paused', String(at));
+}
+async function pausedUntilParked(now: number): Promise<boolean> {
+  const raw = await store.getMeta('autodetect_paused');
+  const t = raw ? Number(raw) : NaN;
+  if (!Number.isFinite(t)) return false;
+  if (now - t < PAUSE_AFTER_STOP_MS) return true;
+  await store.setMeta('autodetect_paused', '');
+  return false;
+}
+
+// Stop pressed (or "End drive" tapped). You don't want this trip recorded
+// any more, so auto-detect stays off until you've parked.
 export function endDrive(reason: string, opts: { trim: boolean; matched: boolean }) {
   return serial(async () => {
     const w = await loadWatch();
     if (!w) return null;
+    await pauseAutoDetect(Date.now());
     await stopUpdates();
     return { driveId: w.driveId, status: await finishDrive(w, reason, opts) };
   });
@@ -393,6 +415,7 @@ export function discardDrive() {
   return serial(async () => {
     const w = await loadWatch();
     if (!w) return;
+    await pauseAutoDetect(Date.now());
     await stopUpdates();
     await cancelPrompt();
     await store.deleteDrive(w.driveId);
@@ -516,6 +539,16 @@ function onFenceExit() {
       await finishDrive(w, 'parked 15+ min', { trim: true, matched: false });
     }
     if (!(await autoDetectEnabled())) return;
+    // Stop was pressed on this trip and you're still moving: no new drive.
+    // The fence follows you, so it's only once you've parked 15+ minutes
+    // that leaving it starts a drive again.
+    if (await pausedUntilParked(now)) {
+      await pauseAutoDetect(now);
+      const here = await hereNow();
+      if (!(here && (await setFence(here)))) await ensureFence();
+      log('left the fence: auto-detect paused after Stop (until you park)');
+      return;
+    }
     // Walking, running or cycling away isn't a drive. Anything else (in a
     // vehicle, or not sure yet) starts recording; a "drive" that turns out
     // to go nowhere is dropped without asking.

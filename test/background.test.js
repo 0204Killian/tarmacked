@@ -298,5 +298,52 @@ const onlyDrive = () => [...db.drives.values()][0];
   await bg.startManualDrive('high');
   check('"Always": GPS auto-pause on', fake.location.lastOpts && fake.location.lastOpts.pausesUpdatesAutomatically === true);
 
+  // 15. Stop on an auto drive while still driving: saved once, and leaving
+  //     the fence again doesn't start new drives until you've parked.
+  reset();
+  db.meta.autodetect = '1';
+  fake.location.lastKnown = at(0, 0);
+  fake.motion.acts = [{ start: now - 60000, automotive: true, walking: false, running: false, cycling: false, stationary: false, unknown: false, confidence: 2 }];
+  await fenceExit();
+  x = await driveEast(0, 3000);
+  await bg.confirmDrive();
+  const r15 = await bg.endDrive('Stop pressed', { trim: true, matched: false });
+  check('stop on auto drive: saved', r15 && r15.status === 'done' && db.drives.size === 1);
+  for (let k = 0; k < 6; k++) {
+    x = x + 400; now += 20000; fake.location.lastKnown = at(x, 0);
+    await fenceExit();
+  }
+  check('after Stop: still driving, no new drives', db.drives.size === 1 && !fake.location.updates && !(await bg.currentWatch()), `drives ${db.drives.size} log: ${db.log.slice(-3).join(' / ')}`);
+  check('after Stop: fence keeps following you', fake.location.fences && Math.abs(fake.location.fences[0].longitude - at(x, 0)[1]) < 1e-9);
+  now += 10 * 60000; x += 400; fake.location.lastKnown = at(x, 0);
+  await fenceExit();
+  check('after Stop: a 10-min stop is still the same trip', db.drives.size === 1);
+  now += 20 * 60000; x += 400; fake.location.lastKnown = at(x, 0);
+  await fenceExit();
+  check('after parking 15+ min: auto-detect starts drives again', db.drives.size === 2 && fake.location.updates);
+
+  // 16. Delete while recording pauses it too; Start clears the pause.
+  reset();
+  db.meta.autodetect = '1';
+  fake.location.lastKnown = at(0, 0);
+  fake.motion.acts = [{ start: now - 60000, automotive: true, walking: false, running: false, cycling: false, stationary: false, unknown: false, confidence: 2 }];
+  await fenceExit();
+  await bg.discardDrive();
+  now += 20000; fake.location.lastKnown = at(500, 0);
+  await fenceExit();
+  check('delete while recording: no new drive straight after', db.drives.size === 0);
+  await bg.startManualDrive('high');
+  check('Start pressed: records, pause cleared', db.drives.size === 1 && !db.meta.autodetect_paused);
+
+  // 17. Stop on an auto drive that went nowhere: dropped, not a 0 km drive.
+  reset();
+  db.meta.autodetect = '1';
+  fake.location.lastKnown = at(0, 0);
+  fake.motion.acts = [{ start: now - 60000, automotive: true, walking: false, running: false, cycling: false, stationary: false, unknown: false, confidence: 2 }];
+  await fenceExit();
+  await bg.confirmDrive();
+  const r17 = await bg.endDrive('Stop pressed', { trim: true, matched: false });
+  check('stop on a 0 km auto drive: dropped', r17 && r17.status === 'dropped' && db.drives.size === 0);
+
   console.log(results.every(Boolean) ? '\nALL PASS' : '\nSOME FAILED');
 })();

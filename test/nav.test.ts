@@ -1,6 +1,6 @@
 // Sat-nav logic (src/nav.ts): following a route, prompts, going off route,
 // arriving, and never-driven road on a route.
-import { Navigator, NavRoute, spokenDistance, shortDistance, newRoadOnRoute, drivenRanges } from '../src/nav';
+import { Navigator, NavRoute, spokenDistance, shortDistance, newRoadOnRoute, drivenRanges, routeAhead, cumulative } from '../src/nav';
 import { RoadNetwork, RoadSegment } from '../src/roadMatcher';
 import { metersPerDegLon, METERS_PER_DEG_LAT, Coord } from '../src/geo';
 
@@ -120,6 +120,18 @@ check('banner distances', [shortDistance(320), shortDistance(42), shortDistance(
   check('new road on a route: only the parts never driven', Math.abs(r.newM - (1000 + 1450 + 300)) < 60 && Math.abs(r.knownM - 3800) < 60, `new ${r.newM.toFixed(0)} m of ${r.knownM.toFixed(0)} m`);
   const r2 = newRoadOnRoute(new RoadNetwork(), new Map(), coords);
   check('no road data: nothing known, nothing claimed', r2.knownM === 0 && r2.newM === 0);
+}
+
+// Route line ahead: cut exactly at your position, mid-segment (one long
+// 1 km straight: nothing behind you stays drawn).
+{
+  const c: Coord[] = [ll(0, 0), ll(1000, 0), ll(1000, 500)];
+  const cum = cumulative(c);
+  const a = routeAhead(c, cum, 300);
+  const behind = (a[0][1] - LON0) * mLon;
+  check('route ahead: starts where you are on a long segment', a.length === 3 && Math.abs(behind - 300) < 1, `starts ${behind.toFixed(1)} m along`);
+  check('route ahead: past a corner keeps only what is left', routeAhead(c, cum, 1200).length === 2 && routeAhead(c, cum, 0).length === 3);
+  check('route ahead: at the end, nothing to draw', routeAhead(c, cum, 1600).length === 1);
 }
 
 console.log(results.every(Boolean) ? '\nALL PASS' : '\nSOME FAILED');

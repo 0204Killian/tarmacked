@@ -8,6 +8,7 @@ import * as SplashScreen from 'expo-splash-screen';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { File, Directory, Paths } from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
+import * as MailComposer from 'expo-mail-composer';
 import * as DocumentPicker from 'expo-document-picker';
 import * as store from './src/storage';
 import * as bg from './src/background';
@@ -22,7 +23,7 @@ import { RoadData, fetchJson } from './src/roadData';
 import { migrateEdits, OldEdit } from './src/editMigrate';
 import { Recap, driveGains } from './src/recap';
 import { RecapCard } from './src/RecapCard';
-import { Navigator, NavUpdate } from './src/nav';
+import { Navigator, NavUpdate, routeAhead } from './src/nav';
 import { RoadGraph, PlannedRoute, RouteMode, Avoid, sameRoute } from './src/router';
 import { RouteData, Region as NavRegion, regionsFor } from './src/routeData';
 import { Place, fold } from './src/places';
@@ -33,7 +34,10 @@ import { TILE_HOST } from './src/tiles';
 // scripts/pipeline). It's checked for a newer version at most this often.
 const ROAD_DATA_CHECK_MS = 6 * 60 * 60 * 1000;
 // Shown in Settings → Help. Keep in step with app.json.
-const APP_VERSION = '0.20.0';
+const APP_VERSION = '0.20.4';
+// How far ahead of your position the route line is cut (under your dot).
+const NAV_TRIM_LEAD_M = 8;
+const SUPPORT_EMAIL = 'support@tarmacked.com';
 
 const formatBytes = (b: number) => (b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.max(0, Math.round(b / 1e3))} KB`);
 
@@ -742,6 +746,14 @@ function App() {
         setBootStep('Opening your data…');
         const migrated = await store.migrateIfNeeded();
         if (migrated) setNote(migrated);
+        // Once: tidy away the empty auto drives that Stop used to leave
+        // behind (0.20.0 and older started a new one straight after Stop).
+        if ((await store.getMeta('empty_auto_cleanup')) !== '1') {
+          for (const d of await store.listDrives()) {
+            if (d.auto && d.status !== 'recording' && (d.distanceM ?? 0) < 50 && d.pointCount < 30 && !(d.newM ?? 0)) await store.deleteDrive(d.id);
+          }
+          await store.setMeta('empty_auto_cleanup', '1');
+        }
       } catch (e) {
         setNote(`Couldn't move your data to the new storage yet (${(e as Error).message}). Nothing was deleted — it retries next launch.`);
       }
@@ -1434,10 +1446,16 @@ function App() {
       await pollRef.current(); // the last points
       if (liveAutoRef.current) {
         // Stop on an auto-detected drive = yes, this was a drive.
+        // Auto-detect then stays off until you've parked (no new drive
+        // starting the moment you press Stop while still moving).
         await bg.confirmDrive();
-        await bg.endDrive('Stop pressed', { trim: true, matched: false }); // queues it for matching
+        const r = await bg.endDrive('Stop pressed', { trim: true, matched: false }); // queues it for matching
         endLiveUi();
-        setNote('Drive saved — adding its roads to your map…');
+        if (r?.status === 'dropped') {
+          setNote('Too short to save. Auto-detect is off until you park.');
+          return;
+        }
+        setNote('Drive saved. Auto-detect is off until you park.');
         await runPendingWork();
         return;
       }
@@ -1786,7 +1804,25 @@ function App() {
 
   const spokenName = (d: Dest) => (d.name === 'Dropped pin' ? '' : d.name.split(',')[0]);
 
+  // Once, before the first trip: directions and limits are a guide.
   const startNavigation = async () => {
+    if (!routeOptions[chosenRoute] || !dest) return;
+    if ((await store.getMeta('nav_notice')) !== '1') {
+      Alert.alert(
+        'Before you go',
+        'Directions and speed limits come from OpenStreetMap and can be wrong or out of date. Always follow the road signs and the rules of the road.',
+        [
+          { text: 'How to fix the map', onPress: () => Linking.openURL('https://tarmacked.com/map-data').catch(() => undefined) },
+          { text: 'Got it', onPress: () => { store.setMeta('nav_notice', '1').catch(() => undefined); beginNavigation().catch(() => undefined); } },
+        ],
+        { cancelable: false }
+      );
+      return;
+    }
+    await beginNavigation();
+  };
+
+  const beginNavigation = async () => {
     const route = routeOptions[chosenRoute];
     if (!route || !dest) return;
     const nav = new Navigator(route, spokenName(dest));
@@ -1891,14 +1927,13 @@ function App() {
 
   // The route still ahead (what's been driven drops off), and the speed
   // limit where you are on it.
-  const navAlongStep = navUpdate ? Math.floor(navUpdate.along / 40) : 0;
+  // Cut exactly where you are (a few metres ahead, under your dot), every
+  // 5 m: the line behind you disappears as you drive over it.
+  const navAlongStep = navUpdate ? Math.floor((navUpdate.along + NAV_TRIM_LEAD_M) / 5) : 0;
   const navAhead = useMemo(() => {
     const nav = navRef.current;
     if (!navRoute || !nav || nav.route !== navRoute) return navRoute?.coords ?? [];
-    const along = navAlongStep * 40;
-    let i = 0;
-    while (i < nav.cum.length - 2 && nav.cum[i + 1] < along) i++;
-    return navRoute.coords.slice(i);
+    return routeAhead(navRoute.coords, nav.cum, navAlongStep * 5);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [navRoute, navAlongStep]);
   const navSpeedLimit = useMemo(() => {
@@ -2209,7 +2244,19 @@ function App() {
       if (file.exists) file.delete();
       file.create();
       file.write([...head, ...lines].join('\n'));
-      await Sharing.shareAsync(file.uri, { mimeType: 'text/plain', UTI: 'public.plain-text', dialogTitle: 'Send to support@tarmacked.com' });
+      // An email to us, ready to go, with the report attached. No mail
+      // account set up in Apple Mail (Gmail app users etc.): the share sheet.
+      if (await MailComposer.isAvailableAsync().catch(() => false)) {
+        await MailComposer.composeAsync({
+          recipients: [SUPPORT_EMAIL],
+          subject: `tarmacked ${APP_VERSION} problem report`,
+          body: 'What happened, and roughly when and where:\n\n',
+          attachments: [file.uri],
+        });
+        return;
+      }
+      setNote(`Send the report to ${SUPPORT_EMAIL}`);
+      await Sharing.shareAsync(file.uri, { mimeType: 'text/plain', UTI: 'public.plain-text', dialogTitle: `Send to ${SUPPORT_EMAIL}` });
     } catch (e) {
       setNote(`Couldn't make the report: ${(e as Error).message}`);
     }

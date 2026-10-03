@@ -12,7 +12,7 @@ declare module 'react-native' {
   export const StyleSheet: { create<T>(s: T): T; hairlineWidth: number };
   export const Text: any, View: any, Pressable: any, ScrollView: any, ActivityIndicator: any, Image: any, Switch: any, TextInput: any;
   export const Keyboard: { dismiss(): void };
-  export const Alert: { alert(title: string, message?: string, buttons?: { text: string; style?: 'default' | 'cancel' | 'destructive'; onPress?: () => void }[]): void };
+  export const Alert: { alert(title: string, message?: string, buttons?: { text: string; style?: 'default' | 'cancel' | 'destructive'; onPress?: () => void }[], options?: { cancelable?: boolean }): void };
   export const ActionSheetIOS: { showActionSheetWithOptions(o: { options: string[]; cancelButtonIndex?: number; destructiveButtonIndex?: number; title?: string; message?: string; userInterfaceStyle?: 'light' | 'dark' }, cb: (i: number) => void): void };
   export const Platform: { OS: 'ios' | 'android'; Version: string | number };
   export const AppState: { currentState: string; addEventListener(t: 'change', cb: (s: 'active' | 'background' | 'inactive') => void): { remove(): void } };
@@ -119,3 +119,4 @@ declare module 'react-native-svg' {
 declare module 'react-native-view-shot' {
   export function captureRef(ref: any, o?: { format?: 'png' | 'jpg'; quality?: number; result?: 'tmpfile' | 'base64' }): Promise<string>;
 }
+declare module 'expo-mail-composer' { export function isAvailableAsync(): Promise<boolean>; export function composeAsync(o: { recipients?: string[]; subject?: string; body?: string; attachments?: string[] }): Promise<{ status: string }>; }
